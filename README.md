@@ -1,10 +1,16 @@
 # ECE 60872  Project
 The goal of this code is to compare code from Github and try and utilize a database of available bugs to explore the possibility of cross language bug detection.
 ## Table of Contents
+- [Read Before Using](#Read-Before-Using)
 - [Current Objective](#Current-Objective)
 - [File Descriptions](#File-Descriptions)
 - [Documentation](#Documentation)
-
+## Read Before Using
+This requires that you make your own file called keys.yaml
+It should contain:
+moss_key: #
+github_key: #
+Which are your access keys for moss and github respectively.
 ## Current Objective
 Currently trying to fill out database properly and find best attributes to compare.
 ## File Descriptions
