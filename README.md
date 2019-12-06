@@ -6,15 +6,14 @@ The goal of this code is to compare code from Github and try and utilize a datab
 - [File Descriptions](#File-Descriptions)
 - [Documentation](#Documentation)
 ## Read Before Using
-This requires that you make your own file called keys.yaml
-It should contain:
-moss_key: #
-github_key: #
+This requires that you make your own file called keys.yaml  
+It should contain:  
+moss_key: #  
+github_key: #  
 Which are your access keys for moss and github respectively.
 ## Current Objective
 Currently trying to fill out database properly and find best attributes to compare.
 ## File Descriptions
-
 resources:
 - angr-doc:
     - This contains pull request information from the angr-doc repo as well as the diff patches.
