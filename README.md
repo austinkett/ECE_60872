@@ -3,7 +3,7 @@ The goal of this code is to compare code from Github and try and utilize a datab
 ## Table of Contents
 - [Current Objective](#Current-Objective)
 - [File Descriptions](#File-Descriptions)
-- [Past Weekly Updates](#Past-Weekly-Updates)
+- [Documentation](#Documentation)
 
 ## Current Objective
 Currently trying to fill out database properly and find best attributes to compare.
