@@ -1,0 +1,249 @@
+diff --git a/core/src/main/java/org/elasticsearch/index/translog/TranslogService.java b/core/src/main/java/org/elasticsearch/index/translog/TranslogService.java
+index 778533b58850..78e70894c975 100644
+--- a/core/src/main/java/org/elasticsearch/index/translog/TranslogService.java
++++ b/core/src/main/java/org/elasticsearch/index/translog/TranslogService.java
+@@ -25,10 +25,16 @@
+ import org.elasticsearch.common.unit.ByteSizeUnit;
+ import org.elasticsearch.common.unit.ByteSizeValue;
+ import org.elasticsearch.common.unit.TimeValue;
++import org.elasticsearch.common.util.concurrent.AbstractRunnable;
+ import org.elasticsearch.common.util.concurrent.FutureUtils;
++import org.elasticsearch.index.engine.EngineClosedException;
+ import org.elasticsearch.index.engine.FlushNotAllowedEngineException;
+ import org.elasticsearch.index.settings.IndexSettingsService;
+-import org.elasticsearch.index.shard.*;
++import org.elasticsearch.index.shard.AbstractIndexShardComponent;
++import org.elasticsearch.index.shard.IllegalIndexShardStateException;
++import org.elasticsearch.index.shard.IndexShard;
++import org.elasticsearch.index.shard.IndexShardState;
++import org.elasticsearch.index.shard.ShardId;
+ import org.elasticsearch.threadpool.ThreadPool;
+ 
+ import java.io.Closeable;
+@@ -41,7 +47,7 @@
+     public static final String INDEX_TRANSLOG_FLUSH_INTERVAL = "index.translog.interval";
+     public static final String INDEX_TRANSLOG_FLUSH_THRESHOLD_OPS = "index.translog.flush_threshold_ops";
+     public static final String INDEX_TRANSLOG_FLUSH_THRESHOLD_SIZE = "index.translog.flush_threshold_size";
+-    public static final String INDEX_TRANSLOG_FLUSH_THRESHOLD_PERIOD =  "index.translog.flush_threshold_period";
++    public static final String INDEX_TRANSLOG_FLUSH_THRESHOLD_PERIOD = "index.translog.flush_threshold_period";
+     public static final String INDEX_TRANSLOG_DISABLE_FLUSH = "index.translog.disable_flush";
+ 
+     private final ThreadPool threadPool;
+@@ -82,7 +88,6 @@ public void close() {
+     }
+ 
+ 
+-
+     class ApplySettings implements IndexSettingsService.Listener {
+         @Override
+         public void onRefreshSettings(Settings settings) {
+@@ -118,37 +123,58 @@ private TimeValue computeNextInterval() {
+         return new TimeValue(interval.millis() + (ThreadLocalRandom.current().nextLong(interval.millis())));
+     }
+ 
+-    private class TranslogBasedFlush implements Runnable {
++    // public for testing
++    public class TranslogBasedFlush extends AbstractRunnable {
+ 
+         private volatile long lastFlushTime = System.currentTimeMillis();
+ 
+         @Override
+-        public void run() {
++        public void onFailure(Throwable t) {
++            logger.warn("unexpected error while checking whether the translog needs a flush. rescheduling", t);
++            reschedule();
++        }
++
++        @Override
++        public void onRejection(Throwable t) {
++            logger.trace("ignoring EsRejectedExecutionException, shutting down", t);
++        }
++
++        @Override
++        protected void doRun() throws Exception {
++            maybeFlushAndReschedule();
++        }
++
++        /** checks if we need to flush and reschedules a new check. returns true if a new check was scheduled */
++        public boolean maybeFlushAndReschedule() {
+             if (indexShard.state() == IndexShardState.CLOSED) {
+-                return;
++                return false;
+             }
+ 
+             // flush is disabled, but still reschedule
+             if (disableFlush) {
+                 reschedule();
+-                return;
++                return true;
+             }
+-            Translog translog = indexShard.engine().getTranslog();
+-            if (translog == null) {
++            final Translog translog;
++            try {
++                translog = indexShard.engine().getTranslog();
++            } catch (EngineClosedException e) {
++                // we're still recovering
+                 reschedule();
+-                return;
++                return true;
+             }
++
+             int currentNumberOfOperations = translog.totalOperations();
+             if (currentNumberOfOperations == 0) {
+                 reschedule();
+-                return;
++                return true;
+             }
+ 
+             if (flushThresholdOperations > 0) {
+                 if (currentNumberOfOperations > flushThresholdOperations) {
+                     logger.trace("flushing translog, operations [{}], breached [{}]", currentNumberOfOperations, flushThresholdOperations);
+                     asyncFlushAndReschedule();
+-                    return;
++                    return true;
+                 }
+             }
+ 
+@@ -157,7 +183,7 @@ public void run() {
+                 if (sizeInBytes > flushThresholdSize.bytes()) {
+                     logger.trace("flushing translog, size [{}], breached [{}]", new ByteSizeValue(sizeInBytes), flushThresholdSize);
+                     asyncFlushAndReschedule();
+-                    return;
++                    return true;
+                 }
+             }
+ 
+@@ -165,11 +191,11 @@ public void run() {
+                 if ((threadPool.estimatedTimeInMillis() - lastFlushTime) > flushThresholdPeriod.millis()) {
+                     logger.trace("flushing translog, last_flush_time [{}], breached [{}]", lastFlushTime, flushThresholdPeriod);
+                     asyncFlushAndReschedule();
+-                    return;
++                    return true;
+                 }
+             }
+-
+             reschedule();
++            return true;
+         }
+ 
+         private void reschedule() {
+@@ -177,23 +203,30 @@ private void reschedule() {
+         }
+ 
+         private void asyncFlushAndReschedule() {
+-            threadPool.executor(ThreadPool.Names.FLUSH).execute(new Runnable() {
++            threadPool.executor(ThreadPool.Names.FLUSH).execute(new AbstractRunnable() {
++
++                @Override
++                public void onRejection(Throwable t) {
++                    logger.trace("ignoring EsRejectedExecutionException, shutting down", t);
++                }
++
+                 @Override
+-                public void run() {
++                public void onFailure(Throwable t) {
++                    logger.warn("failed to flush shard on translog threshold", t);
++                    reschedule();
++                }
++
++                @Override
++                protected void doRun() throws Exception {
+                     try {
+                         indexShard.flush(new FlushRequest());
+                     } catch (IllegalIndexShardStateException e) {
+                         // we are being closed, or in created state, ignore
+                     } catch (FlushNotAllowedEngineException e) {
+                         // ignore this exception, we are not allowed to perform flush
+-                    } catch (Throwable e) {
+-                        logger.warn("failed to flush shard on translog threshold", e);
+                     }
+                     lastFlushTime = threadPool.estimatedTimeInMillis();
+-
+-                    if (indexShard.state() != IndexShardState.CLOSED) {
+-                        future = threadPool.schedule(computeNextInterval(), ThreadPool.Names.SAME, TranslogBasedFlush.this);
+-                    }
++                    reschedule();
+                 }
+             });
+         }
+diff --git a/core/src/test/java/org/elasticsearch/index/shard/IndexShardTests.java b/core/src/test/java/org/elasticsearch/index/shard/IndexShardTests.java
+index 647e4edd1ef0..7db657cbc872 100644
+--- a/core/src/test/java/org/elasticsearch/index/shard/IndexShardTests.java
++++ b/core/src/test/java/org/elasticsearch/index/shard/IndexShardTests.java
+@@ -37,6 +37,9 @@
+ import org.elasticsearch.cluster.ClusterState;
+ import org.elasticsearch.cluster.InternalClusterInfoService;
+ import org.elasticsearch.cluster.metadata.IndexMetaData;
++import org.elasticsearch.cluster.metadata.SnapshotId;
++import org.elasticsearch.cluster.node.DiscoveryNode;
++import org.elasticsearch.cluster.routing.RestoreSource;
+ import org.elasticsearch.cluster.routing.ShardRouting;
+ import org.elasticsearch.cluster.routing.ShardRoutingState;
+ import org.elasticsearch.cluster.routing.TestShardRouting;
+@@ -46,6 +49,7 @@
+ import org.elasticsearch.common.io.stream.StreamInput;
+ import org.elasticsearch.common.logging.ESLogger;
+ import org.elasticsearch.common.settings.Settings;
++import org.elasticsearch.common.transport.DummyTransportAddress;
+ import org.elasticsearch.common.xcontent.XContentBuilder;
+ import org.elasticsearch.common.xcontent.XContentFactory;
+ import org.elasticsearch.env.Environment;
+@@ -63,7 +67,9 @@
+ import org.elasticsearch.index.store.Store;
+ import org.elasticsearch.index.translog.Translog;
+ import org.elasticsearch.index.translog.TranslogConfig;
++import org.elasticsearch.index.translog.TranslogService;
+ import org.elasticsearch.indices.IndicesService;
++import org.elasticsearch.indices.recovery.RecoveryState;
+ import org.elasticsearch.test.DummyShardLock;
+ import org.elasticsearch.test.ESSingleNodeTestCase;
+ import org.elasticsearch.test.VersionUtils;
+@@ -678,10 +684,46 @@ public void postIndex(Engine.Index index, Throwable ex) {
+         try {
+             shard.index(index);
+             fail();
+-        }catch (IllegalIndexShardStateException e){
++        } catch (IllegalIndexShardStateException e) {
+ 
+         }
+ 
+         assertTrue(postIndexWithExceptionCalled.get());
+     }
++
++    /**
++     * We currently start check for time/size/ops based tanslog flush as soon as the shard is created. At that time the
++     * engine is not yet started. We should properly deal with this and schedule a future check
++     */
++    public void testFlushRescheduleOnEngineNotAvailable() throws IOException {
++        createIndex("test");
++        ensureGreen();
++        IndicesService indicesService = getInstanceFromNode(IndicesService.class);
++        IndexService test = indicesService.indexService("test");
++        IndexShard shard = test.shard(0);
++        ShardRouting routing = new ShardRouting(shard.routingEntry());
++        test.removeShard(0, "test");
++        final IndexShard newShard = test.createShard(routing);
++        final TranslogService translogService = test.shardInjectorSafe(0).getInstance(TranslogService.class);
++        final TranslogService.TranslogBasedFlush checker = translogService.new TranslogBasedFlush();
++        assertTrue(checker.maybeFlushAndReschedule());
++        DiscoveryNode someNode = new DiscoveryNode("foo", DummyTransportAddress.INSTANCE, Version.CURRENT);
++        switch (randomFrom(RecoveryState.Type.values())) {
++            case STORE:
++                newShard.recovering("for testing", RecoveryState.Type.STORE, someNode);
++                break;
++            case SNAPSHOT:
++                newShard.recovering("for testing", RecoveryState.Type.SNAPSHOT, new RestoreSource(new SnapshotId("test", "Test"), Version.CURRENT, "test"));
++                break;
++            case REPLICA:
++                newShard.recovering("for testing", RecoveryState.Type.REPLICA, someNode);
++                break;
++            case RELOCATION:
++                newShard.recovering("for testing", RecoveryState.Type.RELOCATION, someNode);
++                break;
++            default:
++                throw new RuntimeException("unknown RecoveryState.Type");
++        }
++        assertTrue(checker.maybeFlushAndReschedule());
++    }
+ }

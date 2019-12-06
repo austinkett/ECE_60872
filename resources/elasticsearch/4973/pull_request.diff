@@ -1,0 +1,144 @@
+diff --git a/src/main/java/org/elasticsearch/search/suggest/completion/AnalyzingCompletionLookupProvider.java b/src/main/java/org/elasticsearch/search/suggest/completion/AnalyzingCompletionLookupProvider.java
+index 8df1e03b4ffd..6714eed9224a 100644
+--- a/src/main/java/org/elasticsearch/search/suggest/completion/AnalyzingCompletionLookupProvider.java
++++ b/src/main/java/org/elasticsearch/search/suggest/completion/AnalyzingCompletionLookupProvider.java
+@@ -204,6 +204,7 @@ public int getMaxAnalyzedPathsForOneInput() {
+ 
+     @Override
+     public LookupFactory load(IndexInput input) throws IOException {
++        long sizeInBytes = 0;
+         int version = CodecUtil.checkHeader(input, CODEC_NAME, CODEC_VERSION_START, CODEC_VERSION_LATEST);
+         final Map<String, AnalyzingSuggestHolder> lookupMap = new HashMap<String, AnalyzingSuggestHolder>();
+         input.seek(input.length() - 8);
+@@ -249,8 +250,10 @@ public LookupFactory load(IndexInput input) throws IOException {
+ 
+             AnalyzingSuggestHolder holder = new AnalyzingSuggestHolder(preserveSep, preservePositionIncrements, maxSurfaceFormsPerAnalyzedForm, maxGraphExpansions,
+                     hasPayloads, maxAnalyzedPathsForOneInput, fst, sepLabel, payloadSep, endByte, holeCharacter);
++            sizeInBytes += fst.sizeInBytes();
+             lookupMap.put(entry.getValue(), holder);
+         }
++        final long ramBytesUsed = sizeInBytes;
+         return new LookupFactory() {
+             @Override
+             public Lookup getLookup(FieldMapper<?> mapper, CompletionSuggestionContext suggestionContext) {
+@@ -309,6 +312,11 @@ public CompletionStats stats(String... fields) {
+             AnalyzingSuggestHolder getAnalyzingSuggestHolder(FieldMapper<?> mapper) {
+                 return lookupMap.get(mapper.names().indexName());
+             }
++
++            @Override
++            public long ramBytesUsed() {
++                return ramBytesUsed;
++            }
+         };
+     }
+ 
+diff --git a/src/main/java/org/elasticsearch/search/suggest/completion/Completion090PostingsFormat.java b/src/main/java/org/elasticsearch/search/suggest/completion/Completion090PostingsFormat.java
+index 19710f69e374..8162160c7069 100644
+--- a/src/main/java/org/elasticsearch/search/suggest/completion/Completion090PostingsFormat.java
++++ b/src/main/java/org/elasticsearch/search/suggest/completion/Completion090PostingsFormat.java
+@@ -205,13 +205,14 @@ public void startTerm(BytesRef text) throws IOException {
+ 
+     private static class CompletionFieldsProducer extends FieldsProducer {
+ 
+-        private FieldsProducer delegateProducer;
+-        private LookupFactory lookupFactory;
++        private final FieldsProducer delegateProducer;
++        private final LookupFactory lookupFactory;
+ 
+         public CompletionFieldsProducer(SegmentReadState state) throws IOException {
+             String suggestFSTFile = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, EXTENSION);
+             IndexInput input = state.directory.openInput(suggestFSTFile, state.context);
+             CodecUtil.checkHeader(input, CODEC_NAME, SUGGEST_CODEC_VERSION, SUGGEST_CODEC_VERSION);
++            FieldsProducer delegateProducer = null;
+             boolean success = false;
+             try {
+                 PostingsFormat delegatePostingsFormat = PostingsFormat.forName(input.readString());
+@@ -221,7 +222,7 @@ public CompletionFieldsProducer(SegmentReadState state) throws IOException {
+                     throw new ElasticsearchIllegalStateException("no provider with name [" + providerName + "] registered");
+                 }
+                 // TODO: we could clone the ReadState and make it always forward IOContext.MERGE to prevent unecessary heap usage? 
+-                this.delegateProducer = delegatePostingsFormat.fieldsProducer(state);
++                delegateProducer = delegatePostingsFormat.fieldsProducer(state);
+                 /*
+                  * If we are merging we don't load the FSTs at all such that we
+                  * don't consume so much memory during merge
+@@ -231,7 +232,10 @@ public CompletionFieldsProducer(SegmentReadState state) throws IOException {
+                     // eventually we should have some kind of curciut breaker that prevents us from going OOM here
+                     // with some configuration
+                     this.lookupFactory = completionLookupProvider.load(input);
++                } else {
++                    this.lookupFactory = null;
+                 }
++                this.delegateProducer = delegateProducer;
+                 success = true;
+             } finally {
+                 if (!success) {
+@@ -254,11 +258,11 @@ public void close() throws IOException {
+ 
+         @Override
+         public Terms terms(String field) throws IOException {
+-            Terms terms = delegateProducer.terms(field);
+-            if (terms == null) {
++            final Terms terms = delegateProducer.terms(field);
++            if (terms == null || lookupFactory == null) {
+                 return terms;
+             }
+-            return new CompletionTerms(terms, this.lookupFactory);
++            return new CompletionTerms(terms, lookupFactory);
+         }
+ 
+         @Override
+@@ -268,7 +272,7 @@ public int size() {
+ 
+         @Override
+         public long ramBytesUsed() {
+-            return RamUsageEstimator.sizeOf(lookupFactory) + delegateProducer.ramBytesUsed();
++            return (lookupFactory == null ? 0 : lookupFactory.ramBytesUsed()) + delegateProducer.ramBytesUsed();
+         }
+     }
+ 
+@@ -363,5 +367,6 @@ public CompletionStats completionStats(IndexReader indexReader, String ... field
+         public abstract Lookup getLookup(FieldMapper<?> mapper, CompletionSuggestionContext suggestionContext);
+         public abstract CompletionStats stats(String ... fields);
+         abstract AnalyzingCompletionLookupProvider.AnalyzingSuggestHolder getAnalyzingSuggestHolder(FieldMapper<?> mapper);
++        public abstract long ramBytesUsed();
+     }
+ }
+diff --git a/src/test/java/org/elasticsearch/search/suggest/completion/AnalyzingCompletionLookupProviderV1.java b/src/test/java/org/elasticsearch/search/suggest/completion/AnalyzingCompletionLookupProviderV1.java
+index 8b297398315e..4a47b3dec30a 100644
+--- a/src/test/java/org/elasticsearch/search/suggest/completion/AnalyzingCompletionLookupProviderV1.java
++++ b/src/test/java/org/elasticsearch/search/suggest/completion/AnalyzingCompletionLookupProviderV1.java
+@@ -224,7 +224,7 @@ public LookupFactory load(IndexInput input) throws IOException {
+             long offset = input.readVLong();
+             meta.put(offset, name);
+         }
+-
++        long sizeInBytes = 0;
+         for (Map.Entry<Long, String> entry : meta.entrySet()) {
+             input.seek(entry.getKey());
+             FST<Pair<Long, BytesRef>> fst = new FST<Pair<Long, BytesRef>>(input, new PairOutputs<Long, BytesRef>(
+@@ -236,9 +236,11 @@ public LookupFactory load(IndexInput input) throws IOException {
+             boolean preserveSep = (options & SERIALIZE_PRESERVE_SEPERATORS) != 0;
+             boolean hasPayloads = (options & SERIALIZE_HAS_PAYLOADS) != 0;
+             boolean preservePositionIncrements = (options & SERIALIZE_PRESERVE_POSITION_INCREMENTS) != 0;
++            sizeInBytes += fst.sizeInBytes();
+             lookupMap.put(entry.getValue(), new AnalyzingSuggestHolder(preserveSep, preservePositionIncrements, maxSurfaceFormsPerAnalyzedForm, maxGraphExpansions,
+                     hasPayloads, maxAnalyzedPathsForOneInput, fst));
+         }
++        final long ramBytesUsed = sizeInBytes;
+         return new LookupFactory() {
+             @Override
+             public Lookup getLookup(FieldMapper<?> mapper, CompletionSuggestionContext suggestionContext) {
+@@ -295,6 +297,11 @@ public CompletionStats stats(String... fields) {
+             AnalyzingSuggestHolder getAnalyzingSuggestHolder(FieldMapper<?> mapper) {
+                 return lookupMap.get(mapper.names().indexName());
+             }
++
++            @Override
++            public long ramBytesUsed() {
++                return ramBytesUsed;
++            }
+         };
+     }
+ 

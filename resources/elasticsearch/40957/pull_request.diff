@@ -1,0 +1,136 @@
+diff --git a/x-pack/plugin/security/src/main/java/org/elasticsearch/xpack/security/Security.java b/x-pack/plugin/security/src/main/java/org/elasticsearch/xpack/security/Security.java
+index 48b9615c790b..bc1d0ed6ed47 100644
+--- a/x-pack/plugin/security/src/main/java/org/elasticsearch/xpack/security/Security.java
++++ b/x-pack/plugin/security/src/main/java/org/elasticsearch/xpack/security/Security.java
+@@ -699,12 +699,18 @@ public void onIndexModule(IndexModule module) {
+                                 indexService.cache() != null ? indexService.cache().bitsetFilterCache() : null,
+                                 indexService.getThreadPool().getThreadContext(), getLicenseState(),
+                                 indexService.getScriptService()));
+-                /*  We need to forcefully overwrite the query cache implementation to use security's opt out query cache implementation.
+-                *  This impl. disabled the query cache if field level security is used for a particular request. If we wouldn't do
+-                *  forcefully overwrite the query cache implementation then we leave the system vulnerable to leakages of data to
+-                *  unauthorized users. */
++                /*
++                 * We need to forcefully overwrite the query cache implementation to use security's opt-out query cache implementation. This
++                 * implementation disables the query cache if field level security is used for a particular request. We have to forcefully
++                 * overwrite the query cache implementation to prevent data leakage to unauthorized users.
++                 */
+                 module.forceQueryCacheProvider(
+-                        (settings, cache) -> new OptOutQueryCache(settings, cache, threadContext.get(), getLicenseState()));
++                        (settings, cache) -> {
++                            final OptOutQueryCache queryCache =
++                                    new OptOutQueryCache(settings, cache, threadContext.get(), getLicenseState());
++                            queryCache.listenForLicenseStateChanges();
++                            return queryCache;
++                        });
+             }
+ 
+             // in order to prevent scroll ids from being maliciously crafted and/or guessed, a listener is added that
+diff --git a/x-pack/plugin/security/src/main/java/org/elasticsearch/xpack/security/authz/accesscontrol/OptOutQueryCache.java b/x-pack/plugin/security/src/main/java/org/elasticsearch/xpack/security/authz/accesscontrol/OptOutQueryCache.java
+index 78058080e5b1..daadac78ae48 100644
+--- a/x-pack/plugin/security/src/main/java/org/elasticsearch/xpack/security/authz/accesscontrol/OptOutQueryCache.java
++++ b/x-pack/plugin/security/src/main/java/org/elasticsearch/xpack/security/authz/accesscontrol/OptOutQueryCache.java
+@@ -24,8 +24,9 @@
+ import java.util.Set;
+ 
+ /**
+- * Opts out of the query cache if field level security is active for the current request,
+- * and its unsafe to cache.
++ * Opts out of the query cache if field level security is active for the current request, and it is unsafe to cache. Note that the method
++ * {@link #listenForLicenseStateChanges()} must be invoked after construction of the query cache and before any other public methods are
++ * invoked on this query cache.
+  */
+ public final class OptOutQueryCache extends AbstractIndexComponent implements LicenseStateListener, QueryCache {
+ 
+@@ -33,6 +34,7 @@
+     private final ThreadContext context;
+     private final String indexName;
+     private final XPackLicenseState licenseState;
++    private volatile boolean licenseStateListenerRegistered;
+ 
+     public OptOutQueryCache(
+             final IndexSettings indexSettings,
+@@ -44,28 +46,46 @@ public OptOutQueryCache(
+         this.context = Objects.requireNonNull(context, "threadContext must not be null");
+         this.indexName = indexSettings.getIndex().getName();
+         this.licenseState = Objects.requireNonNull(licenseState, "licenseState");
++    }
++
++    /**
++     * Register this query cache to listen for license state changes. This must be done after construction of this query cache before any
++     * other public methods are invoked on this query cache.
++     */
++    public void listenForLicenseStateChanges() {
++        /*
++         * Registering this as a listener can not be done in the constructor because otherwise it would be unsafe publication of this. That
++         * is, it would expose this to another thread before the constructor had finished. Therefore, we have a dedicated method to register
++         * the listener that is invoked after the constructor has returned.
++         */
++        assert licenseStateListenerRegistered == false;
+         licenseState.addListener(this);
++        licenseStateListenerRegistered = true;
+     }
+ 
+     @Override
+     public void close() throws ElasticsearchException {
++        assert licenseStateListenerRegistered;
+         licenseState.removeListener(this);
+         clear("close");
+     }
+ 
+     @Override
+     public void licenseStateChanged() {
++        assert licenseStateListenerRegistered;
+         clear("license state changed");
+     }
+ 
+     @Override
+-    public void clear(String reason) {
++    public void clear(final String reason) {
++        assert licenseStateListenerRegistered;
+         logger.debug("full cache clear, reason [{}]", reason);
+         indicesQueryCache.clearIndex(index().getName());
+     }
+ 
+     @Override
+     public Weight doCache(Weight weight, QueryCachingPolicy policy) {
++        assert licenseStateListenerRegistered;
+         if (licenseState.isAuthAllowed() == false) {
+             logger.debug("not opting out of the query cache; authorization is not allowed");
+             return indicesQueryCache.doCache(weight, policy);
+diff --git a/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/authz/accesscontrol/OptOutQueryCacheTests.java b/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/authz/accesscontrol/OptOutQueryCacheTests.java
+index 54dbdc3d33d7..99d23cc8b105 100644
+--- a/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/authz/accesscontrol/OptOutQueryCacheTests.java
++++ b/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/authz/accesscontrol/OptOutQueryCacheTests.java
+@@ -136,6 +136,7 @@ public void testOptOutQueryCacheAuthIsNotAllowed() {
+         final XPackLicenseState licenseState = mock(XPackLicenseState.class);
+         when(licenseState.isAuthAllowed()).thenReturn(false);
+         final OptOutQueryCache cache = new OptOutQueryCache(indexSettings, indicesQueryCache, threadContext, licenseState);
++        cache.listenForLicenseStateChanges();
+         final Weight weight = mock(Weight.class);
+         final QueryCachingPolicy policy = mock(QueryCachingPolicy.class);
+         cache.doCache(weight, policy);
+@@ -154,6 +155,7 @@ public void testOptOutQueryCacheNoIndicesPermissions() {
+         final XPackLicenseState licenseState = mock(XPackLicenseState.class);
+         when(licenseState.isAuthAllowed()).thenReturn(true);
+         final OptOutQueryCache cache = new OptOutQueryCache(indexSettings, indicesQueryCache, threadContext, licenseState);
++        cache.listenForLicenseStateChanges();
+         final Weight weight = mock(Weight.class);
+         final QueryCachingPolicy policy = mock(QueryCachingPolicy.class);
+         final Weight w = cache.doCache(weight, policy);
+@@ -178,6 +180,7 @@ public void testOptOutQueryCacheIndexDoesNotHaveFieldLevelSecurity() {
+         final XPackLicenseState licenseState = mock(XPackLicenseState.class);
+         when(licenseState.isAuthAllowed()).thenReturn(true);
+         final OptOutQueryCache cache = new OptOutQueryCache(indexSettings, indicesQueryCache, threadContext, licenseState);
++        cache.listenForLicenseStateChanges();
+         final Weight weight = mock(Weight.class);
+         final QueryCachingPolicy policy = mock(QueryCachingPolicy.class);
+         cache.doCache(weight, policy);
+@@ -195,6 +198,7 @@ public void testOptOutQueryCacheRemovesLicenseStateListenerOnClose() {
+         final ThreadContext threadContext = new ThreadContext(Settings.EMPTY);
+         final XPackLicenseState licenseState = mock(XPackLicenseState.class);
+         final OptOutQueryCache cache = new OptOutQueryCache(indexSettings, indicesQueryCache, threadContext, licenseState);
++        cache.listenForLicenseStateChanges();
+         verify(licenseState).addListener(cache);
+         cache.close();
+         verify(licenseState).removeListener(cache);

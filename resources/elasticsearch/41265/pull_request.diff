@@ -1,0 +1,419 @@
+diff --git a/qa/rolling-upgrade/src/test/java/org/elasticsearch/upgrades/AbstractRollingTestCase.java b/qa/rolling-upgrade/src/test/java/org/elasticsearch/upgrades/AbstractRollingTestCase.java
+index 25f8ba36021e..3358e07cd494 100644
+--- a/qa/rolling-upgrade/src/test/java/org/elasticsearch/upgrades/AbstractRollingTestCase.java
++++ b/qa/rolling-upgrade/src/test/java/org/elasticsearch/upgrades/AbstractRollingTestCase.java
+@@ -18,6 +18,7 @@
+  */
+ package org.elasticsearch.upgrades;
+ 
++import org.elasticsearch.Version;
+ import org.elasticsearch.common.settings.Settings;
+ import org.elasticsearch.test.rest.ESRestTestCase;
+ 
+@@ -43,6 +44,10 @@ public static ClusterType parse(String value) {
+ 
+     protected static final ClusterType CLUSTER_TYPE = ClusterType.parse(System.getProperty("tests.rest.suite"));
+ 
++    protected static final boolean firstMixedRound = Boolean.parseBoolean(System.getProperty("tests.first_round", "false"));
++
++    protected static final Version UPGRADE_FROM_VERSION = Version.fromString(System.getProperty("tests.upgrade_from_version"));
++
+     @Override
+     protected final boolean preserveIndicesUponCompletion() {
+         return true;
+diff --git a/qa/rolling-upgrade/src/test/java/org/elasticsearch/upgrades/RecoveryIT.java b/qa/rolling-upgrade/src/test/java/org/elasticsearch/upgrades/RecoveryIT.java
+index b74bc98bce8f..8eeb2dcf3103 100644
+--- a/qa/rolling-upgrade/src/test/java/org/elasticsearch/upgrades/RecoveryIT.java
++++ b/qa/rolling-upgrade/src/test/java/org/elasticsearch/upgrades/RecoveryIT.java
+@@ -20,29 +20,38 @@
+ 
+ import org.elasticsearch.Version;
+ import org.elasticsearch.action.support.PlainActionFuture;
++import org.elasticsearch.client.Node;
+ import org.elasticsearch.client.Request;
+ import org.elasticsearch.client.Response;
+ import org.elasticsearch.client.ResponseException;
++import org.elasticsearch.client.RestClient;
++import org.elasticsearch.client.RestClientBuilder;
+ import org.elasticsearch.cluster.metadata.IndexMetaData;
+ import org.elasticsearch.common.settings.Settings;
+ import org.elasticsearch.common.util.concurrent.AbstractRunnable;
+ import org.elasticsearch.common.xcontent.support.XContentMapValues;
+ import org.elasticsearch.index.IndexSettings;
++import org.elasticsearch.index.seqno.SeqNoStats;
++import org.elasticsearch.index.seqno.SequenceNumbers;
+ import org.elasticsearch.test.rest.yaml.ObjectPath;
++import org.hamcrest.Matcher;
+ 
+ import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Objects;
+ import java.util.concurrent.Future;
+ import java.util.concurrent.TimeUnit;
+ import java.util.function.Predicate;
++import java.util.stream.Collectors;
+ 
+ import static com.carrotsearch.randomizedtesting.RandomizedTest.randomAsciiOfLength;
+ import static org.elasticsearch.cluster.routing.UnassignedInfo.INDEX_DELAYED_NODE_LEFT_TIMEOUT_SETTING;
+ import static org.elasticsearch.cluster.routing.allocation.decider.EnableAllocationDecider.INDEX_ROUTING_ALLOCATION_ENABLE_SETTING;
+ import static org.elasticsearch.cluster.routing.allocation.decider.MaxRetryAllocationDecider.SETTING_ALLOCATION_MAX_RETRY;
+ import static org.hamcrest.Matchers.equalTo;
++import static org.hamcrest.Matchers.greaterThan;
+ import static org.hamcrest.Matchers.hasSize;
+ import static org.hamcrest.Matchers.isIn;
+ import static org.hamcrest.Matchers.notNullValue;
+@@ -167,6 +176,25 @@ public void testRecoveryWithConcurrentIndexing() throws Exception {
+         }
+     }
+ 
++    private void assertDocCountOnAllCopies(String index, int expectedCount) throws Exception {
++        assertBusy(() -> {
++            Map<String, ?> state = entityAsMap(client().performRequest(new Request("GET", "/_cluster/state")));
++            String xpath = "routing_table.indices." + index + ".shards.0.node";
++            @SuppressWarnings("unchecked") List<String> assignedNodes = (List<String>) XContentMapValues.extractValue(xpath, state);
++            assertNotNull(state.toString(), assignedNodes);
++            for (String assignedNode : assignedNodes) {
++                try {
++                    assertCount(index, "_only_nodes:" + assignedNode, expectedCount);
++                } catch (ResponseException e) {
++                    if (e.getMessage().contains("no data nodes with criteria [" + assignedNode + "found for shard: [" + index + "][0]")) {
++                        throw new AssertionError(e); // shard is relocating - ask assert busy to retry
++                    }
++                    throw e;
++                }
++            }
++        });
++    }
++
+     private void assertCount(final String index, final String preference, final int expectedCount) throws IOException {
+         final Request request = new Request("GET", index + "/_count");
+         request.addParameter("preference", preference);
+@@ -302,34 +330,72 @@ public void testSearchGeoPoints() throws Exception {
+         }
+     }
+ 
++    /**
++     * This test ensures that peer recovery won't get stuck in a situation where the recovery target and recovery source
++     * have an identical sync id but different local checkpoint in the commit in particular the target does not have
++     * sequence numbers yet. This is possible if the primary is on 6.x while the replica was on 5.x and some write
++     * operations with sequence numbers have taken place. If this is not the case, then peer recovery should utilize
++     * syncId and skip copying files.
++     */
+     public void testRecoverSyncedFlushIndex() throws Exception {
+         final String index = "recover_synced_flush_index";
+         if (CLUSTER_TYPE == ClusterType.OLD) {
+             Settings.Builder settings = Settings.builder()
+                 .put(IndexMetaData.INDEX_NUMBER_OF_SHARDS_SETTING.getKey(), 1)
+-                .put(IndexMetaData.INDEX_NUMBER_OF_REPLICAS_SETTING.getKey(), 1)
+-                // if the node with the replica is the first to be restarted, while a replica is still recovering
+-                // then delayed allocation will kick in. When the node comes back, the master will search for a copy
+-                // but the recovering copy will be seen as invalid and the cluster health won't return to GREEN
+-                // before timing out
+-                .put(INDEX_DELAYED_NODE_LEFT_TIMEOUT_SETTING.getKey(), "100ms")
+-                .put(SETTING_ALLOCATION_MAX_RETRY.getKey(), "0"); // fail faster
++                .put(IndexMetaData.INDEX_NUMBER_OF_REPLICAS_SETTING.getKey(), 2);
+             createIndex(index, settings.build());
+-            indexDocs(index, 0, randomInt(5));
+-            // We have to spin synced-flush requests here because we fire the global checkpoint sync for the last write operation.
+-            // A synced-flush request considers the global checkpoint sync as an going operation because it acquires a shard permit.
+-            assertBusy(() -> {
+-                try {
+-                    Response resp = client().performRequest(new Request("POST", index + "/_flush/synced"));
+-                    Map<String, Object> result = ObjectPath.createFromResponse(resp).evaluate("_shards");
+-                    assertThat(result.get("successful"), equalTo(result.get("total")));
+-                    assertThat(result.get("failed"), equalTo(0));
+-                } catch (ResponseException ex) {
+-                    throw new AssertionError(ex); // cause assert busy to retry
++            ensureGreen(index);
++            indexDocs(index, 0, 40);
++            syncedFlush(index);
++        } else if (CLUSTER_TYPE == ClusterType.MIXED) {
++            ensureGreen(index);
++            if (firstMixedRound) {
++                assertPeerRecoveredFiles("peer recovery with syncId should not copy files", index, "upgraded-node-0", equalTo(0));
++                assertDocCountOnAllCopies(index, 40);
++                indexDocs(index, 40, 50);
++                syncedFlush(index);
++            } else {
++                assertPeerRecoveredFiles("peer recovery with syncId should not copy files", index, "upgraded-node-1", equalTo(0));
++                assertDocCountOnAllCopies(index, 90);
++                indexDocs(index, 90, 60);
++                syncedFlush(index);
++                // exclude node-2 from allocation-filter so we can trim translog on the primary before node-2 starts recover
++                if (randomBoolean()) {
++                    updateIndexSettings(index, Settings.builder().put("index.routing.allocation.include._name", "upgraded-*"));
+                 }
+-            });
++            }
++        } else {
++            // If we are upgrading from 5.x and there're some documents with sequence numbers, then we must ignore syncId
++            // and perform file-based recovery for upgraded-node-2; otherwise peer recovery should utilize syncId.
++            final boolean forcedFileBasedRecovery = UPGRADE_FROM_VERSION.before(Version.V_6_0_0) &&
++                getSeqNoStats(client(), index).stream().anyMatch(seqNos -> seqNos.getMaxSeqNo() != SequenceNumbers.NO_OPS_PERFORMED);
++            final int docsAfterUpgraded;
++            if (randomBoolean()) {
++                updateIndexSettings(index, Settings.builder()
++                    .put(IndexSettings.INDEX_TRANSLOG_RETENTION_AGE_SETTING.getKey(), "-1")
++                    .put(IndexSettings.INDEX_TRANSLOG_RETENTION_SIZE_SETTING.getKey(), "-1")
++                    .put(IndexSettings.INDEX_TRANSLOG_GENERATION_THRESHOLD_SIZE_SETTING.getKey(), "256b"));
++                // index more documents to roll translog so we can trim translog
++                docsAfterUpgraded = randomIntBetween(20, 100);
++                indexDocs(index, 150, docsAfterUpgraded);
++                assertBusy(() -> {
++                    Map<String, ?> stats = entityAsMap(client().performRequest(new Request("GET", index + "/_stats?level=shards")));
++                    Integer translogOps = (Integer) XContentMapValues.extractValue("_all.primaries.translog.operations", stats);
++                    assertThat(translogOps, equalTo(docsAfterUpgraded));
++                }, 60, TimeUnit.SECONDS);
++            } else {
++                docsAfterUpgraded = randomIntBetween(0, 100);
++                indexDocs(index, 150, docsAfterUpgraded);
++            }
++            ensureGreen(index);
++            if (forcedFileBasedRecovery) {
++                assertPeerRecoveredFiles("peer recovery must ignore syncId when sequence numbers in index commit mismatched",
++                    index, "upgraded-node-2", greaterThan(0));
++            } else {
++                assertPeerRecoveredFiles("peer recovery with syncId should not copy files", index, "upgraded-node-2", equalTo(0));
++            }
++            assertDocCountOnAllCopies(index, 150 + docsAfterUpgraded);
+         }
+-        ensureGreen(index);
+     }
+ 
+     public void testRecoveryWithSoftDeletes() throws Exception {
+@@ -363,4 +429,76 @@ public void testRecoveryWithSoftDeletes() throws Exception {
+         }
+         ensureGreen(index);
+     }
++
++    private void syncedFlush(String index) throws Exception {
++        // We have to spin synced-flush requests here because we fire the global checkpoint sync for the last write operation.
++        // A synced-flush request considers the global checkpoint sync as an going operation because it acquires a shard permit.
++        assertBusy(() -> {
++            try {
++                Response resp = client().performRequest(new Request("POST", index + "/_flush/synced"));
++                Map<String, Object> result = ObjectPath.createFromResponse(resp).evaluate("_shards");
++                assertThat(result.get("failed"), equalTo(0));
++            } catch (ResponseException ex) {
++                throw new AssertionError(ex); // cause assert busy to retry
++            }
++        });
++        // ensure the global checkpoint is synced; otherwise we might trim the commit with syncId
++        ensureGlobalCheckpointSynced(index);
++    }
++
++    @SuppressWarnings("unchecked")
++    private void assertPeerRecoveredFiles(String reason, String index, String targetNode, Matcher<Integer> sizeMatcher) throws IOException {
++        Map<?, ?> recoveryStats = entityAsMap(client().performRequest(new Request("GET", index + "/_recovery")));
++        List<Map<?, ?>> shards = (List<Map<?, ?>>) XContentMapValues.extractValue(index + "." + "shards", recoveryStats);
++        for (Map<?, ?> shard : shards) {
++            if (Objects.equals(XContentMapValues.extractValue("type", shard), "PEER")) {
++                if (Objects.equals(XContentMapValues.extractValue("target.name", shard), targetNode)) {
++                    Integer recoveredFileSize = (Integer) XContentMapValues.extractValue("index.files.recovered", shard);
++                    assertThat(reason + " target node [" + targetNode + "] stats [" + recoveryStats + "]", recoveredFileSize, sizeMatcher);
++                }
++            }
++        }
++    }
++
++    private void ensureGlobalCheckpointSynced(String index) throws Exception {
++        // we need to send the stats request to a 6.0+ node which has seq_no_stats;
++        // otherwise seq_no_stats will be stripped out if it is [de]serialized on a node before 6.0.
++        Node[] upgradedNodes = client().getNodes().stream()
++            .filter(node -> Version.fromString(node.getVersion()).onOrAfter(Version.V_6_0_0)).toArray(Node[]::new);
++        if (upgradedNodes.length == 0) {
++            assert CLUSTER_TYPE == ClusterType.OLD && UPGRADE_FROM_VERSION.before(Version.V_6_0_0) : CLUSTER_TYPE;
++            return;
++        }
++        RestClientBuilder clientBuilder = RestClient.builder(upgradedNodes);
++        configureClient(clientBuilder, restClientSettings());
++        try (RestClient client = clientBuilder.build()) {
++            assertBusy(() -> {
++                List<SeqNoStats> seqNoStats = getSeqNoStats(client, index);
++                seqNoStats.forEach(seqNos -> {
++                    // global checkpoint is started with -2 while local checkpoint started with -1.
++                    if (seqNos.getGlobalCheckpoint() == SequenceNumbers.UNASSIGNED_SEQ_NO) {
++                        assertThat(seqNos.toString(), seqNos.getLocalCheckpoint(), equalTo(SequenceNumbers.NO_OPS_PERFORMED));
++                    } else {
++                        assertThat(seqNos.toString(), seqNos.getGlobalCheckpoint(), equalTo(seqNos.getLocalCheckpoint()));
++                    }
++                });
++            }, 60, TimeUnit.SECONDS);
++        }
++    }
++
++    @SuppressWarnings("unchecked")
++    private List<SeqNoStats> getSeqNoStats(RestClient client, String index) throws IOException {
++        Map<?, ?> stats = entityAsMap(client.performRequest(new Request("GET", index + "/_stats?level=shards")));
++        List<Map<?, ?>> shardStats = (List<Map<?, ?>>) XContentMapValues.extractValue("indices." + index + ".shards.0", stats);
++        return shardStats.stream()
++            .map(shard -> (Map<?, ?>) XContentMapValues.extractValue("seq_no", shard))
++            .filter(Objects::nonNull)
++            .map(seqNoStat -> {
++                long globalCheckpoint = ((Number) XContentMapValues.extractValue("global_checkpoint", seqNoStat)).longValue();
++                long localCheckpoint = ((Number) XContentMapValues.extractValue("local_checkpoint", seqNoStat)).longValue();
++                long maxSeqNo = ((Number) XContentMapValues.extractValue("max_seq_no", seqNoStat)).longValue();
++                return new SeqNoStats(maxSeqNo, localCheckpoint, globalCheckpoint);
++            })
++            .collect(Collectors.toList());
++    }
+ }
+diff --git a/server/src/main/java/org/elasticsearch/indices/recovery/RecoverySourceHandler.java b/server/src/main/java/org/elasticsearch/indices/recovery/RecoverySourceHandler.java
+index b20d497d49ed..4fb029b5264a 100644
+--- a/server/src/main/java/org/elasticsearch/indices/recovery/RecoverySourceHandler.java
++++ b/server/src/main/java/org/elasticsearch/indices/recovery/RecoverySourceHandler.java
+@@ -367,25 +367,11 @@ public SendFileResult phase1(final IndexCommit snapshot, final Supplier<Integer>
+                             recoverySourceMetadata.asMap().size() + " files", name);
+                 }
+             }
+-            // Generate a "diff" of all the identical, different, and missing
+-            // segment files on the target node, using the existing files on
+-            // the source node
+-            String recoverySourceSyncId = recoverySourceMetadata.getSyncId();
+-            String recoveryTargetSyncId = request.metadataSnapshot().getSyncId();
+-            final boolean recoverWithSyncId = recoverySourceSyncId != null &&
+-                    recoverySourceSyncId.equals(recoveryTargetSyncId);
+-            if (recoverWithSyncId) {
+-                final long numDocsTarget = request.metadataSnapshot().getNumDocs();
+-                final long numDocsSource = recoverySourceMetadata.getNumDocs();
+-                if (numDocsTarget != numDocsSource) {
+-                    throw new IllegalStateException("try to recover " + request.shardId() + " from primary shard with sync id but number " +
+-                            "of docs differ: " + numDocsSource + " (" + request.sourceNode().getName() + ", primary) vs " + numDocsTarget
+-                            + "(" + request.targetNode().getName() + ")");
+-                }
+-                // we shortcut recovery here because we have nothing to copy. but we must still start the engine on the target.
+-                // so we don't return here
+-                logger.trace("skipping [phase1]- identical sync id [{}] found on both source and target", recoverySourceSyncId);
+-            } else {
++            final Version indexVersionCreated = shard.indexSettings().getIndexVersionCreated();
++            if (canSkipPhase1(indexVersionCreated, recoverySourceMetadata, request.metadataSnapshot()) == false) {
++                // Generate a "diff" of all the identical, different, and missing
++                // segment files on the target node, using the existing files on
++                // the source node
+                 final Store.RecoveryDiff diff = recoverySourceMetadata.recoveryDiff(request.metadataSnapshot());
+                 for (StoreFileMetaData md : diff.identical) {
+                     phase1ExistingFileNames.add(md.name());
+@@ -466,6 +452,9 @@ public SendFileResult phase1(final IndexCommit snapshot, final Supplier<Integer>
+                         throw targetException;
+                     }
+                 }
++            } else {
++                logger.trace("skipping [phase1]- identical sync id [{}] found on both source and target",
++                    recoverySourceMetadata.getSyncId());
+             }
+             final TimeValue took = stopWatch.totalTime();
+             logger.trace("recovery [phase1]: took [{}]", took);
+@@ -478,6 +467,35 @@ public SendFileResult phase1(final IndexCommit snapshot, final Supplier<Integer>
+         }
+     }
+ 
++    boolean canSkipPhase1(Version indexCreatedVersion, Store.MetadataSnapshot source, Store.MetadataSnapshot target) {
++        if (source.getSyncId() == null || source.getSyncId().equals(target.getSyncId()) == false) {
++            return false;
++        }
++        if (source.getNumDocs() != target.getNumDocs()) {
++            throw new IllegalStateException("try to recover " + request.shardId() + " from primary shard with sync id but number " +
++                "of docs differ: " + source.getNumDocs() + " (" + request.sourceNode().getName() + ", primary) vs " + target.getNumDocs()
++                + "(" + request.targetNode().getName() + ")");
++        }
++        SequenceNumbers.CommitInfo sourceSeqNos = SequenceNumbers.loadSeqNoInfoFromLuceneCommit(source.getCommitUserData().entrySet());
++        SequenceNumbers.CommitInfo targetSeqNos = SequenceNumbers.loadSeqNoInfoFromLuceneCommit(target.getCommitUserData().entrySet());
++        if (sourceSeqNos.localCheckpoint != targetSeqNos.localCheckpoint || targetSeqNos.maxSeqNo != sourceSeqNos.maxSeqNo) {
++            // If the primary is on 6.x while the replica was on 5.x, then we can get into this situation
++            // where the target still does not have sequence numbers in documents and its index commit.
++            // In this case, we don't want to fail the recovery but fallback to a file-based recovery.
++            // However, this should never happen for 6.0+ indices; thus we should fail (and assert) the recovery.
++            if (indexCreatedVersion.before(Version.V_6_0_0) &&
++                target.getCommitUserData().containsKey(SequenceNumbers.LOCAL_CHECKPOINT_KEY) == false &&
++                target.getCommitUserData().containsKey(SequenceNumbers.MAX_SEQ_NO) == false) {
++                return false;
++            }
++            final String message = "try to recover " + request.shardId() + " with sync id but " +
++                "seq_no stats are mismatched: [" + source.getCommitUserData() + "] vs [" + target.getCommitUserData() + "]";
++            assert false : message;
++            throw new IllegalStateException(message);
++        }
++        return true;
++    }
++
+     void prepareTargetForTranslog(boolean fileBasedRecovery, int totalTranslogOps, ActionListener<TimeValue> listener) {
+         StopWatch stopWatch = new StopWatch().start();
+         final ActionListener<Void> wrappedListener = ActionListener.wrap(
+diff --git a/server/src/test/java/org/elasticsearch/indices/recovery/RecoverySourceHandlerTests.java b/server/src/test/java/org/elasticsearch/indices/recovery/RecoverySourceHandlerTests.java
+index 2b3d29ddeb62..c5ee1742c89b 100644
+--- a/server/src/test/java/org/elasticsearch/indices/recovery/RecoverySourceHandlerTests.java
++++ b/server/src/test/java/org/elasticsearch/indices/recovery/RecoverySourceHandlerTests.java
+@@ -77,6 +77,7 @@
+ import org.elasticsearch.test.DummyShardLock;
+ import org.elasticsearch.test.ESTestCase;
+ import org.elasticsearch.test.IndexSettingsModule;
++import org.elasticsearch.test.VersionUtils;
+ import org.elasticsearch.threadpool.TestThreadPool;
+ import org.elasticsearch.threadpool.ThreadPool;
+ import org.junit.After;
+@@ -89,7 +90,9 @@
+ import java.util.Arrays;
+ import java.util.Collections;
+ import java.util.Comparator;
++import java.util.HashMap;
+ import java.util.List;
++import java.util.Map;
+ import java.util.concurrent.CopyOnWriteArrayList;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.AtomicInteger;
+@@ -645,6 +648,53 @@ public void writeFileChunk(StoreFileMetaData md, long position, BytesReference c
+         store.close();
+     }
+ 
++    public void testVerifySeqNoStatsWhenRecoverWithSyncId() throws Exception {
++        IndexShard shard = mock(IndexShard.class);
++        when(shard.state()).thenReturn(IndexShardState.STARTED);
++        RecoverySourceHandler handler = new RecoverySourceHandler(
++            shard, new TestRecoveryTargetHandler(), getStartRecoveryRequest(), between(1, 16), between(1, 4));
++
++        String syncId = UUIDs.randomBase64UUID();
++        int numDocs = between(0, 1000);
++        long localCheckpoint = randomLongBetween(SequenceNumbers.NO_OPS_PERFORMED, Long.MAX_VALUE);
++        long maxSeqNo = randomLongBetween(SequenceNumbers.NO_OPS_PERFORMED, Long.MAX_VALUE);
++        assertTrue(handler.canSkipPhase1(VersionUtils.randomVersion(random()),
++            newMetadataSnapshot(syncId, Long.toString(localCheckpoint), Long.toString(maxSeqNo), numDocs),
++            newMetadataSnapshot(syncId, Long.toString(localCheckpoint), Long.toString(maxSeqNo), numDocs)));
++
++        Version version5x = VersionUtils.randomVersionBetween(random(), Version.V_5_0_0, VersionUtils.getPreviousVersion(Version.V_5_6_17));
++        assertTrue(handler.canSkipPhase1(version5x,
++            newMetadataSnapshot(syncId, "-1", "-1", numDocs),
++            newMetadataSnapshot(syncId, null, null, numDocs)));
++
++        assertFalse(handler.canSkipPhase1(version5x,
++            newMetadataSnapshot(syncId, Long.toString(randomNonNegativeLong()), Long.toString(randomNonNegativeLong()), numDocs),
++            newMetadataSnapshot(syncId, null, null, numDocs)));
++
++        AssertionError error = expectThrows(AssertionError.class, () -> {
++            long localCheckpointOnTarget = randomValueOtherThan(localCheckpoint,
++                () -> randomLongBetween(SequenceNumbers.NO_OPS_PERFORMED, Long.MAX_VALUE));
++            long maxSeqNoOnTarget = randomValueOtherThan(maxSeqNo,
++                () -> randomLongBetween(SequenceNumbers.NO_OPS_PERFORMED, Long.MAX_VALUE));
++            handler.canSkipPhase1(VersionUtils.randomVersion(random()),
++                newMetadataSnapshot(syncId, Long.toString(localCheckpoint), Long.toString(maxSeqNo), numDocs),
++                newMetadataSnapshot(syncId, Long.toString(localCheckpointOnTarget), Long.toString(maxSeqNoOnTarget), numDocs));
++        });
++        assertThat(error.getMessage(), containsString("try to recover [index][1] with sync id but seq_no stats are mismatched:"));
++    }
++
++    private Store.MetadataSnapshot newMetadataSnapshot(String syncId, String localCheckpoint, String maxSeqNo, int numDocs) {
++        Map<String, String> userData = new HashMap<>();
++        userData.put(Engine.SYNC_COMMIT_ID, syncId);
++        if (localCheckpoint != null) {
++            userData.put(SequenceNumbers.LOCAL_CHECKPOINT_KEY, localCheckpoint);
++        }
++        if (maxSeqNo != null) {
++            userData.put(SequenceNumbers.LOCAL_CHECKPOINT_KEY, maxSeqNo);
++        }
++        return new Store.MetadataSnapshot(Collections.emptyMap(), userData, numDocs);
++    }
++
+     private Store newStore(Path path) throws IOException {
+         return newStore(path, true);
+     }

@@ -1,0 +1,1134 @@
+diff --git a/Marlin/src/HAL/HAL_AVR/HAL.h b/Marlin/src/HAL/HAL_AVR/HAL.h
+index aa2c59db496..4b84cf5ac70 100644
+--- a/Marlin/src/HAL/HAL_AVR/HAL.h
++++ b/Marlin/src/HAL/HAL_AVR/HAL.h
+@@ -64,7 +64,9 @@
+   #define CRITICAL_SECTION_START  unsigned char _sreg = SREG; cli();
+   #define CRITICAL_SECTION_END    SREG = _sreg;
+ #endif
+-
++#define ISRS_ENABLED() TEST(SREG, SREG_I)
++#define ENABLE_ISRS()  sei()
++#define DISABLE_ISRS() cli()
+ 
+ // On AVR this is in math.h?
+ //#define square(x) ((x)*(x))
+@@ -181,7 +183,6 @@ void TIMER1_COMPA_vect (void) { \
+     A("lds r16, %[timsk1]")            /* 2 Load into R0 the stepper timer Interrupt mask register [TIMSK1] */ \
+     A("andi r16,~%[msk1]")             /* 1 Disable the stepper ISR */ \
+     A("sts %[timsk1], r16")            /* 2 And set the new value */ \
+-    A("sei")                           /* 1 Enable global interrupts - stepper and temperature ISRs are disabled, so no risk of reentry or being preempted by the temperature ISR */    \
+     A("push r16")                      /* 2 Save TIMSK1 into stack */ \
+     A("in r16, 0x3B")                  /* 1 Get RAMPZ register */ \
+     A("push r16")                      /* 2 Save RAMPZ into stack */ \
+@@ -291,7 +292,7 @@ void TIMER0_COMPB_vect (void) { \
+     A("out 0x3B, r16")                  /* 1 Restore RAMPZ register to its original value */ \
+     A("pop r16")                        /* 2 Get the original TIMSK0 value but with temperature ISR disabled */ \
+     A("ori r16,%[msk0]")                /* 1 Enable temperature ISR */ \
+-    A("cli")                            /* 1 Disable global interrupts - We must do this, as we will reenable the temperature ISR, and we don´t want to reenter this handler until the current one is done */ \
++    A("cli")                            /* 1 Disable global interrupts - We must do this, as we will reenable the temperature ISR, and we don't want to reenter this handler until the current one is done */ \
+     A("sts %[timsk0], r16")             /* 2 And restore the old value */ \
+     A("pop r16")                        /* 2 Get the old SREG */ \
+     A("out __SREG__, r16")              /* 1 And restore the SREG value */ \
+diff --git a/Marlin/src/HAL/HAL_AVR/MarlinSerial.cpp b/Marlin/src/HAL/HAL_AVR/MarlinSerial.cpp
+index 7d10ca74b8a..6568b08396f 100644
+--- a/Marlin/src/HAL/HAL_AVR/MarlinSerial.cpp
++++ b/Marlin/src/HAL/HAL_AVR/MarlinSerial.cpp
+@@ -69,8 +69,6 @@
+     uint8_t xon_xoff_state = XON_XOFF_CHAR_SENT | XON_CHAR;
+   #endif
+ 
+-  void clear_command_queue();
+-
+   #if ENABLED(SERIAL_STATS_DROPPED_RX)
+     uint8_t rx_dropped_bytes = 0;
+   #endif
+@@ -79,10 +77,14 @@
+     ring_buffer_pos_t rx_max_enqueued = 0;
+   #endif
+ 
++  // A SW memory barrier, to ensure GCC does not overoptimize loops
++  #define sw_barrier() asm volatile("": : :"memory");
++
+   #if ENABLED(EMERGENCY_PARSER)
+     #include "../../feature/emergency_parser.h"
+   #endif
+ 
++  // (called with RX interrupts disabled)
+   FORCE_INLINE void store_rxd_char() {
+ 
+     #if ENABLED(EMERGENCY_PARSER)
+@@ -129,18 +131,22 @@
+         // let the host react and stop sending bytes. This translates to 13mS
+         // propagation time.
+         if (rx_count >= (RX_BUFFER_SIZE) / 8) {
++
+           // If TX interrupts are disabled and data register is empty,
+           // just write the byte to the data register and be done. This
+           // shortcut helps significantly improve the effective datarate
+           // at high (>500kbit/s) bitrates, where interrupt overhead
+           // becomes a slowdown.
+           if (!TEST(M_UCSRxB, M_UDRIEx) && TEST(M_UCSRxA, M_UDREx)) {
++
+             // Send an XOFF character
+             M_UDRx = XOFF_CHAR;
++
+             // clear the TXC bit -- "can be cleared by writing a one to its bit
+             // location". This makes sure flush() won't return until the bytes
+             // actually got written
+             SBI(M_UCSRxA, M_TXCx);
++
+             // And remember it was sent
+             xon_xoff_state = XOFF_CHAR | XON_XOFF_CHAR_SENT;
+           }
+@@ -153,8 +159,14 @@
+               xon_xoff_state = XOFF_CHAR;
+             #else
+               // We are not using TX interrupts, we will have to send this manually
+-              while (!TEST(M_UCSRxA, M_UDREx)) { /* nada */ };
++              while (!TEST(M_UCSRxA, M_UDREx)) sw_barrier();
+               M_UDRx = XOFF_CHAR;
++
++              // clear the TXC bit -- "can be cleared by writing a one to its bit
++              // location". This makes sure flush() won't return until the bytes
++              // actually got written
++              SBI(M_UCSRxA, M_TXCx);
++
+               // And remember we already sent it
+               xon_xoff_state = XOFF_CHAR | XON_XOFF_CHAR_SENT;
+             #endif
+@@ -170,6 +182,7 @@
+ 
+   #if TX_BUFFER_SIZE > 0
+ 
++    // (called with TX irqs disabled)
+     FORCE_INLINE void _tx_udr_empty_irq(void) {
+       // If interrupts are enabled, there must be more data in the output
+       // buffer.
+@@ -251,116 +264,139 @@
+     CBI(M_UCSRxB, M_UDRIEx);
+   }
+ 
+-  void MarlinSerial::checkRx(void) {
+-    if (TEST(M_UCSRxA, M_RXCx)) {
+-      CRITICAL_SECTION_START;
+-        store_rxd_char();
+-      CRITICAL_SECTION_END;
+-    }
+-  }
+-
+   int MarlinSerial::peek(void) {
+-    CRITICAL_SECTION_START;
++    #if RX_BUFFER_SIZE > 256
++      // Disable RX interrupts, but only if non atomic reads
++      const bool isr_enabled = TEST(M_UCSRxB, M_RXCIEx);
++      CBI(M_UCSRxB, M_RXCIEx);
++    #endif
+       const int v = rx_buffer.head == rx_buffer.tail ? -1 : rx_buffer.buffer[rx_buffer.tail];
+-    CRITICAL_SECTION_END;
++    #if RX_BUFFER_SIZE > 256
++      // Reenable RX interrupts if they were enabled
++      if (isr_enabled) SBI(M_UCSRxB, M_RXCIEx);
++    #endif
+     return v;
+   }
+ 
+   int MarlinSerial::read(void) {
+     int v;
+-    CRITICAL_SECTION_START;
+-      const ring_buffer_pos_t t = rx_buffer.tail;
+-      if (rx_buffer.head == t)
+-        v = -1;
+-      else {
+-        v = rx_buffer.buffer[t];
+-        rx_buffer.tail = (ring_buffer_pos_t)(t + 1) & (RX_BUFFER_SIZE - 1);
+-
+-        #if ENABLED(SERIAL_XON_XOFF)
+-          if ((xon_xoff_state & XON_XOFF_CHAR_MASK) == XOFF_CHAR) {
+-            // Get count of bytes in the RX buffer
+-            ring_buffer_pos_t rx_count = (ring_buffer_pos_t)(rx_buffer.head - rx_buffer.tail) & (ring_buffer_pos_t)(RX_BUFFER_SIZE - 1);
+-            // When below 10% of RX buffer capacity, send XON before
+-            // running out of RX buffer bytes
+-            if (rx_count < (RX_BUFFER_SIZE) / 10) {
+-              xon_xoff_state = XON_CHAR | XON_XOFF_CHAR_SENT;
+-              CRITICAL_SECTION_END;       // End critical section before returning!
+-              writeNoHandshake(XON_CHAR);
+-              return v;
+-            }
++
++    #if RX_BUFFER_SIZE > 256
++      // Disable RX interrupts to ensure atomic reads
++      const bool isr_enabled = TEST(M_UCSRxB, M_RXCIEx);
++      CBI(M_UCSRxB, M_RXCIEx);
++    #endif
++
++    const ring_buffer_pos_t h = rx_buffer.head;
++
++    #if RX_BUFFER_SIZE > 256
++      // End critical section
++      if (isr_enabled) SBI(M_UCSRxB, M_RXCIEx);
++    #endif
++
++    ring_buffer_pos_t t = rx_buffer.tail;
++
++    if (h == t)
++      v = -1;
++    else {
++      v = rx_buffer.buffer[t];
++      t = (ring_buffer_pos_t)(t + 1) & (RX_BUFFER_SIZE - 1);
++
++      #if RX_BUFFER_SIZE > 256
++        // Disable RX interrupts to ensure atomic write to tail, so
++        // the RX isr can't read partially updated values
++        const bool isr_enabled = TEST(M_UCSRxB, M_RXCIEx);
++        CBI(M_UCSRxB, M_RXCIEx);
++      #endif
++
++      // Advance tail
++      rx_buffer.tail = t;
++
++      #if RX_BUFFER_SIZE > 256
++        // End critical section
++        if (isr_enabled) SBI(M_UCSRxB, M_RXCIEx);
++      #endif
++
++      #if ENABLED(SERIAL_XON_XOFF)
++        if ((xon_xoff_state & XON_XOFF_CHAR_MASK) == XOFF_CHAR) {
++
++          // Get count of bytes in the RX buffer
++          ring_buffer_pos_t rx_count = (ring_buffer_pos_t)(h - t) & (ring_buffer_pos_t)(RX_BUFFER_SIZE - 1);
++
++          // When below 10% of RX buffer capacity, send XON before
++          // running out of RX buffer bytes
++          if (rx_count < (RX_BUFFER_SIZE) / 10) {
++            xon_xoff_state = XON_CHAR | XON_XOFF_CHAR_SENT;
++            write(XON_CHAR);
++            return v;
+           }
+-        #endif
+-      }
+-    CRITICAL_SECTION_END;
++        }
++      #endif
++    }
++
+     return v;
+   }
+ 
+   ring_buffer_pos_t MarlinSerial::available(void) {
+-    CRITICAL_SECTION_START;
++    #if RX_BUFFER_SIZE > 256
++      const bool isr_enabled = TEST(M_UCSRxB, M_RXCIEx);
++      CBI(M_UCSRxB, M_RXCIEx);
++    #endif
++
+       const ring_buffer_pos_t h = rx_buffer.head, t = rx_buffer.tail;
+-    CRITICAL_SECTION_END;
++
++    #if RX_BUFFER_SIZE > 256
++      if (isr_enabled) SBI(M_UCSRxB, M_RXCIEx);
++    #endif
++
+     return (ring_buffer_pos_t)(RX_BUFFER_SIZE + h - t) & (RX_BUFFER_SIZE - 1);
+   }
+ 
+   void MarlinSerial::flush(void) {
+-    // Don't change this order of operations. If the RX interrupt occurs between
+-    // reading rx_buffer_head and updating rx_buffer_tail, the previous rx_buffer_head
+-    // may be written to rx_buffer_tail, making the buffer appear full rather than empty.
+-    CRITICAL_SECTION_START;
+-      rx_buffer.head = rx_buffer.tail = 0;
+-      clear_command_queue();
+-    CRITICAL_SECTION_END;
++    #if RX_BUFFER_SIZE > 256
++      const bool isr_enabled = TEST(M_UCSRxB, M_RXCIEx);
++      CBI(M_UCSRxB, M_RXCIEx);
++    #endif
++
++      rx_buffer.tail = rx_buffer.head;
++
++    #if RX_BUFFER_SIZE > 256
++      if (isr_enabled) SBI(M_UCSRxB, M_RXCIEx);
++    #endif
+ 
+     #if ENABLED(SERIAL_XON_XOFF)
+       if ((xon_xoff_state & XON_XOFF_CHAR_MASK) == XOFF_CHAR) {
+         xon_xoff_state = XON_CHAR | XON_XOFF_CHAR_SENT;
+-        writeNoHandshake(XON_CHAR);
++        write(XON_CHAR);
+       }
+     #endif
+   }
+ 
+   #if TX_BUFFER_SIZE > 0
+-    uint8_t MarlinSerial::availableForWrite(void) {
+-      CRITICAL_SECTION_START;
+-        const uint8_t h = tx_buffer.head, t = tx_buffer.tail;
+-      CRITICAL_SECTION_END;
+-      return (uint8_t)(TX_BUFFER_SIZE + h - t) & (TX_BUFFER_SIZE - 1);
+-    }
+-
+     void MarlinSerial::write(const uint8_t c) {
+-      #if ENABLED(SERIAL_XON_XOFF)
+-        const uint8_t state = xon_xoff_state;
+-        if (!(state & XON_XOFF_CHAR_SENT)) {
+-          // Send 2 chars: XON/XOFF, then a user-specified char
+-          writeNoHandshake(state & XON_XOFF_CHAR_MASK);
+-          xon_xoff_state = state | XON_XOFF_CHAR_SENT;
+-        }
+-      #endif
+-      writeNoHandshake(c);
+-    }
+-
+-    void MarlinSerial::writeNoHandshake(const uint8_t c) {
+       _written = true;
+-      CRITICAL_SECTION_START;
+-        bool emty = (tx_buffer.head == tx_buffer.tail);
+-      CRITICAL_SECTION_END;
+-      // If the buffer and the data register is empty, just write the byte
+-      // to the data register and be done. This shortcut helps
+-      // significantly improve the effective datarate at high (>
+-      // 500kbit/s) bitrates, where interrupt overhead becomes a slowdown.
+-      if (emty && TEST(M_UCSRxA, M_UDREx)) {
+-        CRITICAL_SECTION_START;
+-          M_UDRx = c;
+-          SBI(M_UCSRxA, M_TXCx);
+-        CRITICAL_SECTION_END;
++
++      // If the TX interrupts are disabled and the data register
++      // is empty, just write the byte to the data register and
++      // be done. This shortcut helps significantly improve the
++      // effective datarate at high (>500kbit/s) bitrates, where
++      // interrupt overhead becomes a slowdown.
++      if (!TEST(M_UCSRxB, M_UDRIEx) && TEST(M_UCSRxA, M_UDREx)) {
++        M_UDRx = c;
++
++        // clear the TXC bit -- "can be cleared by writing a one to its bit
++        // location". This makes sure flush() won't return until the bytes
++        // actually got written
++        SBI(M_UCSRxA, M_TXCx);
+         return;
+       }
++
+       const uint8_t i = (tx_buffer.head + 1) & (TX_BUFFER_SIZE - 1);
+ 
+       // If the output buffer is full, there's nothing for it other than to
+       // wait for the interrupt handler to empty it a bit
+       while (i == tx_buffer.tail) {
+-        if (!TEST(SREG, SREG_I)) {
++        if (!ISRS_ENABLED()) {
+           // Interrupts are disabled, so we'll have to poll the data
+           // register empty flag ourselves. If it is set, pretend an
+           // interrupt has happened and call the handler to free up
+@@ -368,17 +404,18 @@
+           if (TEST(M_UCSRxA, M_UDREx))
+             _tx_udr_empty_irq();
+         }
+-        else {
+-          // nop, the interrupt handler will free up space for us
+-        }
++        // (else , the interrupt handler will free up space for us)
++
++        // Make sure compiler rereads tx_buffer.tail
++        sw_barrier();
+       }
+ 
++      // Store new char. head is always safe to move
+       tx_buffer.buffer[tx_buffer.head] = c;
+-      { CRITICAL_SECTION_START;
+-          tx_buffer.head = i;
+-          SBI(M_UCSRxB, M_UDRIEx);
+-        CRITICAL_SECTION_END;
+-      }
++      tx_buffer.head = i;
++
++      // Enable TX isr
++      SBI(M_UCSRxB, M_UDRIEx);
+       return;
+     }
+ 
+@@ -391,33 +428,23 @@
+         return;
+ 
+       while (TEST(M_UCSRxB, M_UDRIEx) || !TEST(M_UCSRxA, M_TXCx)) {
+-        if (!TEST(SREG, SREG_I) && TEST(M_UCSRxB, M_UDRIEx))
++        if (!ISRS_ENABLED()) {
+           // Interrupts are globally disabled, but the DR empty
+           // interrupt should be enabled, so poll the DR empty flag to
+           // prevent deadlock
+           if (TEST(M_UCSRxA, M_UDREx))
+             _tx_udr_empty_irq();
++        }
++        sw_barrier();
+       }
+       // If we get here, nothing is queued anymore (DRIE is disabled) and
+-      // the hardware finished tranmission (TXC is set).
++      // the hardware finished transmission (TXC is set).
+     }
+ 
+   #else // TX_BUFFER_SIZE == 0
+ 
+     void MarlinSerial::write(const uint8_t c) {
+-      #if ENABLED(SERIAL_XON_XOFF)
+-        // Do a priority insertion of an XON/XOFF char, if needed.
+-        const uint8_t state = xon_xoff_state;
+-        if (!(state & XON_XOFF_CHAR_SENT)) {
+-          writeNoHandshake(state & XON_XOFF_CHAR_MASK);
+-          xon_xoff_state = state | XON_XOFF_CHAR_SENT;
+-        }
+-      #endif
+-      writeNoHandshake(c);
+-    }
+-
+-    void MarlinSerial::writeNoHandshake(const uint8_t c) {
+-      while (!TEST(M_UCSRxA, M_UDREx)) { /* nada */ }
++      while (!TEST(M_UCSRxA, M_UDREx)) sw_barrier();
+       M_UDRx = c;
+     }
+ 
+diff --git a/Marlin/src/HAL/HAL_AVR/MarlinSerial.h b/Marlin/src/HAL/HAL_AVR/MarlinSerial.h
+index 4bddd5f5053..dc39222d9bf 100644
+--- a/Marlin/src/HAL/HAL_AVR/MarlinSerial.h
++++ b/Marlin/src/HAL/HAL_AVR/MarlinSerial.h
+@@ -94,7 +94,7 @@
+     extern ring_buffer_pos_t rx_max_enqueued;
+   #endif
+ 
+-  class MarlinSerial { //: public Stream
++  class MarlinSerial {
+ 
+     public:
+       MarlinSerial() {};
+@@ -104,13 +104,10 @@
+       static int read(void);
+       static void flush(void);
+       static ring_buffer_pos_t available(void);
+-      static void checkRx(void);
+       static void write(const uint8_t c);
+       #if TX_BUFFER_SIZE > 0
+-        static uint8_t availableForWrite(void);
+         static void flushTX(void);
+       #endif
+-      static void writeNoHandshake(const uint8_t c);
+ 
+       #if ENABLED(SERIAL_STATS_DROPPED_RX)
+         FORCE_INLINE static uint32_t dropped() { return rx_dropped_bytes; }
+diff --git a/Marlin/src/HAL/HAL_DUE/HAL.h b/Marlin/src/HAL/HAL_DUE/HAL.h
+index efac5ee8cdf..805acd28d6b 100644
+--- a/Marlin/src/HAL/HAL_DUE/HAL.h
++++ b/Marlin/src/HAL/HAL_DUE/HAL.h
+@@ -55,8 +55,11 @@
+   #define analogInputToDigitalPin(p) ((p < 12u) ? (p) + 54u : -1)
+ #endif
+ 
+-#define CRITICAL_SECTION_START  uint32_t primask = __get_PRIMASK(); __disable_irq();
+-#define CRITICAL_SECTION_END    if (!primask) __enable_irq();
++#define CRITICAL_SECTION_START  uint32_t primask = __get_PRIMASK(); __disable_irq()
++#define CRITICAL_SECTION_END    if (!primask) __enable_irq()
++#define ISRS_ENABLED() (!__get_PRIMASK())
++#define ENABLE_ISRS()  __enable_irq()
++#define DISABLE_ISRS() __disable_irq()
+ 
+ // On AVR this is in math.h?
+ #define square(x) ((x)*(x))
+diff --git a/Marlin/src/HAL/HAL_DUE/MarlinSerial_Due.cpp b/Marlin/src/HAL/HAL_DUE/MarlinSerial_Due.cpp
+index ac366063085..306cd912e89 100644
+--- a/Marlin/src/HAL/HAL_DUE/MarlinSerial_Due.cpp
++++ b/Marlin/src/HAL/HAL_DUE/MarlinSerial_Due.cpp
+@@ -154,12 +154,14 @@
+         // let the host react and stop sending bytes. This translates to 13mS
+         // propagation time.
+         if (rx_count >= (RX_BUFFER_SIZE) / 8) {
++          
+           // If TX interrupts are disabled and data register is empty,
+           // just write the byte to the data register and be done. This
+           // shortcut helps significantly improve the effective datarate
+           // at high (>500kbit/s) bitrates, where interrupt overhead
+           // becomes a slowdown.
+           if (!(HWUART->UART_IMR & UART_IMR_TXRDY) && (HWUART->UART_SR & UART_SR_TXRDY)) {
++            
+             // Send an XOFF character
+             HWUART->UART_THR = XOFF_CHAR;
+ 
+@@ -175,8 +177,9 @@
+               xon_xoff_state = XOFF_CHAR;
+             #else
+               // We are not using TX interrupts, we will have to send this manually
+-              while (!(HWUART->UART_SR & UART_SR_TXRDY)) { sw_barrier(); };
++              while (!(HWUART->UART_SR & UART_SR_TXRDY)) sw_barrier();
+               HWUART->UART_THR = XOFF_CHAR;
++              
+               // And remember we already sent it
+               xon_xoff_state = XOFF_CHAR | XON_XOFF_CHAR_SENT;
+             #endif
+@@ -303,116 +306,81 @@
+     pmc_disable_periph_clk( HWUART_IRQ_ID );
+   }
+ 
+-  void MarlinSerial::checkRx(void) {
+-    if (HWUART->UART_SR & UART_SR_RXRDY) {
+-      CRITICAL_SECTION_START;
+-      store_rxd_char();
+-      CRITICAL_SECTION_END;
+-    }
+-  }
+-
+   int MarlinSerial::peek(void) {
+-    CRITICAL_SECTION_START;
+     const int v = rx_buffer.head == rx_buffer.tail ? -1 : rx_buffer.buffer[rx_buffer.tail];
+-    CRITICAL_SECTION_END;
+     return v;
+   }
+ 
+   int MarlinSerial::read(void) {
+     int v;
+-    CRITICAL_SECTION_START;
+-    const ring_buffer_pos_t t = rx_buffer.tail;
+-    if (rx_buffer.head == t)
++    
++    const ring_buffer_pos_t h = rx_buffer.head;
++    ring_buffer_pos_t t = rx_buffer.tail;
++    
++    if (h == t)
+       v = -1;
+     else {
+       v = rx_buffer.buffer[t];
+-      rx_buffer.tail = (ring_buffer_pos_t)(t + 1) & (RX_BUFFER_SIZE - 1);
++      t = (ring_buffer_pos_t)(t + 1) & (RX_BUFFER_SIZE - 1);
++      
++      // Advance tail
++      rx_buffer.tail = t;
+ 
+       #if ENABLED(SERIAL_XON_XOFF)
+         if ((xon_xoff_state & XON_XOFF_CHAR_MASK) == XOFF_CHAR) {
++          
+           // Get count of bytes in the RX buffer
+-          ring_buffer_pos_t rx_count = (ring_buffer_pos_t)(rx_buffer.head - rx_buffer.tail) & (ring_buffer_pos_t)(RX_BUFFER_SIZE - 1);
++          ring_buffer_pos_t rx_count = (ring_buffer_pos_t)(h - t) & (ring_buffer_pos_t)(RX_BUFFER_SIZE - 1);
++          
+           // When below 10% of RX buffer capacity, send XON before
+           // running out of RX buffer bytes
+           if (rx_count < (RX_BUFFER_SIZE) / 10) {
+             xon_xoff_state = XON_CHAR | XON_XOFF_CHAR_SENT;
+-            CRITICAL_SECTION_END;       // End critical section before returning!
+-            writeNoHandshake(XON_CHAR);
++            write(XON_CHAR);
+             return v;
+           }
+         }
+       #endif
+     }
+-    CRITICAL_SECTION_END;
+     return v;
+   }
+ 
+   ring_buffer_pos_t MarlinSerial::available(void) {
+-    CRITICAL_SECTION_START;
+     const ring_buffer_pos_t h = rx_buffer.head, t = rx_buffer.tail;
+-    CRITICAL_SECTION_END;
+     return (ring_buffer_pos_t)(RX_BUFFER_SIZE + h - t) & (RX_BUFFER_SIZE - 1);
+   }
+ 
+   void MarlinSerial::flush(void) {
+-    // Don't change this order of operations. If the RX interrupt occurs between
+-    // reading rx_buffer_head and updating rx_buffer_tail, the previous rx_buffer_head
+-    // may be written to rx_buffer_tail, making the buffer appear full rather than empty.
+-    CRITICAL_SECTION_START;
+-    rx_buffer.head = rx_buffer.tail;
+-    CRITICAL_SECTION_END;
++    rx_buffer.tail = rx_buffer.head;
+ 
+     #if ENABLED(SERIAL_XON_XOFF)
+       if ((xon_xoff_state & XON_XOFF_CHAR_MASK) == XOFF_CHAR) {
+         xon_xoff_state = XON_CHAR | XON_XOFF_CHAR_SENT;
+-        writeNoHandshake(XON_CHAR);
++        write(XON_CHAR);
+       }
+     #endif
+   }
+ 
+   #if TX_BUFFER_SIZE > 0
+-
+-    uint8_t MarlinSerial::availableForWrite(void) {
+-      CRITICAL_SECTION_START;
+-      const uint8_t h = tx_buffer.head, t = tx_buffer.tail;
+-      CRITICAL_SECTION_END;
+-      return (uint8_t)(TX_BUFFER_SIZE + h - t) & (TX_BUFFER_SIZE - 1);
+-    }
+-
+     void MarlinSerial::write(const uint8_t c) {
+-      #if ENABLED(SERIAL_XON_XOFF)
+-        const uint8_t state = xon_xoff_state;
+-        if (!(state & XON_XOFF_CHAR_SENT)) {
+-          // Send 2 chars: XON/XOFF, then a user-specified char
+-          writeNoHandshake(state & XON_XOFF_CHAR_MASK);
+-          xon_xoff_state = state | XON_XOFF_CHAR_SENT;
+-        }
+-      #endif
+-      writeNoHandshake(c);
+-    }
+-
+-    void MarlinSerial::writeNoHandshake(const uint8_t c) {
+       _written = true;
+-      CRITICAL_SECTION_START;
+-      bool emty = (tx_buffer.head == tx_buffer.tail);
+-      CRITICAL_SECTION_END;
+-      // If the buffer and the data register is empty, just write the byte
+-      // to the data register and be done. This shortcut helps
+-      // significantly improve the effective datarate at high (>
+-      // 500kbit/s) bitrates, where interrupt overhead becomes a slowdown.
+-      if (emty && (HWUART->UART_SR & UART_SR_TXRDY)) {
+-        CRITICAL_SECTION_START;
+-          HWUART->UART_THR = c;
+-          HWUART->UART_IER = UART_IER_TXRDY;
+-        CRITICAL_SECTION_END;
++      
++      // If the TX interrupts are disabled and the data register 
++      // is empty, just write the byte to the data register and 
++      // be done. This shortcut helps significantly improve the 
++      // effective datarate at high (>500kbit/s) bitrates, where 
++      // interrupt overhead becomes a slowdown.
++      if (!(HWUART->UART_IMR & UART_IMR_TXRDY) && (HWUART->UART_SR & UART_SR_TXRDY)) {
++        HWUART->UART_THR = c;
+         return;
+       }
++      
+       const uint8_t i = (tx_buffer.head + 1) & (TX_BUFFER_SIZE - 1);
+ 
+       // If the output buffer is full, there's nothing for it other than to
+       // wait for the interrupt handler to empty it a bit
+       while (i == tx_buffer.tail) {
+-        if (__get_PRIMASK()) {
++        if (!ISRS_ENABLED()) {
+           // Interrupts are disabled, so we'll have to poll the data
+           // register empty flag ourselves. If it is set, pretend an
+           // interrupt has happened and call the handler to free up
+@@ -420,31 +388,30 @@
+           if (HWUART->UART_SR & UART_SR_TXRDY)
+             _tx_thr_empty_irq();
+         }
+-        else {
+-          // nop, the interrupt handler will free up space for us
+-        }
++        // (else , the interrupt handler will free up space for us)
++        
++        // Make sure compiler rereads tx_buffer.tail
+         sw_barrier();
+       }
+ 
+       tx_buffer.buffer[tx_buffer.head] = c;
+-      { CRITICAL_SECTION_START;
+-          tx_buffer.head = i;
+-          HWUART->UART_IER = UART_IER_TXRDY;
+-        CRITICAL_SECTION_END;
+-      }
++      tx_buffer.head = i;
++      
++      // Enable TX isr
++      HWUART->UART_IER = UART_IER_TXRDY;
+       return;
+     }
+ 
+     void MarlinSerial::flushTX(void) {
+       // TX
+       // If we have never written a byte, no need to flush.
+-      if (!_written)
+-        return;
++      if (!_written) return;
+ 
+       while ((HWUART->UART_IMR & UART_IMR_TXRDY) || !(HWUART->UART_SR & UART_SR_TXEMPTY)) {
+-        if (__get_PRIMASK())
+-          if ((HWUART->UART_SR & UART_SR_TXRDY))
++        if (!ISRS_ENABLED()) {
++          if (HWUART->UART_SR & UART_SR_TXRDY)
+             _tx_thr_empty_irq();
++        }
+         sw_barrier();
+       }
+       // If we get here, nothing is queued anymore (TX interrupts are disabled) and
+@@ -454,19 +421,7 @@
+   #else // TX_BUFFER_SIZE == 0
+ 
+     void MarlinSerial::write(const uint8_t c) {
+-      #if ENABLED(SERIAL_XON_XOFF)
+-        // Do a priority insertion of an XON/XOFF char, if needed.
+-        const uint8_t state = xon_xoff_state;
+-        if (!(state & XON_XOFF_CHAR_SENT)) {
+-          writeNoHandshake(state & XON_XOFF_CHAR_MASK);
+-          xon_xoff_state = state | XON_XOFF_CHAR_SENT;
+-        }
+-      #endif
+-      writeNoHandshake(c);
+-    }
+-
+-    void MarlinSerial::writeNoHandshake(const uint8_t c) {
+-      while (!(HWUART->UART_SR & UART_SR_TXRDY)) { sw_barrier(); };
++      while (!(HWUART->UART_SR & UART_SR_TXRDY)) sw_barrier();
+       HWUART->UART_THR = c;
+     }
+ 
+diff --git a/Marlin/src/HAL/HAL_DUE/MarlinSerial_Due.h b/Marlin/src/HAL/HAL_DUE/MarlinSerial_Due.h
+index a28beaeb143..9f4077b85d9 100644
+--- a/Marlin/src/HAL/HAL_DUE/MarlinSerial_Due.h
++++ b/Marlin/src/HAL/HAL_DUE/MarlinSerial_Due.h
+@@ -84,13 +84,10 @@ class MarlinSerial {
+   static int read(void);
+   static void flush(void);
+   static ring_buffer_pos_t available(void);
+-  static void checkRx(void);
+   static void write(const uint8_t c);
+   #if TX_BUFFER_SIZE > 0
+-    static uint8_t availableForWrite(void);
+     static void flushTX(void);
+   #endif
+-  static void writeNoHandshake(const uint8_t c);
+ 
+   #if ENABLED(SERIAL_STATS_DROPPED_RX)
+     FORCE_INLINE static uint32_t dropped() { return rx_dropped_bytes; }
+diff --git a/Marlin/src/HAL/HAL_LPC1768/HAL.h b/Marlin/src/HAL/HAL_LPC1768/HAL.h
+index 0944241df9a..d11c552e2b8 100644
+--- a/Marlin/src/HAL/HAL_LPC1768/HAL.h
++++ b/Marlin/src/HAL/HAL_LPC1768/HAL.h
+@@ -120,8 +120,11 @@ extern HalSerial usb_serial;
+   #define NUM_SERIAL 1
+ #endif
+ 
+-#define CRITICAL_SECTION_START  uint32_t primask = __get_PRIMASK(); __disable_irq();
+-#define CRITICAL_SECTION_END    if (!primask) __enable_irq();
++#define CRITICAL_SECTION_START  uint32_t primask = __get_PRIMASK(); __disable_irq()
++#define CRITICAL_SECTION_END    if (!primask) __enable_irq()
++#define ISRS_ENABLED() (!__get_PRIMASK())
++#define ENABLE_ISRS()  __enable_irq()
++#define DISABLE_ISRS() __disable_irq()
+ 
+ //Utility functions
+ int freeMemory(void);
+diff --git a/Marlin/src/HAL/HAL_STM32F1/HAL.h b/Marlin/src/HAL/HAL_STM32F1/HAL.h
+index d1e83603ee1..6da2964f9e4 100644
+--- a/Marlin/src/HAL/HAL_STM32F1/HAL.h
++++ b/Marlin/src/HAL/HAL_STM32F1/HAL.h
+@@ -119,8 +119,11 @@ void HAL_init();
+   #define analogInputToDigitalPin(p) (p)
+ #endif
+ 
+-#define CRITICAL_SECTION_START  noInterrupts();
+-#define CRITICAL_SECTION_END    interrupts();
++#define CRITICAL_SECTION_START  uint32_t primask = __get_PRIMASK(); __disable_irq()
++#define CRITICAL_SECTION_END    if (!primask) __enable_irq()
++#define ISRS_ENABLED() (!__get_PRIMASK())
++#define ENABLE_ISRS()  __enable_irq()
++#define DISABLE_ISRS() __disable_irq()
+ 
+ // On AVR this is in math.h?
+ #define square(x) ((x)*(x))
+diff --git a/Marlin/src/HAL/HAL_STM32F4/HAL.h b/Marlin/src/HAL/HAL_STM32F4/HAL.h
+index f1cd29142d2..53d3f1dd06e 100644
+--- a/Marlin/src/HAL/HAL_STM32F4/HAL.h
++++ b/Marlin/src/HAL/HAL_STM32F4/HAL.h
+@@ -118,8 +118,11 @@
+   #define analogInputToDigitalPin(p) (p)
+ #endif
+ 
+-#define CRITICAL_SECTION_START  noInterrupts();
+-#define CRITICAL_SECTION_END    interrupts();
++#define CRITICAL_SECTION_START  uint32_t primask = __get_PRIMASK(); __disable_irq()
++#define CRITICAL_SECTION_END    if (!primask) __enable_irq()
++#define ISRS_ENABLED() (!__get_PRIMASK())
++#define ENABLE_ISRS()  __enable_irq()
++#define DISABLE_ISRS() __disable_irq()
+ 
+ // On AVR this is in math.h?
+ #define square(x) ((x)*(x))
+diff --git a/Marlin/src/HAL/HAL_STM32F7/HAL.h b/Marlin/src/HAL/HAL_STM32F7/HAL.h
+index 9481fe3a638..c15d3719796 100644
+--- a/Marlin/src/HAL/HAL_STM32F7/HAL.h
++++ b/Marlin/src/HAL/HAL_STM32F7/HAL.h
+@@ -111,8 +111,11 @@
+   #define analogInputToDigitalPin(p) (p)
+ #endif
+ 
+-#define CRITICAL_SECTION_START  noInterrupts();
+-#define CRITICAL_SECTION_END    interrupts();
++#define CRITICAL_SECTION_START  uint32_t primask = __get_PRIMASK(); __disable_irq()
++#define CRITICAL_SECTION_END    if (!primask) __enable_irq()
++#define ISRS_ENABLED() (!__get_PRIMASK())
++#define ENABLE_ISRS()  __enable_irq()
++#define DISABLE_ISRS() __disable_irq()
+ 
+ // On AVR this is in math.h?
+ #define square(x) ((x)*(x))
+diff --git a/Marlin/src/HAL/HAL_TEENSY35_36/HAL.h b/Marlin/src/HAL/HAL_TEENSY35_36/HAL.h
+index 59f729ba86e..d5ab7699bce 100644
+--- a/Marlin/src/HAL/HAL_TEENSY35_36/HAL.h
++++ b/Marlin/src/HAL/HAL_TEENSY35_36/HAL.h
+@@ -88,8 +88,11 @@ typedef int8_t pin_t;
+   #define analogInputToDigitalPin(p) ((p < 12u) ? (p) + 54u : -1)
+ #endif
+ 
+-#define CRITICAL_SECTION_START  unsigned char _sreg = SREG; cli();
+-#define CRITICAL_SECTION_END    SREG = _sreg;
++#define CRITICAL_SECTION_START  uint32_t primask = __get_PRIMASK(); __disable_irq()
++#define CRITICAL_SECTION_END    if (!primask) __enable_irq()
++#define ISRS_ENABLED() (!__get_PRIMASK())
++#define ENABLE_ISRS()  __enable_irq()
++#define DISABLE_ISRS() __disable_irq()
+ 
+ #undef sq
+ #define sq(x) ((x)*(x))
+diff --git a/Marlin/src/module/endstops.cpp b/Marlin/src/module/endstops.cpp
+index 29ac1e7ce1b..ee312da2d02 100644
+--- a/Marlin/src/module/endstops.cpp
++++ b/Marlin/src/module/endstops.cpp
+@@ -578,19 +578,22 @@ void Endstops::update() {
+ 
+   // Call the endstop triggered routine for single endstops
+   #define PROCESS_ENDSTOP(AXIS,MINMAX) do { \
+-      if (TEST_ENDSTOP(_ENDSTOP(AXIS, MINMAX))) { \
+-        _ENDSTOP_HIT(AXIS, MINMAX); \
+-        planner.endstop_triggered(_AXIS(AXIS)); \
+-      } \
+-    }while(0)
++    if (TEST_ENDSTOP(_ENDSTOP(AXIS, MINMAX))) { \
++      _ENDSTOP_HIT(AXIS, MINMAX); \
++      planner.endstop_triggered(_AXIS(AXIS)); \
++    } \
++  }while(0)
+ 
+-  // Call the endstop triggered routine for single endstops
++  // Call the endstop triggered routine for dual endstops
+   #define PROCESS_DUAL_ENDSTOP(AXIS1, AXIS2, MINMAX) do { \
+-      if (TEST_ENDSTOP(_ENDSTOP(AXIS1, MINMAX)) || TEST_ENDSTOP(_ENDSTOP(AXIS2, MINMAX))) { \
+-        _ENDSTOP_HIT(AXIS1, MINMAX); \
++    const byte dual_hit = TEST_ENDSTOP(_ENDSTOP(AXIS1, MINMAX)) | (TEST_ENDSTOP(_ENDSTOP(AXIS2, MINMAX)) << 1); \
++    if (dual_hit) { \
++      _ENDSTOP_HIT(AXIS1, MINMAX); \
++      /* if not performing home or if both endstops were trigged during homing... */ \
++      if (!stepper.performing_homing || dual_hit == 0x3) \
+         planner.endstop_triggered(_AXIS(AXIS1)); \
+-      } \
+-    }while(0)
++    } \
++  }while(0)
+ 
+   #if ENABLED(G38_PROBE_TARGET) && PIN_EXISTS(Z_MIN_PROBE) && !(CORE_IS_XY || CORE_IS_XZ)
+     // If G38 command is active check Z_MIN_PROBE for ALL movement
+diff --git a/Marlin/src/module/endstops.h b/Marlin/src/module/endstops.h
+index 589a649bbcd..eb411570cd4 100644
+--- a/Marlin/src/module/endstops.h
++++ b/Marlin/src/module/endstops.h
+@@ -108,7 +108,15 @@ class Endstops {
+     /**
+      * Get current endstops state
+      */
+-    FORCE_INLINE static esbits_t state() { return live_state; }
++    FORCE_INLINE static esbits_t state() {
++      return
++        #if ENABLED(ENDSTOP_NOISE_FILTER)
++          validated_live_state
++        #else
++          live_state
++        #endif
++      ;
++    }
+ 
+     /**
+      * Report endstop hits to serial. Called from loop().
+diff --git a/Marlin/src/module/planner.cpp b/Marlin/src/module/planner.cpp
+index 1d358495a90..18d45af509e 100644
+--- a/Marlin/src/module/planner.cpp
++++ b/Marlin/src/module/planner.cpp
+@@ -2467,9 +2467,13 @@ void Planner::_set_position_mm(const float &a, const float &b, const float &c, c
+     position_float[C_AXIS] = c;
+     position_float[E_AXIS] = e;
+   #endif
+-  previous_nominal_speed_sqr = 0.0; // Resets planner junction speeds. Assumes start from rest.
+-  ZERO(previous_speed);
+-  buffer_sync_block();
++  if (has_blocks_queued()) {
++    //previous_nominal_speed_sqr = 0.0; // Reset planner junction speeds. Assume start from rest.
++    //ZERO(previous_speed);
++    buffer_sync_block();
++  }
++  else
++    stepper.set_position(position[A_AXIS], position[B_AXIS], position[C_AXIS], position[E_AXIS]);
+ }
+ 
+ void Planner::set_position_mm_kinematic(const float (&cart)[XYZE]) {
+@@ -2501,8 +2505,12 @@ void Planner::set_position_mm(const AxisEnum axis, const float &v) {
+   #if HAS_POSITION_FLOAT
+     position_float[axis] = v;
+   #endif
+-  previous_speed[axis] = 0.0;
+-  buffer_sync_block();
++  if (has_blocks_queued()) {
++    //previous_speed[axis] = 0.0;
++    buffer_sync_block();
++  }
++  else
++    stepper.set_position(axis, position[axis]);
+ }
+ 
+ // Recalculate the steps/s^2 acceleration rates, based on the mm/s^2
+diff --git a/Marlin/src/module/stepper.cpp b/Marlin/src/module/stepper.cpp
+index fc0378950a0..a69d65d419a 100644
+--- a/Marlin/src/module/stepper.cpp
++++ b/Marlin/src/module/stepper.cpp
+@@ -102,13 +102,13 @@ uint8_t Stepper::last_direction_bits = 0,
+ bool Stepper::abort_current_block;
+ 
+ #if ENABLED(X_DUAL_ENDSTOPS)
+-  bool Stepper::locked_x_motor = false, Stepper::locked_x2_motor = false;
++  bool Stepper::locked_X_motor = false, Stepper::locked_X2_motor = false;
+ #endif
+ #if ENABLED(Y_DUAL_ENDSTOPS)
+-  bool Stepper::locked_y_motor = false, Stepper::locked_y2_motor = false;
++  bool Stepper::locked_Y_motor = false, Stepper::locked_Y2_motor = false;
+ #endif
+ #if ENABLED(Z_DUAL_ENDSTOPS)
+-  bool Stepper::locked_z_motor = false, Stepper::locked_z2_motor = false;
++  bool Stepper::locked_Z_motor = false, Stepper::locked_Z2_motor = false;
+ #endif
+ 
+ /**
+@@ -182,26 +182,20 @@ uint8_t Stepper::step_loops, Stepper::step_loops_nominal;
+ volatile int32_t Stepper::endstops_trigsteps[XYZ];
+ 
+ #if ENABLED(X_DUAL_ENDSTOPS) || ENABLED(Y_DUAL_ENDSTOPS) || ENABLED(Z_DUAL_ENDSTOPS)
+-  #define LOCKED_X_MOTOR  locked_x_motor
+-  #define LOCKED_Y_MOTOR  locked_y_motor
+-  #define LOCKED_Z_MOTOR  locked_z_motor
+-  #define LOCKED_X2_MOTOR locked_x2_motor
+-  #define LOCKED_Y2_MOTOR locked_y2_motor
+-  #define LOCKED_Z2_MOTOR locked_z2_motor
+-  #define DUAL_ENDSTOP_APPLY_STEP(A,V)                                                                                                      \
+-    if (performing_homing) {                                                                                                                \
+-      if (A##_HOME_DIR < 0) {                                                                                                               \
+-        if (!(TEST(endstops.state(), A##_MIN) && count_direction[_AXIS(A)] < 0) && !LOCKED_##A##_MOTOR) A##_STEP_WRITE(V);     \
+-        if (!(TEST(endstops.state(), A##2_MIN) && count_direction[_AXIS(A)] < 0) && !LOCKED_##A##2_MOTOR) A##2_STEP_WRITE(V);  \
+-      }                                                                                                                                     \
+-      else {                                                                                                                                \
+-        if (!(TEST(endstops.state(), A##_MAX) && count_direction[_AXIS(A)] > 0) && !LOCKED_##A##_MOTOR) A##_STEP_WRITE(V);     \
+-        if (!(TEST(endstops.state(), A##2_MAX) && count_direction[_AXIS(A)] > 0) && !LOCKED_##A##2_MOTOR) A##2_STEP_WRITE(V);  \
+-      }                                                                                                                                     \
+-    }                                                                                                                                       \
+-    else {                                                                                                                                  \
+-      A##_STEP_WRITE(V);                                                                                                                    \
+-      A##2_STEP_WRITE(V);                                                                                                                   \
++  #define DUAL_ENDSTOP_APPLY_STEP(A,V)                                                                                        \
++    if (performing_homing) {                                                                                                  \
++      if (A##_HOME_DIR < 0) {                                                                                                 \
++        if (!(TEST(endstops.state(), A##_MIN) && count_direction[_AXIS(A)] < 0) && !locked_##A##_motor) A##_STEP_WRITE(V);    \
++        if (!(TEST(endstops.state(), A##2_MIN) && count_direction[_AXIS(A)] < 0) && !locked_##A##2_motor) A##2_STEP_WRITE(V); \
++      }                                                                                                                       \
++      else {                                                                                                                  \
++        if (!(TEST(endstops.state(), A##_MAX) && count_direction[_AXIS(A)] > 0) && !locked_##A##_motor) A##_STEP_WRITE(V);    \
++        if (!(TEST(endstops.state(), A##2_MAX) && count_direction[_AXIS(A)] > 0) && !locked_##A##2_motor) A##2_STEP_WRITE(V); \
++      }                                                                                                                       \
++    }                                                                                                                         \
++    else {                                                                                                                    \
++      A##_STEP_WRITE(V);                                                                                                      \
++      A##2_STEP_WRITE(V);                                                                                                     \
+     }
+ #endif
+ 
+@@ -1150,19 +1144,8 @@ void Stepper::set_directions() {
+ HAL_STEP_TIMER_ISR {
+   HAL_timer_isr_prologue(STEP_TIMER_NUM);
+ 
+-  // Program timer compare for the maximum period, so it does NOT
+-  // flag an interrupt while this ISR is running - So changes from small
+-  // periods to big periods are respected and the timer does not reset to 0
+-  HAL_timer_set_compare(STEP_TIMER_NUM, HAL_TIMER_TYPE_MAX);
+-
+-  // Call the ISR scheduler
+-  hal_timer_t ticks = Stepper::isr_scheduler();
+-
+-  // Now 'ticks' contains the period to the next Stepper ISR - And we are
+-  // sure that the time has not arrived yet - Warrantied by the scheduler
+-
+-  // Set the next ISR to fire at the proper time
+-  HAL_timer_set_compare(STEP_TIMER_NUM, ticks);
++  // Call the ISR
++  Stepper::isr();
+ 
+   HAL_timer_isr_epilogue(STEP_TIMER_NUM);
+ }
+@@ -1173,8 +1156,15 @@ HAL_STEP_TIMER_ISR {
+   #define STEP_MULTIPLY(A,B) MultiU24X32toH16(A, B)
+ #endif
+ 
+-hal_timer_t Stepper::isr_scheduler() {
+-  uint32_t interval;
++void Stepper::isr() {
++
++  // Disable interrupts, to avoid ISR preemption while we reprogram the period
++  DISABLE_ISRS();
++
++  // Program timer compare for the maximum period, so it does NOT
++  // flag an interrupt while this ISR is running - So changes from small
++  // periods to big periods are respected and the timer does not reset to 0
++  HAL_timer_set_compare(STEP_TIMER_NUM, HAL_TIMER_TYPE_MAX);
+ 
+   // Count of ticks for the next ISR
+   hal_timer_t next_isr_ticks = 0;
+@@ -1185,6 +1175,9 @@ hal_timer_t Stepper::isr_scheduler() {
+   // We need this variable here to be able to use it in the following loop
+   hal_timer_t min_ticks;
+   do {
++    // Enable ISRs so the USART processing latency is reduced
++    ENABLE_ISRS();
++
+     // Run main stepping pulse phase ISR if we have to
+     if (!nextMainISR) Stepper::stepper_pulse_phase_isr();
+ 
+@@ -1198,13 +1191,15 @@ hal_timer_t Stepper::isr_scheduler() {
+     // Run main stepping block processing ISR if we have to
+     if (!nextMainISR) nextMainISR = Stepper::stepper_block_phase_isr();
+ 
+-    #if ENABLED(LIN_ADVANCE)
+-      // Select the closest interval in time
+-      interval = (nextAdvanceISR <= nextMainISR) ? nextAdvanceISR : nextMainISR;
+-    #else
+-      // The interval is just the remaining time to the stepper ISR
+-      interval = nextMainISR;
+-    #endif
++    uint32_t interval =
++      #if ENABLED(LIN_ADVANCE)
++        // Select the closest interval in time
++        MIN(nextAdvanceISR, nextMainISR)
++      #else
++        // The interval is just the remaining time to the stepper ISR
++        nextMainISR
++      #endif
++    ;
+ 
+     // Limit the value to the maximum possible value of the timer
+     NOMORE(interval, HAL_TIMER_TYPE_MAX);
+@@ -1243,6 +1238,16 @@ hal_timer_t Stepper::isr_scheduler() {
+     // Compute the tick count for the next ISR
+     next_isr_ticks += interval;
+ 
++    /**
++     *  The following section must be done with global interrupts disabled.
++     * We want nothing to interrupt it, as that could mess the calculations
++     * we do for the next value to program in the period register of the
++     * stepper timer and lead to skipped ISRs (if the value we happen to program
++     * is less than the current count due to something preempting between the
++     * read and the write of the new period value).
++     */
++    DISABLE_ISRS();
++
+     /**
+      * Get the current tick value + margin
+      * Assuming at least 6µs between calls to this ISR...
+@@ -1264,8 +1269,14 @@ hal_timer_t Stepper::isr_scheduler() {
+     // Advance pulses if not enough time to wait for the next ISR
+   } while (next_isr_ticks < min_ticks);
+ 
+-  // Return the count of ticks for the next ISR
+-  return (hal_timer_t)next_isr_ticks;
++  // Now 'next_isr_ticks' contains the period to the next Stepper ISR - And we are
++  // sure that the time has not arrived yet - Warrantied by the scheduler
++
++  // Set the next ISR to fire at the proper time
++  HAL_timer_set_compare(STEP_TIMER_NUM, hal_timer_t(next_isr_ticks));
++
++  // Don't forget to finally reenable interrupts
++  ENABLE_ISRS();
+ }
+ 
+ /**
+diff --git a/Marlin/src/module/stepper.h b/Marlin/src/module/stepper.h
+index 19c9d4b9b5f..d3dd06aa5ee 100644
+--- a/Marlin/src/module/stepper.h
++++ b/Marlin/src/module/stepper.h
+@@ -81,13 +81,13 @@ class Stepper {
+     static bool abort_current_block;        // Signals to the stepper that current block should be aborted
+ 
+     #if ENABLED(X_DUAL_ENDSTOPS)
+-      static bool locked_x_motor, locked_x2_motor;
++      static bool locked_X_motor, locked_X2_motor;
+     #endif
+     #if ENABLED(Y_DUAL_ENDSTOPS)
+-      static bool locked_y_motor, locked_y2_motor;
++      static bool locked_Y_motor, locked_Y2_motor;
+     #endif
+     #if ENABLED(Z_DUAL_ENDSTOPS)
+-      static bool locked_z_motor, locked_z2_motor;
++      static bool locked_Z_motor, locked_Z2_motor;
+     #endif
+ 
+     // Counter variables for the Bresenham line tracer
+@@ -168,7 +168,7 @@ class Stepper {
+     // Interrupt Service Routines
+ 
+     // The ISR scheduler
+-    static hal_timer_t isr_scheduler();
++    static void isr();
+ 
+     // The stepper pulse phase ISR
+     static void stepper_pulse_phase_isr();
+@@ -222,18 +222,18 @@ class Stepper {
+ 
+     #if ENABLED(X_DUAL_ENDSTOPS)
+       FORCE_INLINE static void set_homing_flag_x(const bool state) { performing_homing = state; }
+-      FORCE_INLINE static void set_x_lock(const bool state) { locked_x_motor = state; }
+-      FORCE_INLINE static void set_x2_lock(const bool state) { locked_x2_motor = state; }
++      FORCE_INLINE static void set_x_lock(const bool state) { locked_X_motor = state; }
++      FORCE_INLINE static void set_x2_lock(const bool state) { locked_X2_motor = state; }
+     #endif
+     #if ENABLED(Y_DUAL_ENDSTOPS)
+       FORCE_INLINE static void set_homing_flag_y(const bool state) { performing_homing = state; }
+-      FORCE_INLINE static void set_y_lock(const bool state) { locked_y_motor = state; }
+-      FORCE_INLINE static void set_y2_lock(const bool state) { locked_y2_motor = state; }
++      FORCE_INLINE static void set_y_lock(const bool state) { locked_Y_motor = state; }
++      FORCE_INLINE static void set_y2_lock(const bool state) { locked_Y2_motor = state; }
+     #endif
+     #if ENABLED(Z_DUAL_ENDSTOPS)
+       FORCE_INLINE static void set_homing_flag_z(const bool state) { performing_homing = state; }
+-      FORCE_INLINE static void set_z_lock(const bool state) { locked_z_motor = state; }
+-      FORCE_INLINE static void set_z2_lock(const bool state) { locked_z2_motor = state; }
++      FORCE_INLINE static void set_z_lock(const bool state) { locked_Z_motor = state; }
++      FORCE_INLINE static void set_z2_lock(const bool state) { locked_Z2_motor = state; }
+     #endif
+ 
+     #if ENABLED(BABYSTEPPING)
+@@ -247,16 +247,34 @@ class Stepper {
+     // Set the current position in steps
+     inline static void set_position(const int32_t &a, const int32_t &b, const int32_t &c, const int32_t &e) {
+       planner.synchronize();
+-      CRITICAL_SECTION_START;
++
++      // Disable stepper interrupts, to ensure atomic setting of all the position variables
++      const bool was_enabled = STEPPER_ISR_ENABLED();
++      if (was_enabled) DISABLE_STEPPER_DRIVER_INTERRUPT();
++
++      // Set position
+       _set_position(a, b, c, e);
+-      CRITICAL_SECTION_END;
++
++      // Reenable Stepper ISR
++      if (was_enabled) ENABLE_STEPPER_DRIVER_INTERRUPT();
+     }
+ 
+     inline static void set_position(const AxisEnum a, const int32_t &v) {
+       planner.synchronize();
+-      CRITICAL_SECTION_START;
++
++    #ifdef __AVR__
++      // Protect the access to the position. Only required for AVR, as
++      //  any 32bit CPU offers atomic access to 32bit variables
++      const bool was_enabled = STEPPER_ISR_ENABLED();
++      if (was_enabled) DISABLE_STEPPER_DRIVER_INTERRUPT();
++    #endif
++
+       count_position[a] = v;
+-      CRITICAL_SECTION_END;
++
++    #ifdef __AVR__
++      // Reenable Stepper ISR
++      if (was_enabled) ENABLE_STEPPER_DRIVER_INTERRUPT();
++    #endif
+     }
+ 
+   private:

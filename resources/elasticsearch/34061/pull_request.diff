@@ -1,0 +1,510 @@
+diff --git a/core/src/main/java/org/apache/lucene/queryparser/classic/MapperQueryParser.java b/core/src/main/java/org/apache/lucene/queryparser/classic/MapperQueryParser.java
+index 130066788e71..ff30e568c317 100644
+--- a/core/src/main/java/org/apache/lucene/queryparser/classic/MapperQueryParser.java
++++ b/core/src/main/java/org/apache/lucene/queryparser/classic/MapperQueryParser.java
+@@ -39,9 +39,15 @@
+ import org.apache.lucene.search.spans.SpanNearQuery;
+ import org.apache.lucene.search.spans.SpanOrQuery;
+ import org.apache.lucene.search.spans.SpanQuery;
++import org.apache.lucene.search.spans.SpanTermQuery;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.IOUtils;
+ import org.apache.lucene.util.automaton.RegExp;
++import org.apache.lucene.util.graph.GraphTokenStreamFiniteStrings;
++import org.apache.lucene.util.QueryBuilder;
++import org.elasticsearch.common.Booleans;
++import org.elasticsearch.common.logging.DeprecationLogger;
++import org.elasticsearch.common.logging.Loggers;
+ import org.elasticsearch.common.lucene.search.Queries;
+ import org.elasticsearch.common.unit.Fuzziness;
+ import org.elasticsearch.index.mapper.AllFieldMapper;
+@@ -58,9 +64,11 @@
+ import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.HashMap;
++import java.util.Iterator;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Collections;
++
+ import static java.util.Collections.unmodifiableMap;
+ import static org.elasticsearch.common.lucene.search.Queries.fixNegativeQueryIfNeeded;
+ 
+@@ -72,6 +80,7 @@
+  * as well as the query on the name.
+  */
+ public class MapperQueryParser extends AnalyzingQueryParser {
++    private static final DeprecationLogger DEPRECATION_LOGGER = new DeprecationLogger(Loggers.getLogger(MapperQueryParser.class));
+ 
+     public static final Map<String, FieldQueryExtension> FIELD_QUERY_EXTENSIONS;
+ 
+@@ -828,6 +837,7 @@ public Query parse(String query) throws ParseException {
+      * Checks if graph analysis should be enabled for the field depending
+      * on the provided {@link Analyzer}
+      */
++    @Override
+     protected Query createFieldQuery(Analyzer analyzer, BooleanClause.Occur operator, String field,
+                                      String queryText, boolean quoted, int phraseSlop) {
+         assert operator == BooleanClause.Occur.SHOULD || operator == BooleanClause.Occur.MUST;
+@@ -849,4 +859,131 @@ protected Query createFieldQuery(Analyzer analyzer, BooleanClause.Occur operator
+             throw new RuntimeException("Error analyzing query text", e);
+         }
+     }
++
++    /**
++     * See {@link MapperQueryParser#analyzeGraphPhraseWithLimit}
++     */
++    @Override
++    protected SpanQuery analyzeGraphPhrase(TokenStream source, String field, int phraseSlop) throws IOException {
++        return analyzeGraphPhraseWithLimit(source, field, phraseSlop, this::createSpanQuery, shouldApplyGraphPhraseLimit());
++    }
++
++    /** A BiFuntion that can throw an IOException */
++    @FunctionalInterface
++    public interface CheckedBiFunction<T, U, R> {
++
++        /**
++         * Applies this function to the given arguments.
++         *
++         * @param t the first function argument
++         * @param u the second function argument
++         * @return the function result
++         */
++        R apply(T t, U u) throws IOException;
++    }
++
++    /**
++     * Checks the value of the JVM option <code>es.query.write.apply_graph_phrase_limit</code> to determine
++     * if the analysis of graph phrase should be limited to {@link BooleanQuery#getMaxClauseCount()}.
++     * The JVM option can only be set to <code>true</code> (false is the default value), any other value
++     * will throw an {@link IllegalArgumentException}.
++     */
++    public static boolean shouldApplyGraphPhraseLimit() {
++        String value = System.getProperty("es.query.apply_graph_phrase_limit");
++        if (value == null) {
++            return false;
++        } else if ("true".equals(value) == false) {
++            throw new IllegalArgumentException("[" + value + "] is not a valid value for the JVM option:" +
++                "[es.query.apply_graph_phrase_limit]. Set it to [true] to activate the limit.");
++        } else {
++            return true;
++        }
++    }
++
++    /**
++     * Overrides {@link QueryBuilder#analyzeGraphPhrase(TokenStream, String, int)} to add
++     * a limit (see {@link BooleanQuery#getMaxClauseCount()}) to the number of {@link SpanQuery}
++     * that this method can create.
++     */
++    public static SpanQuery analyzeGraphPhraseWithLimit(TokenStream source, String field, int phraseSlop,
++                                                            CheckedBiFunction<TokenStream, String, SpanQuery> spanQueryFunc,
++                                                            boolean isHardLimit) throws IOException {
++        GraphTokenStreamFiniteStrings graph = new GraphTokenStreamFiniteStrings(source);
++        List<SpanQuery> clauses = new ArrayList<>();
++        int[] articulationPoints = graph.articulationPoints();
++        int lastState = 0;
++        int maxBooleanClause = BooleanQuery.getMaxClauseCount();
++        for (int i = 0; i <= articulationPoints.length; i++) {
++            int start = lastState;
++            int end = -1;
++            if (i < articulationPoints.length) {
++                end = articulationPoints[i];
++            }
++            lastState = end;
++            final SpanQuery queryPos;
++            if (graph.hasSidePath(start)) {
++                List<SpanQuery> queries = new ArrayList<>();
++                Iterator<TokenStream> it = graph.getFiniteStrings(start, end);
++                while (it.hasNext()) {
++                    TokenStream ts = it.next();
++                    SpanQuery q = spanQueryFunc.apply(ts, field);
++                    if (q != null) {
++                        if (queries.size() >= maxBooleanClause) {
++                            if (isHardLimit) {
++                                throw new BooleanQuery.TooManyClauses();
++                            } else {
++
++                            }
++                        }
++                        queries.add(q);
++                    }
++                }
++                if (queries.size() > 0) {
++                    queryPos = new SpanOrQuery(queries.toArray(new SpanQuery[0]));
++                } else {
++                    queryPos = null;
++                }
++            } else {
++                Term[] terms = graph.getTerms(field, start);
++                assert terms.length > 0;
++                if (terms.length >= maxBooleanClause) {
++                    if (isHardLimit) {
++                        throw new BooleanQuery.TooManyClauses();
++                    } else {
++                        DEPRECATION_LOGGER.deprecated("Phrase query on field:[" + field + "] reached the max boolean" +
++                            " clause limit [" + maxBooleanClause + "] after expansion. This query will throw an error in" +
++                            " the next major version.");
++                    }
++                }
++                if (terms.length == 1) {
++                    queryPos = new SpanTermQuery(terms[0]);
++                } else {
++                    SpanTermQuery[] orClauses = new SpanTermQuery[terms.length];
++                    for (int idx = 0; idx < terms.length; idx++) {
++                        orClauses[idx] = new SpanTermQuery(terms[idx]);
++                    }
++                    queryPos = new SpanOrQuery(orClauses);
++                }
++            }
++            if (queryPos != null) {
++                if (clauses.size() >= maxBooleanClause) {
++                    if (isHardLimit) {
++                        throw new BooleanQuery.TooManyClauses();
++                    } else {
++                        DEPRECATION_LOGGER.deprecated("Phrase query on field:[" + field + "] reached the max boolean" +
++                            " clause limit [" + maxBooleanClause + "] after expansion. This query will throw an error in" +
++                            " the next major version.");
++                    }
++                }
++                clauses.add(queryPos);
++            }
++        }
++        if (clauses.isEmpty()) {
++            return null;
++        } else if (clauses.size() == 1) {
++            return clauses.get(0);
++        } else {
++            return new SpanNearQuery(clauses.toArray(new SpanQuery[0]), phraseSlop, true);
++        }
++    }
+ }
+diff --git a/core/src/main/java/org/elasticsearch/index/query/SimpleQueryParser.java b/core/src/main/java/org/elasticsearch/index/query/SimpleQueryParser.java
+index a147e496045e..e54b768cdc75 100644
+--- a/core/src/main/java/org/elasticsearch/index/query/SimpleQueryParser.java
++++ b/core/src/main/java/org/elasticsearch/index/query/SimpleQueryParser.java
+@@ -24,6 +24,7 @@
+ import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
+ import org.apache.lucene.analysis.tokenattributes.PositionIncrementAttribute;
+ import org.apache.lucene.index.Term;
++import org.apache.lucene.queryparser.classic.MapperQueryParser;
+ import org.apache.lucene.search.BooleanClause;
+ import org.apache.lucene.search.BooleanQuery;
+ import org.apache.lucene.search.BoostQuery;
+@@ -31,6 +32,7 @@
+ import org.apache.lucene.search.PrefixQuery;
+ import org.apache.lucene.search.Query;
+ import org.apache.lucene.search.SynonymQuery;
++import org.apache.lucene.search.spans.SpanQuery;
+ import org.apache.lucene.util.BytesRef;
+ import org.elasticsearch.index.analysis.ShingleTokenFilterFactory;
+ import org.elasticsearch.index.mapper.MappedFieldType;
+@@ -41,6 +43,9 @@
+ import java.util.List;
+ import java.util.ArrayList;
+ 
++import static org.apache.lucene.queryparser.classic.MapperQueryParser.analyzeGraphPhraseWithLimit;
++import static org.apache.lucene.queryparser.classic.MapperQueryParser.shouldApplyGraphPhraseLimit;
++
+ /**
+  * Wrapper class for Lucene's SimpleQueryParser that allows us to redefine
+  * different types of queries.
+@@ -173,6 +178,7 @@ public Query newPrefixQuery(String text) {
+      * Checks if graph analysis should be enabled for the field depending
+      * on the provided {@link Analyzer}
+      */
++    @Override
+     protected Query createFieldQuery(Analyzer analyzer, BooleanClause.Occur operator, String field,
+                                      String queryText, boolean quoted, int phraseSlop) {
+         assert operator == BooleanClause.Occur.SHOULD || operator == BooleanClause.Occur.MUST;
+@@ -195,6 +201,14 @@ protected Query createFieldQuery(Analyzer analyzer, BooleanClause.Occur operator
+         }
+     }
+ 
++    /**
++     * See {@link MapperQueryParser#analyzeGraphPhraseWithLimit}
++     */
++    @Override
++    protected SpanQuery analyzeGraphPhrase(TokenStream source, String field, int phraseSlop) throws IOException {
++        return analyzeGraphPhraseWithLimit(source, field, phraseSlop, this::createSpanQuery, shouldApplyGraphPhraseLimit());
++    }
++
+     private static Query wrapWithBoost(Query query, float boost) {
+         if (boost != AbstractQueryBuilder.DEFAULT_BOOST) {
+             return new BoostQuery(query, boost);
+diff --git a/core/src/main/java/org/elasticsearch/index/search/MatchQuery.java b/core/src/main/java/org/elasticsearch/index/search/MatchQuery.java
+index f3ea9447db74..30f41a7a12e2 100644
+--- a/core/src/main/java/org/elasticsearch/index/search/MatchQuery.java
++++ b/core/src/main/java/org/elasticsearch/index/search/MatchQuery.java
+@@ -24,6 +24,7 @@
+ import org.apache.lucene.analysis.TokenStream;
+ import org.apache.lucene.index.Term;
+ import org.apache.lucene.queries.ExtendedCommonTermsQuery;
++import org.apache.lucene.queryparser.classic.MapperQueryParser;
+ import org.apache.lucene.search.BooleanClause;
+ import org.apache.lucene.search.BooleanClause.Occur;
+ import org.apache.lucene.search.BooleanQuery;
+@@ -58,6 +59,9 @@
+ 
+ import java.io.IOException;
+ 
++import static org.apache.lucene.queryparser.classic.MapperQueryParser.analyzeGraphPhraseWithLimit;
++import static org.apache.lucene.queryparser.classic.MapperQueryParser.shouldApplyGraphPhraseLimit;
++
+ public class MatchQuery {
+ 
+     public enum Type implements Writeable {
+@@ -349,6 +353,14 @@ protected Query createFieldQuery(Analyzer analyzer, BooleanClause.Occur operator
+             }
+         }
+ 
++        /**
++         * See {@link MapperQueryParser#analyzeGraphPhraseWithLimit}
++         */
++        @Override
++        protected SpanQuery analyzeGraphPhrase(TokenStream source, String field, int phraseSlop) throws IOException {
++            return analyzeGraphPhraseWithLimit(source, field, phraseSlop, this::createSpanQuery, shouldApplyGraphPhraseLimit());
++        }
++
+         public Query createPhrasePrefixQuery(String field, String queryText, int phraseSlop, int maxExpansions) {
+             final Query query = createFieldQuery(getAnalyzer(), Occur.MUST, field, queryText, true, phraseSlop);
+             return toMultiPhrasePrefix(query, phraseSlop, maxExpansions);
+diff --git a/core/src/main/java/org/elasticsearch/search/SearchModule.java b/core/src/main/java/org/elasticsearch/search/SearchModule.java
+index a68a5b7fa17d..a50c6eeea5af 100644
+--- a/core/src/main/java/org/elasticsearch/search/SearchModule.java
++++ b/core/src/main/java/org/elasticsearch/search/SearchModule.java
+@@ -19,6 +19,7 @@
+ 
+ package org.elasticsearch.search;
+ 
++import org.apache.lucene.queryparser.classic.MapperQueryParser;
+ import org.apache.lucene.search.BooleanQuery;
+ import org.elasticsearch.common.NamedRegistry;
+ import org.elasticsearch.common.geo.ShapesAvailability;
+@@ -258,6 +259,7 @@
+ 
+ import static java.util.Collections.unmodifiableMap;
+ import static java.util.Objects.requireNonNull;
++import static org.apache.lucene.queryparser.classic.MapperQueryParser.shouldApplyGraphPhraseLimit;
+ 
+ /**
+  * Sets up things that can be done at search time like queries, aggregations, and suggesters.
+@@ -282,6 +284,8 @@
+     public SearchModule(Settings settings, boolean transportClient, List<SearchPlugin> plugins) {
+         this.settings = settings;
+         this.transportClient = transportClient;
++        // checks if the system property es.query.apply_graph_phrase_limit is set to a valid value
++        shouldApplyGraphPhraseLimit();
+         registerSuggesters(plugins);
+         highlighters = setupHighlighters(settings, plugins);
+         registerScoreFunctions(plugins);
+diff --git a/core/src/test/java/org/elasticsearch/index/query/QueryStringQueryBuilderTests.java b/core/src/test/java/org/elasticsearch/index/query/QueryStringQueryBuilderTests.java
+index 795189d7ded9..3c6cdc34ea2d 100644
+--- a/core/src/test/java/org/elasticsearch/index/query/QueryStringQueryBuilderTests.java
++++ b/core/src/test/java/org/elasticsearch/index/query/QueryStringQueryBuilderTests.java
+@@ -19,7 +19,13 @@
+ 
+ package org.elasticsearch.index.query;
+ 
++import org.apache.lucene.analysis.Analyzer;
++import org.apache.lucene.analysis.CannedBinaryTokenStream;
+ import org.apache.lucene.analysis.MockSynonymAnalyzer;
++import org.apache.lucene.analysis.MockTokenizer;
++import org.apache.lucene.analysis.TokenStream;
++import org.apache.lucene.analysis.Tokenizer;
++import org.apache.lucene.analysis.tokenattributes.TermToBytesRefAttribute;
+ import org.apache.lucene.index.Term;
+ import org.apache.lucene.queryparser.classic.MapperQueryParser;
+ import org.apache.lucene.queryparser.classic.QueryParserSettings;
+@@ -43,6 +49,7 @@
+ import org.apache.lucene.search.WildcardQuery;
+ import org.apache.lucene.search.spans.SpanNearQuery;
+ import org.apache.lucene.search.spans.SpanOrQuery;
++import org.apache.lucene.search.spans.SpanQuery;
+ import org.apache.lucene.search.spans.SpanTermQuery;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.automaton.TooComplexToDeterminizeException;
+@@ -60,6 +67,7 @@
+ import org.joda.time.DateTimeZone;
+ 
+ import java.io.IOException;
++import java.io.Reader;
+ import java.util.ArrayList;
+ import java.util.List;
+ 
+@@ -1038,4 +1046,107 @@ public void testInvalidCombo() throws IOException {
+         assertEquals(exc.getMessage(),
+             "it is disallowed to disable [split_on_whitespace] if [auto_generate_phrase_queries] is activated");
+     }
++
++    public void testGraphPhraseWithLimit() throws IOException {
++        assumeTrue("test runs only when at least a type is registered", getCurrentTypes().length > 0);
++        assertFalse(MapperQueryParser.shouldApplyGraphPhraseLimit());
++        try (TokenStream source = new MockGraphAnalyzer(createGiantGraph(40))
++            .createComponents("").getTokenStream()) {
++            expectThrows(BooleanQuery.TooManyClauses.class,
++                () -> MapperQueryParser.analyzeGraphPhraseWithLimit(source, "field", 0,
++                    QueryStringQueryBuilderTests::createSpanQuery, true));
++        }
++
++        try (TokenStream source = new MockGraphAnalyzer(createGiantGraphMultiTerms())
++            .createComponents("").getTokenStream()) {
++            expectThrows(BooleanQuery.TooManyClauses.class,
++                () -> MapperQueryParser.analyzeGraphPhraseWithLimit(source, "field", 0,
++                    QueryStringQueryBuilderTests::createSpanQuery, true));
++        }
++
++        try (TokenStream source = new MockGraphAnalyzer(createGiantGraphMultiTerms())
++            .createComponents("").getTokenStream()) {
++            Query query = MapperQueryParser.analyzeGraphPhraseWithLimit(source, "field", 0,
++                QueryStringQueryBuilderTests::createSpanQuery, false);
++            assertThat(query, instanceOf(SpanQuery.class));
++            assertWarnings("Phrase query on field:[field] reached the max boolean clause limit [1024] after expansion. " +
++                "This query will throw an error in the next major version.");
++        }
++    }
++
++    private static SpanQuery createSpanQuery(TokenStream in, String field) throws IOException {
++        TermToBytesRefAttribute termAtt = in.getAttribute(TermToBytesRefAttribute.class);
++        if (termAtt == null) {
++            return null;
++        }
++
++        List<SpanTermQuery> terms = new ArrayList<>();
++        while (in.incrementToken()) {
++            terms.add(new SpanTermQuery(new Term(field, termAtt.getBytesRef())));
++        }
++
++        if (terms.isEmpty()) {
++            return null;
++        } else if (terms.size() == 1) {
++            return terms.get(0);
++        } else {
++            return new SpanNearQuery(terms.toArray(new SpanTermQuery[0]), 0, true);
++        }
++    }
++
++    private static class MockGraphAnalyzer extends Analyzer {
++        final CannedBinaryTokenStream.BinaryToken[] tokens;
++        private MockGraphAnalyzer(CannedBinaryTokenStream.BinaryToken[] tokens ) {
++            this.tokens = tokens;
++        }
++        @Override
++        protected Analyzer.TokenStreamComponents createComponents(String fieldName) {
++            Tokenizer tokenizer = new MockTokenizer(MockTokenizer.SIMPLE, true);
++            return new TokenStreamComponents(tokenizer) {
++                @Override
++                public TokenStream getTokenStream() {
++                    return new CannedBinaryTokenStream(tokens);
++                }
++                @Override
++                protected void setReader(final Reader reader) {
++                }
++            };
++        }
++    }
++    /**
++     * Creates a graph token stream with 2 side paths at each position.
++     **/
++    private static CannedBinaryTokenStream.BinaryToken[] createGiantGraph(int numPos) {
++        List<CannedBinaryTokenStream.BinaryToken> tokens = new ArrayList<>();
++        BytesRef term1 = new BytesRef("foo");
++        BytesRef term2 = new BytesRef("bar");
++        for (int i = 0; i < numPos;) {
++            if (i % 2 == 0) {
++                tokens.add(new CannedBinaryTokenStream.BinaryToken(term2, 1, 1));
++                tokens.add(new CannedBinaryTokenStream.BinaryToken(term1, 0, 2));
++                i += 2;
++            } else {
++                tokens.add(new CannedBinaryTokenStream.BinaryToken(term2, 1, 1));
++                i++;
++            }
++        }
++        return tokens.toArray(new CannedBinaryTokenStream.BinaryToken[0]);
++    }
++    /**
++     * Creates a graph token stream with {@link BooleanQuery#getMaxClauseCount()}
++     * expansions at the last position.
++     **/
++    private static CannedBinaryTokenStream.BinaryToken[] createGiantGraphMultiTerms() {
++        List<CannedBinaryTokenStream.BinaryToken> tokens = new ArrayList<>();
++        BytesRef term1 = new BytesRef("foo");
++        BytesRef term2 = new BytesRef("bar");
++        tokens.add(new CannedBinaryTokenStream.BinaryToken(term2, 1, 1));
++        tokens.add(new CannedBinaryTokenStream.BinaryToken(term1, 0, 2));
++        tokens.add(new CannedBinaryTokenStream.BinaryToken(term2, 1, 1));
++        tokens.add(new CannedBinaryTokenStream.BinaryToken(term2, 1, 1));
++        for (int i = 0; i < BooleanQuery.getMaxClauseCount(); i++) {
++            tokens.add(new CannedBinaryTokenStream.BinaryToken(term1, 0, 1));
++        }
++        return tokens.toArray(new CannedBinaryTokenStream.BinaryToken[0]);
++    }
+ }
+diff --git a/docs/reference/query-dsl/full-text-queries.asciidoc b/docs/reference/query-dsl/full-text-queries.asciidoc
+index ba3924669d81..759bbf561a32 100644
+--- a/docs/reference/query-dsl/full-text-queries.asciidoc
++++ b/docs/reference/query-dsl/full-text-queries.asciidoc
+@@ -5,6 +5,11 @@ The high-level full text queries are usually used for running full text
+ queries on full text fields like the body of an email. They understand how the
+ field being queried is <<analysis,analyzed>> and will apply each field's
+ `analyzer` (or `search_analyzer`) to the query string before executing.
++The node setting named `indices.query.bool.max_clause_count` (defaults to 1024)
++is applied to boolean queries in order to limit the number of terms per query.
++It is also possible to limit the expansion of phrase queries with the JVM option `-Des.query.apply_graph_phrase_limit=true`,
++when activated the `indices.query.bool.max_clause_count` is applied to phrase queries expansions.
++Elasticsearch will stop observing this system property in 6x.
+ 
+ The queries in this group are:
+ 
+@@ -40,6 +45,8 @@ The queries in this group are:
+     A simpler, more robust version of the `query_string` syntax suitable
+     for exposing directly to users.
+ 
++These queries
++
+ include::match-query.asciidoc[]
+ 
+ include::match-phrase-query.asciidoc[]
+diff --git a/qa/evil-tests/src/test/java/org/elasticsearch/cluster/metadata/EvilSystemPropertyTests.java b/qa/evil-tests/src/test/java/org/elasticsearch/cluster/metadata/EvilSystemPropertyTests.java
+index 5e44fdbefad0..2316dbcfe011 100644
+--- a/qa/evil-tests/src/test/java/org/elasticsearch/cluster/metadata/EvilSystemPropertyTests.java
++++ b/qa/evil-tests/src/test/java/org/elasticsearch/cluster/metadata/EvilSystemPropertyTests.java
+@@ -18,10 +18,13 @@
+  */
+ package org.elasticsearch.cluster.metadata;
+ 
++import org.apache.lucene.queryparser.classic.MapperQueryParser;
+ import org.elasticsearch.common.SuppressForbidden;
+ import org.elasticsearch.common.settings.Settings;
+ import org.elasticsearch.test.ESTestCase;
+ 
++import static org.hamcrest.Matchers.containsString;
++
+ public class EvilSystemPropertyTests extends ESTestCase {
+ 
+     @SuppressForbidden(reason = "manipulates system properties for testing")
+@@ -44,4 +47,25 @@ public void testMaxNumShards() {
+             System.clearProperty("es.index.max_number_of_shards");
+         }
+     }
++
++    @SuppressForbidden(reason = "manipulates system property es.query.apply_graph_phrase_limit")
++    public void testApplyGraphPhraseLimit() {
++        assertFalse(MapperQueryParser.shouldApplyGraphPhraseLimit());
++        try {
++            System.setProperty("es.query.apply_graph_phrase_limit", "false");
++            IllegalArgumentException exc = expectThrows(IllegalArgumentException.class,
++                () -> MapperQueryParser.shouldApplyGraphPhraseLimit());
++            assertThat(exc.getMessage(), containsString("[false] is not a valid value for the JVM option"));
++
++            System.setProperty("es.query.apply_graph_phrase_limit", "lol");
++            exc = expectThrows(IllegalArgumentException.class,
++                () -> MapperQueryParser.shouldApplyGraphPhraseLimit());
++            assertThat(exc.getMessage(), containsString("[lol] is not a valid value for the JVM option"));
++
++            System.setProperty("es.query.apply_graph_phrase_limit", "true");
++            assertTrue(MapperQueryParser.shouldApplyGraphPhraseLimit());
++        } finally {
++            System.clearProperty("es.query.apply_graph_phrase_limit");
++        }
++    }
+ }

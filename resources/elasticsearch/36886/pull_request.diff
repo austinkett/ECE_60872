@@ -1,0 +1,290 @@
+diff --git a/x-pack/plugin/ccr/src/main/java/org/elasticsearch/xpack/ccr/action/AutoFollowCoordinator.java b/x-pack/plugin/ccr/src/main/java/org/elasticsearch/xpack/ccr/action/AutoFollowCoordinator.java
+index 4888b0367fd2..9043b379b5b3 100644
+--- a/x-pack/plugin/ccr/src/main/java/org/elasticsearch/xpack/ccr/action/AutoFollowCoordinator.java
++++ b/x-pack/plugin/ccr/src/main/java/org/elasticsearch/xpack/ccr/action/AutoFollowCoordinator.java
+@@ -45,6 +45,7 @@
+ import java.util.HashSet;
+ import java.util.LinkedHashMap;
+ import java.util.List;
++import java.util.Locale;
+ import java.util.Map;
+ import java.util.Objects;
+ import java.util.Set;
+@@ -345,7 +346,7 @@ private void autoFollowIndices(final AutoFollowMetadata autoFollowMetadata,
+ 
+                     Consumer<AutoFollowResult> resultHandler = result -> finalise(slot, result);
+                     checkAutoFollowPattern(autoFollowPatternName, remoteCluster, autoFollowPattern, leaderIndicesToFollow, headers,
+-                        patternsForTheSameRemoteCluster, resultHandler);
++                        patternsForTheSameRemoteCluster, remoteClusterState.metaData(), resultHandler);
+                 }
+                 i++;
+             }
+@@ -358,6 +359,7 @@ private void checkAutoFollowPattern(String autoFollowPattenName,
+                                             List<Index> leaderIndicesToFollow,
+                                             Map<String, String> headers,
+                                             List<Tuple<String, AutoFollowPattern>> patternsForTheSameRemoteCluster,
++                                            MetaData remoteMetadata,
+                                             Consumer<AutoFollowResult> resultHandler) {
+ 
+             final CountDown leaderIndicesCountDown = new CountDown(leaderIndicesToFollow.size());
+@@ -377,6 +379,25 @@ private void checkAutoFollowPattern(String autoFollowPattenName,
+                         resultHandler.accept(new AutoFollowResult(autoFollowPattenName, results.asList()));
+                     }
+                 } else {
++                    final Settings leaderIndexSettings = remoteMetadata.getIndexSafe(indexToFollow).getSettings();
++                    if (leaderIndexSettings.getAsBoolean(IndexSettings.INDEX_SOFT_DELETES_SETTING.getKey(),
++                        IndexMetaData.SETTING_INDEX_VERSION_CREATED.get(leaderIndexSettings).onOrAfter(Version.V_7_0_0)) == false) {
++
++                        String message = String.format(Locale.ROOT, "index [%s] cannot be followed, because soft deletes are not enabled",
++                            indexToFollow.getName());
++                        LOGGER.warn(message);
++                        updateAutoFollowMetadata(recordLeaderIndexAsFollowFunction(autoFollowPattenName, indexToFollow), error -> {
++                            ElasticsearchException failure = new ElasticsearchException(message);
++                            if (error != null) {
++                                failure.addSuppressed(error);
++                            }
++                            results.set(slot, new Tuple<>(indexToFollow, failure));
++                            if (leaderIndicesCountDown.countDown()) {
++                                resultHandler.accept(new AutoFollowResult(autoFollowPattenName, results.asList()));
++                            }
++                        });
++                        continue;
++                    }
+                     followLeaderIndex(autoFollowPattenName, remoteCluster, indexToFollow, autoFollowPattern, headers, error -> {
+                         results.set(slot, new Tuple<>(indexToFollow, error));
+                         if (leaderIndicesCountDown.countDown()) {
+@@ -455,12 +476,7 @@ private void finalise(int slot, AutoFollowResult result) {
+                         // has a leader index uuid custom metadata entry that matches with uuid of leaderIndexMetaData variable
+                         // If so then handle it differently: not follow it, but just add an entry to
+                         // AutoFollowMetadata#followedLeaderIndexUUIDs
+-                        final Settings leaderIndexSettings = leaderIndexMetaData.getSettings();
+-                        // soft deletes are enabled by default on indices created on 7.0.0 or later
+-                        if (leaderIndexSettings.getAsBoolean(IndexSettings.INDEX_SOFT_DELETES_SETTING.getKey(),
+-                            IndexMetaData.SETTING_INDEX_VERSION_CREATED.get(leaderIndexSettings).onOrAfter(Version.V_7_0_0))) {
+-                            leaderIndicesToFollow.add(leaderIndexMetaData.getIndex());
+-                        }
++                        leaderIndicesToFollow.add(leaderIndexMetaData.getIndex());
+                     }
+                 }
+             }
+diff --git a/x-pack/plugin/ccr/src/test/java/org/elasticsearch/xpack/ccr/AutoFollowIT.java b/x-pack/plugin/ccr/src/test/java/org/elasticsearch/xpack/ccr/AutoFollowIT.java
+index f1802315e476..6c85b2cb4891 100644
+--- a/x-pack/plugin/ccr/src/test/java/org/elasticsearch/xpack/ccr/AutoFollowIT.java
++++ b/x-pack/plugin/ccr/src/test/java/org/elasticsearch/xpack/ccr/AutoFollowIT.java
+@@ -296,6 +296,43 @@ public void testConflictingPatterns() throws Exception {
+         assertFalse(followerClient().admin().indices().exists(request).actionGet().isExists());
+     }
+ 
++    public void testAutoFollowSoftDeletesDisabled() throws Exception {
++        putAutoFollowPatterns("my-pattern1", new String[] {"logs-*"});
++
++        // Soft deletes are disabled:
++        Settings leaderIndexSettings = Settings.builder()
++            .put(IndexSettings.INDEX_SOFT_DELETES_SETTING.getKey(), false)
++            .put(IndexMetaData.INDEX_NUMBER_OF_SHARDS_SETTING.getKey(), 1)
++            .put(IndexMetaData.INDEX_NUMBER_OF_REPLICAS_SETTING.getKey(), 0)
++            .build();
++        createLeaderIndex("logs-20200101", leaderIndexSettings);
++        assertBusy(() -> {
++            AutoFollowStats autoFollowStats = getAutoFollowStats();
++            assertThat(autoFollowStats.getNumberOfSuccessfulFollowIndices(), equalTo(0L));
++            assertThat(autoFollowStats.getNumberOfFailedFollowIndices(), equalTo(1L));
++            assertThat(autoFollowStats.getRecentAutoFollowErrors().size(), equalTo(1));
++            ElasticsearchException failure  = autoFollowStats.getRecentAutoFollowErrors().firstEntry().getValue();
++            assertThat(failure.getMessage(), equalTo("index [logs-20200101] cannot be followed, " +
++                "because soft deletes are not enabled"));
++            IndicesExistsRequest request = new IndicesExistsRequest("copy-logs-20200101");
++            assertFalse(followerClient().admin().indices().exists(request).actionGet().isExists());
++        });
++
++        // Soft deletes are enabled:
++        leaderIndexSettings = Settings.builder()
++            .put(IndexSettings.INDEX_SOFT_DELETES_SETTING.getKey(), true)
++            .put(IndexMetaData.INDEX_NUMBER_OF_SHARDS_SETTING.getKey(), 1)
++            .put(IndexMetaData.INDEX_NUMBER_OF_REPLICAS_SETTING.getKey(), 0)
++            .build();
++        createLeaderIndex("logs-20200102", leaderIndexSettings);
++        assertBusy(() -> {
++            AutoFollowStats autoFollowStats = getAutoFollowStats();
++            assertThat(autoFollowStats.getNumberOfSuccessfulFollowIndices(), equalTo(1L));
++            IndicesExistsRequest request = new IndicesExistsRequest("copy-logs-20200102");
++            assertTrue(followerClient().admin().indices().exists(request).actionGet().isExists());
++        });
++    }
++
+     private void putAutoFollowPatterns(String name, String[] patterns) {
+         PutAutoFollowPatternAction.Request request = new PutAutoFollowPatternAction.Request();
+         request.setName(name);
+diff --git a/x-pack/plugin/ccr/src/test/java/org/elasticsearch/xpack/ccr/action/AutoFollowCoordinatorTests.java b/x-pack/plugin/ccr/src/test/java/org/elasticsearch/xpack/ccr/action/AutoFollowCoordinatorTests.java
+index 7228acaacf1a..2e684e2a4860 100644
+--- a/x-pack/plugin/ccr/src/test/java/org/elasticsearch/xpack/ccr/action/AutoFollowCoordinatorTests.java
++++ b/x-pack/plugin/ccr/src/test/java/org/elasticsearch/xpack/ccr/action/AutoFollowCoordinatorTests.java
+@@ -62,7 +62,7 @@ public void testAutoFollower() {
+         Client client = mock(Client.class);
+         when(client.getRemoteClusterClient(anyString())).thenReturn(client);
+ 
+-        ClusterState remoteState = createRemoteClusterState("logs-20190101");
++        ClusterState remoteState = createRemoteClusterState("logs-20190101", true);
+ 
+         AutoFollowPattern autoFollowPattern = new AutoFollowPattern("remote", Collections.singletonList("logs-*"),
+             null, null, null, null, null, null, null, null, null, null, null);
+@@ -183,7 +183,7 @@ void updateAutoFollowMetadata(Function<ClusterState, ClusterState> updateFunctio
+     public void testAutoFollowerUpdateClusterStateFailure() {
+         Client client = mock(Client.class);
+         when(client.getRemoteClusterClient(anyString())).thenReturn(client);
+-        ClusterState remoteState = createRemoteClusterState("logs-20190101");
++        ClusterState remoteState = createRemoteClusterState("logs-20190101", true);
+ 
+         AutoFollowPattern autoFollowPattern = new AutoFollowPattern("remote", Collections.singletonList("logs-*"),
+                 null, null, null, null, null, null, null, null, null, null, null);
+@@ -240,7 +240,7 @@ void updateAutoFollowMetadata(Function<ClusterState, ClusterState> updateFunctio
+     public void testAutoFollowerCreateAndFollowApiCallFailure() {
+         Client client = mock(Client.class);
+         when(client.getRemoteClusterClient(anyString())).thenReturn(client);
+-        ClusterState remoteState = createRemoteClusterState("logs-20190101");
++        ClusterState remoteState = createRemoteClusterState("logs-20190101", true);
+ 
+         AutoFollowPattern autoFollowPattern = new AutoFollowPattern("remote", Collections.singletonList("logs-*"),
+                 null, null, null, null, null, null, null, null, null, null, null);
+@@ -315,8 +315,7 @@ public void testGetLeaderIndicesToFollow() {
+             String indexName = "metrics-" + i;
+             Settings.Builder builder = Settings.builder()
+                 .put(IndexMetaData.SETTING_VERSION_CREATED, Version.CURRENT)
+-                .put(IndexMetaData.SETTING_INDEX_UUID, indexName)
+-                .put(IndexSettings.INDEX_SOFT_DELETES_SETTING.getKey(), i % 2 == 0);
++                .put(IndexMetaData.SETTING_INDEX_UUID, indexName);
+             imdBuilder.put(IndexMetaData.builder("metrics-" + i)
+                 .settings(builder)
+                 .numberOfShards(1)
+@@ -347,17 +346,21 @@ public void testGetLeaderIndicesToFollow() {
+         List<Index> result = AutoFollower.getLeaderIndicesToFollow(autoFollowPattern, remoteState, clusterState,
+             Collections.emptyList());
+         result.sort(Comparator.comparing(Index::getName));
+-        assertThat(result.size(), equalTo(3));
++        assertThat(result.size(), equalTo(5));
+         assertThat(result.get(0).getName(), equalTo("metrics-0"));
+-        assertThat(result.get(1).getName(), equalTo("metrics-2"));
+-        assertThat(result.get(2).getName(), equalTo("metrics-4"));
++        assertThat(result.get(1).getName(), equalTo("metrics-1"));
++        assertThat(result.get(2).getName(), equalTo("metrics-2"));
++        assertThat(result.get(3).getName(), equalTo("metrics-3"));
++        assertThat(result.get(4).getName(), equalTo("metrics-4"));
+ 
+         List<String> followedIndexUUIDs = Collections.singletonList(remoteState.metaData().index("metrics-2").getIndexUUID());
+         result = AutoFollower.getLeaderIndicesToFollow(autoFollowPattern, remoteState, clusterState, followedIndexUUIDs);
+         result.sort(Comparator.comparing(Index::getName));
+-        assertThat(result.size(), equalTo(2));
++        assertThat(result.size(), equalTo(4));
+         assertThat(result.get(0).getName(), equalTo("metrics-0"));
+-        assertThat(result.get(1).getName(), equalTo("metrics-4"));
++        assertThat(result.get(1).getName(), equalTo("metrics-1"));
++        assertThat(result.get(2).getName(), equalTo("metrics-3"));
++        assertThat(result.get(3).getName(), equalTo("metrics-4"));
+     }
+ 
+     public void testGetLeaderIndicesToFollow_shardsNotStarted() {
+@@ -370,7 +373,7 @@ public void testGetLeaderIndicesToFollow_shardsNotStarted() {
+             .build();
+ 
+         // 1 shard started and another not started:
+-        ClusterState remoteState = createRemoteClusterState("index1");
++        ClusterState remoteState = createRemoteClusterState("index1", true);
+         MetaData.Builder mBuilder= MetaData.builder(remoteState.metaData());
+         mBuilder.put(IndexMetaData.builder("index2")
+             .settings(settings(Version.CURRENT).put(IndexSettings.INDEX_SOFT_DELETES_SETTING.getKey(), true))
+@@ -692,7 +695,8 @@ public void testWaitForMetadataVersion() {
+                 .metaData(MetaData.builder().putCustom(AutoFollowMetadata.TYPE, autoFollowMetadata))
+                 .build();
+             String indexName = "logs-" + i;
+-            leaderStates.add(i == 0 ? createRemoteClusterState(indexName) : createRemoteClusterState(leaderStates.get(i - 1), indexName));
++            leaderStates.add(i == 0 ? createRemoteClusterState(indexName, true) :
++                createRemoteClusterState(leaderStates.get(i - 1), indexName));
+         }
+ 
+         List<AutoFollowCoordinator.AutoFollowResult> allResults = new ArrayList<>();
+@@ -787,9 +791,83 @@ void updateAutoFollowMetadata(Function<ClusterState, ClusterState> updateFunctio
+         assertThat(counter.get(), equalTo(states.length));
+     }
+ 
+-    private static ClusterState createRemoteClusterState(String indexName) {
++    public void testAutoFollowerSoftDeletesDisabled() {
++        Client client = mock(Client.class);
++        when(client.getRemoteClusterClient(anyString())).thenReturn(client);
++
++        ClusterState remoteState = randomBoolean() ? createRemoteClusterState("logs-20190101", false) :
++            createRemoteClusterState("logs-20190101", null);
++
++        AutoFollowPattern autoFollowPattern = new AutoFollowPattern("remote", Collections.singletonList("logs-*"),
++            null, null, null, null, null, null, null, null, null, null, null);
++        Map<String, AutoFollowPattern> patterns = new HashMap<>();
++        patterns.put("remote", autoFollowPattern);
++        Map<String, List<String>> followedLeaderIndexUUIDS = new HashMap<>();
++        followedLeaderIndexUUIDS.put("remote", new ArrayList<>());
++        Map<String, Map<String, String>> autoFollowHeaders = new HashMap<>();
++        autoFollowHeaders.put("remote", Collections.singletonMap("key", "val"));
++        AutoFollowMetadata autoFollowMetadata = new AutoFollowMetadata(patterns, followedLeaderIndexUUIDS, autoFollowHeaders);
++
++        ClusterState currentState = ClusterState.builder(new ClusterName("name"))
++            .metaData(MetaData.builder().putCustom(AutoFollowMetadata.TYPE, autoFollowMetadata))
++            .build();
++
++        List<AutoFollowCoordinator.AutoFollowResult> results = new ArrayList<>();
++        Consumer<List<AutoFollowCoordinator.AutoFollowResult>> handler = results::addAll;
++        AutoFollower autoFollower = new AutoFollower("remote", handler, localClusterStateSupplier(currentState), () -> 1L) {
++            @Override
++            void getRemoteClusterState(String remoteCluster,
++                                       long metadataVersion,
++                                       BiConsumer<ClusterStateResponse, Exception> handler) {
++                assertThat(remoteCluster, equalTo("remote"));
++                handler.accept(new ClusterStateResponse(new ClusterName("name"), remoteState, 1L, false), null);
++            }
++
++            @Override
++            void createAndFollow(Map<String, String> headers,
++                                 PutFollowAction.Request followRequest,
++                                 Runnable successHandler,
++                                 Consumer<Exception> failureHandler) {
++                fail("soft deletes are disabled; index should not be followed");
++            }
++
++            @Override
++            void updateAutoFollowMetadata(Function<ClusterState, ClusterState> updateFunction,
++                                          Consumer<Exception> handler) {
++                ClusterState resultCs = updateFunction.apply(currentState);
++                AutoFollowMetadata result = resultCs.metaData().custom(AutoFollowMetadata.TYPE);
++                assertThat(result.getFollowedLeaderIndexUUIDs().size(), equalTo(1));
++                assertThat(result.getFollowedLeaderIndexUUIDs().get("remote").size(), equalTo(1));
++                handler.accept(null);
++            }
++
++            @Override
++            void cleanFollowedRemoteIndices(ClusterState remoteClusterState, List<String> patterns) {
++                // Ignore, to avoid invoking updateAutoFollowMetadata(...) twice
++            }
++        };
++        autoFollower.start();
++
++        assertThat(results.size(), equalTo(1));
++        assertThat(results.get(0).clusterStateFetchException, nullValue());
++        List<Map.Entry<Index, Exception>> entries = new ArrayList<>(results.get(0).autoFollowExecutionResults.entrySet());
++        assertThat(entries.size(), equalTo(1));
++        assertThat(entries.get(0).getKey().getName(), equalTo("logs-20190101"));
++        assertThat(entries.get(0).getValue(), notNullValue());
++        assertThat(entries.get(0).getValue().getMessage(), equalTo("index [logs-20190101] cannot be followed, " +
++            "because soft deletes are not enabled"));
++    }
++
++    private static ClusterState createRemoteClusterState(String indexName, Boolean enableSoftDeletes) {
++        Settings.Builder indexSettings;
++        if (enableSoftDeletes != null) {
++            indexSettings = settings(Version.CURRENT).put(IndexSettings.INDEX_SOFT_DELETES_SETTING.getKey(), enableSoftDeletes);
++        } else {
++            indexSettings = settings(Version.V_6_6_0);
++        }
++
+         IndexMetaData indexMetaData = IndexMetaData.builder(indexName)
+-            .settings(settings(Version.CURRENT).put(IndexSettings.INDEX_SOFT_DELETES_SETTING.getKey(), true))
++            .settings(indexSettings)
+             .numberOfShards(1)
+             .numberOfReplicas(0)
+             .build();

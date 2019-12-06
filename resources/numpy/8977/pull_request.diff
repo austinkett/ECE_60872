@@ -1,0 +1,663 @@
+diff --git a/doc/release/1.14.0-notes.rst b/doc/release/1.14.0-notes.rst
+index 624886eb159..a4b61e038bf 100644
+--- a/doc/release/1.14.0-notes.rst
++++ b/doc/release/1.14.0-notes.rst
+@@ -247,6 +247,23 @@ common cache line size.  This makes ``npy`` files easier to use in
+ programs which open them with ``mmap``, especially on Linux where an
+ ``mmap`` offset must be a multiple of the page size.
+ 
++Better support for empty structured and string types
++----------------------------------------------------
++Structured types can contain zero fields, and string dtypes can contain zero
++characters. Zero-length strings still cannot be created directly, and must be
++constructed through structured dtypes:
++
++    str0 = np.empty(10, np.dtype([('v', str, N)]))['v']
++    void0 = np.empty(10, np.void)
++
++It was always possible to work with these, but the following operations are
++now supported for these arrays:
++
++ * `arr.sort()`
++ * `arr.view(bytes)`
++ * `arr.resize(...)`
++ * `pickle.dumps(arr)`
++
+ 
+ Changes
+ =======
+diff --git a/numpy/core/src/multiarray/ctors.c b/numpy/core/src/multiarray/ctors.c
+index fb913d288bf..7958c619f16 100644
+--- a/numpy/core/src/multiarray/ctors.c
++++ b/numpy/core/src/multiarray/ctors.c
+@@ -3708,14 +3708,15 @@ PyArray_FromIter(PyObject *obj, PyArray_Descr *dtype, npy_intp count)
+     for (i = 0; (i < count || count == -1) &&
+              (value = PyIter_Next(iter)); i++) {
+         if (i >= elcount) {
++            npy_intp nbytes;
+             /*
+               Grow PyArray_DATA(ret):
+               this is similar for the strategy for PyListObject, but we use
+               50% overallocation => 0, 4, 8, 14, 23, 36, 56, 86 ...
+             */
+             elcount = (i >> 1) + (i < 4 ? 4 : 2) + i;
+-            if (elcount <= NPY_MAX_INTP/elsize) {
+-                new_data = PyDataMem_RENEW(PyArray_DATA(ret), elcount * elsize);
++            if (!npy_mul_with_overflow_intp(&nbytes, elcount, elsize)) {
++                new_data = PyDataMem_RENEW(PyArray_DATA(ret), nbytes);
+             }
+             else {
+                 new_data = NULL;
+diff --git a/numpy/core/src/multiarray/descriptor.c b/numpy/core/src/multiarray/descriptor.c
+index 1ae6e34a6c2..78ed7a1de31 100644
+--- a/numpy/core/src/multiarray/descriptor.c
++++ b/numpy/core/src/multiarray/descriptor.c
+@@ -15,6 +15,7 @@
+ 
+ #include "_datetime.h"
+ #include "common.h"
++#include "templ_common.h" /* for npy_mul_with_overflow_intp */
+ #include "descriptor.h"
+ #include "alloc.h"
+ 
+@@ -259,12 +260,7 @@ _convert_from_tuple(PyObject *obj)
+     res = _use_inherit(type, val, &errflag);
+     if (res || errflag) {
+         Py_DECREF(type);
+-        if (res) {
+-            return res;
+-        }
+-        else {
+-            return NULL;
+-        }
++        return res;
+     }
+     PyErr_Clear();
+     /*
+@@ -278,7 +274,8 @@ _convert_from_tuple(PyObject *obj)
+         if (error_converting(itemsize)) {
+             PyErr_SetString(PyExc_ValueError,
+                     "invalid itemsize in generic type tuple");
+-            goto fail;
++            Py_DECREF(type);
++            return NULL;
+         }
+         PyArray_DESCR_REPLACE(type);
+         if (type->type_num == NPY_UNICODE) {
+@@ -287,6 +284,7 @@ _convert_from_tuple(PyObject *obj)
+         else {
+             type->elsize = itemsize;
+         }
++        return type;
+     }
+     else if (type->metadata && (PyDict_Check(val) || PyDictProxy_Check(val))) {
+         /* Assume it's a metadata dictionary */
+@@ -294,6 +292,7 @@ _convert_from_tuple(PyObject *obj)
+             Py_DECREF(type);
+             return NULL;
+         }
++        return type;
+     }
+     else {
+         /*
+@@ -302,12 +301,12 @@ _convert_from_tuple(PyObject *obj)
+          * a new fields attribute.
+          */
+         PyArray_Dims shape = {NULL, -1};
+-        PyArray_Descr *newdescr;
++        PyArray_Descr *newdescr = NULL;
+         npy_intp items;
+-        int i;
++        int i, overflowed;
++        int nbytes;
+ 
+         if (!(PyArray_IntpConverter(val, &shape)) || (shape.len > NPY_MAXDIMS)) {
+-            npy_free_cache_dim_obj(shape);
+             PyErr_SetString(PyExc_ValueError,
+                     "invalid shape in fixed-type tuple.");
+             goto fail;
+@@ -324,11 +323,6 @@ _convert_from_tuple(PyObject *obj)
+             npy_free_cache_dim_obj(shape);
+             return type;
+         }
+-        newdescr = PyArray_DescrNewFromType(NPY_VOID);
+-        if (newdescr == NULL) {
+-            npy_free_cache_dim_obj(shape);
+-            goto fail;
+-        }
+ 
+         /* validate and set shape */
+         for (i=0; i < shape.len; i++) {
+@@ -336,34 +330,36 @@ _convert_from_tuple(PyObject *obj)
+                 PyErr_SetString(PyExc_ValueError,
+                                 "invalid shape in fixed-type tuple: "
+                                 "dimension smaller then zero.");
+-                npy_free_cache_dim_obj(shape);
+                 goto fail;
+             }
+             if (shape.ptr[i] > NPY_MAX_INT) {
+                 PyErr_SetString(PyExc_ValueError,
+                                 "invalid shape in fixed-type tuple: "
+                                 "dimension does not fit into a C int.");
+-                npy_free_cache_dim_obj(shape);
+                 goto fail;
+             }
+         }
+         items = PyArray_OverflowMultiplyList(shape.ptr, shape.len);
+-        if ((items < 0) || (items > (NPY_MAX_INT / type->elsize))) {
++        if (items < 0 || items > NPY_MAX_INT) {
++            overflowed = 1;
++        }
++        else {
++            overflowed = npy_mul_with_overflow_int(
++                &nbytes, type->elsize, (int) items);
++        }
++        if (overflowed) {
+             PyErr_SetString(PyExc_ValueError,
+                             "invalid shape in fixed-type tuple: dtype size in "
+                             "bytes must fit into a C int.");
+-            npy_free_cache_dim_obj(shape);
+             goto fail;
+         }
+-        newdescr->elsize = type->elsize * items;
+-        if (newdescr->elsize == -1) {
+-            npy_free_cache_dim_obj(shape);
++        newdescr = PyArray_DescrNewFromType(NPY_VOID);
++        if (newdescr == NULL) {
+             goto fail;
+         }
+-
++        newdescr->elsize = nbytes;
+         newdescr->subarray = PyArray_malloc(sizeof(PyArray_ArrayDescr));
+         if (newdescr->subarray == NULL) {
+-            Py_DECREF(newdescr);
+             PyErr_NoMemory();
+             goto fail;
+         }
+@@ -382,7 +378,6 @@ _convert_from_tuple(PyObject *obj)
+          */
+         newdescr->subarray->shape = PyTuple_New(shape.len);
+         if (newdescr->subarray->shape == NULL) {
+-            npy_free_cache_dim_obj(shape);
+             goto fail;
+         }
+         for (i=0; i < shape.len; i++) {
+@@ -390,21 +385,19 @@ _convert_from_tuple(PyObject *obj)
+                              PyInt_FromLong((long)shape.ptr[i]));
+ 
+             if (PyTuple_GET_ITEM(newdescr->subarray->shape, i) == NULL) {
+-                Py_DECREF(newdescr->subarray->shape);
+-                newdescr->subarray->shape = NULL;
+-                npy_free_cache_dim_obj(shape);
+                 goto fail;
+             }
+         }
+ 
+         npy_free_cache_dim_obj(shape);
+-        type = newdescr;
+-    }
+-    return type;
++        return newdescr;
+ 
+- fail:
+-    Py_XDECREF(type);
+-    return NULL;
++    fail:
++        Py_XDECREF(type);
++        Py_XDECREF(newdescr);
++        npy_free_cache_dim_obj(shape);
++        return NULL;
++    }
+ }
+ 
+ /*
+diff --git a/numpy/core/src/multiarray/getset.c b/numpy/core/src/multiarray/getset.c
+index 77d9b8c666e..d58071239f1 100644
+--- a/numpy/core/src/multiarray/getset.c
++++ b/numpy/core/src/multiarray/getset.c
+@@ -469,22 +469,18 @@ array_descr_set(PyArrayObject *self, PyObject *arg)
+         Py_DECREF(safe);
+     }
+ 
+-    if (newtype->elsize == 0) {
+-        /* Allow a void view */
+-        if (newtype->type_num == NPY_VOID) {
+-            PyArray_DESCR_REPLACE(newtype);
+-            if (newtype == NULL) {
+-                return -1;
+-            }
+-            newtype->elsize = PyArray_DESCR(self)->elsize;
+-        }
+-        /* But no other flexible types */
+-        else {
+-            PyErr_SetString(PyExc_TypeError,
+-                    "data-type must not be 0-sized");
+-            Py_DECREF(newtype);
++    /*
++     * Treat V0 as resizable void - unless the destination is already V0, then
++     * don't allow np.void to be duplicated
++     */
++    if (newtype->type_num == NPY_VOID &&
++            newtype->elsize == 0 &&
++            PyArray_DESCR(self)->elsize != 0) {
++        PyArray_DESCR_REPLACE(newtype);
++        if (newtype == NULL) {
+             return -1;
+         }
++        newtype->elsize = PyArray_DESCR(self)->elsize;
+     }
+ 
+ 
+@@ -532,7 +528,8 @@ array_descr_set(PyArrayObject *self, PyObject *arg)
+ 
+         if (newtype->elsize < PyArray_DESCR(self)->elsize) {
+             /* if it is compatible, increase the size of the relevant axis */
+-            if (PyArray_DESCR(self)->elsize % newtype->elsize != 0) {
++            if (newtype->elsize == 0 ||
++                    PyArray_DESCR(self)->elsize % newtype->elsize != 0) {
+                 PyErr_SetString(PyExc_ValueError,
+                         "When changing to a smaller dtype, its size must be a "
+                         "divisor of the size of original dtype");
+diff --git a/numpy/core/src/multiarray/methods.c b/numpy/core/src/multiarray/methods.c
+index efa97dd6515..a908e648d66 100644
+--- a/numpy/core/src/multiarray/methods.c
++++ b/numpy/core/src/multiarray/methods.c
+@@ -13,6 +13,7 @@
+ #include "npy_import.h"
+ #include "ufunc_override.h"
+ #include "common.h"
++#include "templ_common.h" /* for npy_mul_with_overflow_intp */
+ #include "ctors.h"
+ #include "calculation.h"
+ #include "convert_datatype.h"
+@@ -1671,6 +1672,8 @@ array_setstate(PyArrayObject *self, PyObject *args)
+     Py_ssize_t len;
+     npy_intp size, dimensions[NPY_MAXDIMS];
+     int nd;
++    npy_intp nbytes;
++    int overflowed;
+ 
+     PyArrayObject_fields *fa = (PyArrayObject_fields *)self;
+ 
+@@ -1712,13 +1715,15 @@ array_setstate(PyArrayObject *self, PyObject *args)
+         return NULL;
+     }
+     size = PyArray_MultiplyList(dimensions, nd);
+-    if (PyArray_DESCR(self)->elsize == 0) {
+-        PyErr_SetString(PyExc_ValueError, "Invalid data-type size.");
+-        return NULL;
++    if (size < 0) {
++        /* More items than are addressable */
++        return PyErr_NoMemory();
+     }
+-    if (size < 0 || size > NPY_MAX_INTP / PyArray_DESCR(self)->elsize) {
+-        PyErr_NoMemory();
+-        return NULL;
++    overflowed = npy_mul_with_overflow_intp(
++        &nbytes, size, PyArray_DESCR(self)->elsize);
++    if (overflowed) {
++        /* More bytes than are addressable */
++        return PyErr_NoMemory();
+     }
+ 
+     if (PyDataType_FLAGCHK(typecode, NPY_LIST_PICKLE)) {
+@@ -1760,7 +1765,7 @@ array_setstate(PyArrayObject *self, PyObject *args)
+             return NULL;
+         }
+ 
+-        if ((len != (PyArray_DESCR(self)->elsize * size))) {
++        if (len != nbytes) {
+             PyErr_SetString(PyExc_ValueError,
+                             "buffer size does not"  \
+                             " match array size");
+@@ -1822,7 +1827,7 @@ array_setstate(PyArrayObject *self, PyObject *args)
+             }
+             if (swap) {
+                 /* byte-swap on pickle-read */
+-                npy_intp numels = num / PyArray_DESCR(self)->elsize;
++                npy_intp numels = PyArray_SIZE(self);
+                 PyArray_DESCR(self)->f->copyswapn(PyArray_DATA(self),
+                                         PyArray_DESCR(self)->elsize,
+                                         datastr, PyArray_DESCR(self)->elsize,
+diff --git a/numpy/core/src/multiarray/shape.c b/numpy/core/src/multiarray/shape.c
+index 07ab9b626ef..40925d8b9ca 100644
+--- a/numpy/core/src/multiarray/shape.c
++++ b/numpy/core/src/multiarray/shape.c
+@@ -41,15 +41,14 @@ NPY_NO_EXPORT PyObject *
+ PyArray_Resize(PyArrayObject *self, PyArray_Dims *newshape, int refcheck,
+                NPY_ORDER order)
+ {
++    npy_intp oldnbytes, newnbytes;
+     npy_intp oldsize, newsize;
+     int new_nd=newshape->len, k, n, elsize;
+     int refcnt;
+     npy_intp* new_dimensions=newshape->ptr;
+     npy_intp new_strides[NPY_MAXDIMS];
+-    size_t sd;
+     npy_intp *dimptr;
+     char *new_data;
+-    npy_intp largest;
+ 
+     if (!PyArray_ISONESEGMENT(self)) {
+         PyErr_SetString(PyExc_ValueError,
+@@ -57,15 +56,12 @@ PyArray_Resize(PyArrayObject *self, PyArray_Dims *newshape, int refcheck,
+         return NULL;
+     }
+ 
+-    if (PyArray_DESCR(self)->elsize == 0) {
+-        PyErr_SetString(PyExc_ValueError,
+-                "Bad data-type size.");
+-        return NULL;
+-    }
++    /* Compute total size of old and new arrays. The new size might overflow */
++    oldsize = PyArray_SIZE(self);
+     newsize = 1;
+-    largest = NPY_MAX_INTP / PyArray_DESCR(self)->elsize;
+     for(k = 0; k < new_nd; k++) {
+         if (new_dimensions[k] == 0) {
++            newsize = 0;
+             break;
+         }
+         if (new_dimensions[k] < 0) {
+@@ -73,14 +69,19 @@ PyArray_Resize(PyArrayObject *self, PyArray_Dims *newshape, int refcheck,
+                     "negative dimensions not allowed");
+             return NULL;
+         }
+-        newsize *= new_dimensions[k];
+-        if (newsize <= 0 || newsize > largest) {
++        if (npy_mul_with_overflow_intp(&newsize, newsize, new_dimensions[k])) {
+             return PyErr_NoMemory();
+         }
+     }
+-    oldsize = PyArray_SIZE(self);
+ 
+-    if (oldsize != newsize) {
++    /* Convert to number of bytes. The new count might overflow */
++    elsize = PyArray_DESCR(self)->elsize;
++    oldnbytes = oldsize * elsize;
++    if (npy_mul_with_overflow_intp(&newnbytes, newsize, elsize)) {
++        return PyErr_NoMemory();
++    }
++
++    if (oldnbytes != newnbytes) {
+         if (!(PyArray_FLAGS(self) & NPY_ARRAY_OWNDATA)) {
+             PyErr_SetString(PyExc_ValueError,
+                     "cannot resize this array: it does not own its data");
+@@ -92,7 +93,6 @@ PyArray_Resize(PyArrayObject *self, PyArray_Dims *newshape, int refcheck,
+             PyErr_SetString(PyExc_ValueError,
+                     "cannot resize an array with refcheck=True on PyPy.\n"
+                     "Use the resize function or refcheck=False");
+-             
+             return NULL;
+ #else
+             refcnt = PyArray_REFCOUNT(self);
+@@ -111,14 +111,9 @@ PyArray_Resize(PyArrayObject *self, PyArray_Dims *newshape, int refcheck,
+             return NULL;
+         }
+ 
+-        if (newsize == 0) {
+-            sd = PyArray_DESCR(self)->elsize;
+-        }
+-        else {
+-            sd = newsize*PyArray_DESCR(self)->elsize;
+-        }
+-        /* Reallocate space if needed */
+-        new_data = PyDataMem_RENEW(PyArray_DATA(self), sd);
++        /* Reallocate space if needed - allocating 0 is forbidden */
++        new_data = PyDataMem_RENEW(
++            PyArray_DATA(self), newnbytes == 0 ? elsize : newnbytes);
+         if (new_data == NULL) {
+             PyErr_SetString(PyExc_MemoryError,
+                     "cannot allocate memory for array");
+@@ -127,13 +122,12 @@ PyArray_Resize(PyArrayObject *self, PyArray_Dims *newshape, int refcheck,
+         ((PyArrayObject_fields *)self)->data = new_data;
+     }
+ 
+-    if ((newsize > oldsize) && PyArray_ISWRITEABLE(self)) {
++    if (newnbytes > oldnbytes && PyArray_ISWRITEABLE(self)) {
+         /* Fill new memory with zeros */
+-        elsize = PyArray_DESCR(self)->elsize;
+         if (PyDataType_FLAGCHK(PyArray_DESCR(self), NPY_ITEM_REFCOUNT)) {
+             PyObject *zero = PyInt_FromLong(0);
+             char *optr;
+-            optr = PyArray_BYTES(self) + oldsize*elsize;
++            optr = PyArray_BYTES(self) + oldnbytes;
+             n = newsize - oldsize;
+             for (k = 0; k < n; k++) {
+                 _putzero((char *)optr, zero, PyArray_DESCR(self));
+@@ -142,7 +136,7 @@ PyArray_Resize(PyArrayObject *self, PyArray_Dims *newshape, int refcheck,
+             Py_DECREF(zero);
+         }
+         else{
+-            memset(PyArray_BYTES(self)+oldsize*elsize, 0, (newsize-oldsize)*elsize);
++            memset(PyArray_BYTES(self) + oldnbytes, 0, newnbytes - oldnbytes);
+         }
+     }
+ 
+diff --git a/numpy/core/src/npysort/mergesort.c.src b/numpy/core/src/npysort/mergesort.c.src
+index fc82e213503..6f659617a73 100644
+--- a/numpy/core/src/npysort/mergesort.c.src
++++ b/numpy/core/src/npysort/mergesort.c.src
+@@ -254,6 +254,11 @@ mergesort_@suff@(void *start, npy_intp num, void *varr)
+     @type@ *pl, *pr, *pw, *vp;
+     int err = 0;
+ 
++    /* Items that have zero size don't make sense to sort */
++    if (elsize == 0) {
++        return 0;
++    }
++
+     pl = start;
+     pr = pl + num*len;
+     pw = malloc((num/2) * elsize);
+@@ -329,6 +334,11 @@ amergesort_@suff@(void *v, npy_intp *tosort, npy_intp num, void *varr)
+     size_t len = elsize / sizeof(@type@);
+     npy_intp *pl, *pr, *pw;
+ 
++    /* Items that have zero size don't make sense to sort */
++    if (elsize == 0) {
++        return 0;
++    }
++
+     pl = tosort;
+     pr = pl + num;
+     pw = malloc((num/2) * sizeof(npy_intp));
+@@ -405,10 +415,18 @@ npy_mergesort(void *start, npy_intp num, void *varr)
+     PyArray_CompareFunc *cmp = PyArray_DESCR(arr)->f->compare;
+     char *pl = start;
+     char *pr = pl + num*elsize;
+-    char *pw = malloc((num >> 1) *elsize);
+-    char *vp = malloc(elsize);
++    char *pw;
++    char *vp;
+     int err = -NPY_ENOMEM;
+ 
++    /* Items that have zero size don't make sense to sort */
++    if (elsize == 0) {
++        return 0;
++    }
++
++    pw = malloc((num >> 1) *elsize);
++    vp = malloc(elsize);
++
+     if (pw != NULL && vp != NULL) {
+         npy_mergesort0(pl, pr, pw, vp, elsize, cmp, arr);
+         err = 0;
+@@ -475,6 +493,11 @@ npy_amergesort(void *v, npy_intp *tosort, npy_intp num, void *varr)
+     PyArray_CompareFunc *cmp = PyArray_DESCR(arr)->f->compare;
+     npy_intp *pl, *pr, *pw;
+ 
++    /* Items that have zero size don't make sense to sort */
++    if (elsize == 0) {
++        return 0;
++    }
++
+     pl = tosort;
+     pr = pl + num;
+     pw = malloc((num >> 1) * sizeof(npy_intp));
+diff --git a/numpy/core/src/npysort/quicksort.c.src b/numpy/core/src/npysort/quicksort.c.src
+index 2b6e2ed1ce4..ff0e8a14905 100644
+--- a/numpy/core/src/npysort/quicksort.c.src
++++ b/numpy/core/src/npysort/quicksort.c.src
+@@ -258,7 +258,7 @@ quicksort_@suff@(void *start, npy_intp num, void *varr)
+ {
+     PyArrayObject *arr = varr;
+     const size_t len = PyArray_ITEMSIZE(arr)/sizeof(@type@);
+-    @type@ *vp = malloc(PyArray_ITEMSIZE(arr));
++    @type@ *vp;
+     @type@ *pl = start;
+     @type@ *pr = pl + (num - 1)*len;
+     @type@ *stack[PYA_QS_STACK], **sptr = stack, *pm, *pi, *pj, *pk;
+@@ -266,6 +266,12 @@ quicksort_@suff@(void *start, npy_intp num, void *varr)
+     int * psdepth = depth;
+     int cdepth = npy_get_msb(num) * 2;
+ 
++    /* Items that have zero size don't make sense to sort */
++    if (len == 0) {
++        return 0;
++    }
++
++    vp = malloc(PyArray_ITEMSIZE(arr));
+     if (vp == NULL) {
+         return -NPY_ENOMEM;
+     }
+@@ -351,6 +357,11 @@ aquicksort_@suff@(void *vv, npy_intp* tosort, npy_intp num, void *varr)
+     int * psdepth = depth;
+     int cdepth = npy_get_msb(num) * 2;
+ 
++    /* Items that have zero size don't make sense to sort */
++    if (len == 0) {
++        return 0;
++    }
++
+     for (;;) {
+         if (NPY_UNLIKELY(cdepth < 0)) {
+             aheapsort_@suff@(vv, pl, pr - pl + 1, varr);
+@@ -429,7 +440,7 @@ npy_quicksort(void *start, npy_intp num, void *varr)
+     PyArrayObject *arr = varr;
+     npy_intp elsize = PyArray_ITEMSIZE(arr);
+     PyArray_CompareFunc *cmp = PyArray_DESCR(arr)->f->compare;
+-    char *vp = malloc(elsize);
++    char *vp;
+     char *pl = start;
+     char *pr = pl + (num - 1)*elsize;
+     char *stack[PYA_QS_STACK];
+@@ -439,6 +450,12 @@ npy_quicksort(void *start, npy_intp num, void *varr)
+     int * psdepth = depth;
+     int cdepth = npy_get_msb(num) * 2;
+ 
++    /* Items that have zero size don't make sense to sort */
++    if (elsize == 0) {
++        return 0;
++    }
++
++    vp = malloc(elsize);
+     if (vp == NULL) {
+         return -NPY_ENOMEM;
+     }
+@@ -539,6 +556,11 @@ npy_aquicksort(void *vv, npy_intp* tosort, npy_intp num, void *varr)
+     int * psdepth = depth;
+     int cdepth = npy_get_msb(num) * 2;
+ 
++    /* Items that have zero size don't make sense to sort */
++    if (elsize == 0) {
++        return 0;
++    }
++
+     for (;;) {
+         if (NPY_UNLIKELY(cdepth < 0)) {
+             npy_aheapsort(vv, pl, pr - pl + 1, varr);
+diff --git a/numpy/core/tests/test_multiarray.py b/numpy/core/tests/test_multiarray.py
+index c28a72150ea..204285a4e10 100644
+--- a/numpy/core/tests/test_multiarray.py
++++ b/numpy/core/tests/test_multiarray.py
+@@ -1204,6 +1204,74 @@ def test_count_nonzero_unaligned(self):
+             assert_equal(np.count_nonzero(a), builtins.sum(a.tolist()))
+ 
+ 
++class TestZeroSizeFlexible(object):
++    @staticmethod
++    def _zeros(shape, dtype=str):
++        dtype = np.dtype(dtype)
++        if dtype == np.void:
++            return np.zeros(shape, dtype=(dtype, 0))
++
++        # not constructable directly
++        dtype = np.dtype([('x', dtype, 0)])
++        return np.zeros(shape, dtype=dtype)['x']
++
++    def test_create(self):
++        zs = self._zeros(10, bytes)
++        assert_equal(zs.itemsize, 0)
++        zs = self._zeros(10, np.void)
++        assert_equal(zs.itemsize, 0)
++        zs = self._zeros(10, unicode)
++        assert_equal(zs.itemsize, 0)
++
++    def _test_sort_partition(self, name, kinds, **kwargs):
++        # Previously, these would all hang
++        for dt in [bytes, np.void, unicode]:
++            zs = self._zeros(10, dt)
++            sort_method = getattr(zs, name)
++            sort_func = getattr(np, name)
++            for kind in kinds:
++                sort_method(kind=kind, **kwargs)
++                sort_func(zs, kind=kind, **kwargs)
++
++    def test_sort(self):
++        self._test_sort_partition('sort', kinds='qhm')
++
++    def test_argsort(self):
++        self._test_sort_partition('argsort', kinds='qhm')
++
++    def test_partition(self):
++        self._test_sort_partition('partition', kinds=['introselect'], kth=2)
++
++    def test_argpartition(self):
++        self._test_sort_partition('argpartition', kinds=['introselect'], kth=2)
++
++    def test_resize(self):
++        # previously an error
++        for dt in [bytes, np.void, unicode]:
++            zs = self._zeros(10, dt)
++            zs.resize(25)
++            zs.resize((10, 10))
++
++    def test_view(self):
++        for dt in [bytes, np.void, unicode]:
++            zs = self._zeros(10, dt)
++
++            # viewing as itself should be allowed
++            assert_equal(zs.view(dt).dtype, np.dtype(dt))
++
++            # viewing as any non-empty type gives an empty result
++            assert_equal(zs.view((dt, 1)).shape, (0,))
++
++    def test_pickle(self):
++        import pickle
++        for dt in [bytes, np.void, unicode]:
++            zs = self._zeros(10, dt)
++            p = pickle.dumps(zs)
++            zs2 = pickle.loads(p)
++
++            assert_equal(zs.dtype, zs2.dtype)
++
++
+ class TestMethods(object):
+     def test_compress(self):
+         tgt = [[5, 6, 7, 8, 9]]
+@@ -4474,6 +4542,14 @@ def test_obj_obj(self):
+         assert_array_equal(a['k'][-5:], 0)
+         assert_array_equal(a['k'][:-5], 1)
+ 
++    def test_empty_view(self):
++        # check that sizes containing a zero don't trigger a reallocate for
++        # already empty arrays
++        x = np.zeros((10, 0), int)
++        x_view = x[...]
++        x_view.resize((0, 10))
++        x_view.resize((0, 100))
++
+ 
+ class TestRecord(object):
+     def test_field_rename(self):

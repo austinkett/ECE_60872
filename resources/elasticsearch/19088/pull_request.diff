@@ -1,0 +1,304 @@
+diff --git a/core/src/main/java/org/elasticsearch/action/admin/cluster/settings/SettingsUpdater.java b/core/src/main/java/org/elasticsearch/action/admin/cluster/settings/SettingsUpdater.java
+index 652401194bb0..575fbcd3b982 100644
+--- a/core/src/main/java/org/elasticsearch/action/admin/cluster/settings/SettingsUpdater.java
++++ b/core/src/main/java/org/elasticsearch/action/admin/cluster/settings/SettingsUpdater.java
+@@ -77,7 +77,7 @@ synchronized ClusterState updateSettings(final ClusterState currentState, Settin
+         Settings settings = build.metaData().settings();
+         // now we try to apply things and if they are invalid we fail
+         // this dryRun will validate & parse settings but won't actually apply them.
+-        clusterSettings.dryRun(settings);
++        clusterSettings.validateUpdate(settings);
+         return build;
+     }
+ 
+diff --git a/core/src/main/java/org/elasticsearch/cluster/metadata/MetaDataUpdateSettingsService.java b/core/src/main/java/org/elasticsearch/cluster/metadata/MetaDataUpdateSettingsService.java
+index 3daf6c4dd3a4..54f6ad0705ac 100644
+--- a/core/src/main/java/org/elasticsearch/cluster/metadata/MetaDataUpdateSettingsService.java
++++ b/core/src/main/java/org/elasticsearch/cluster/metadata/MetaDataUpdateSettingsService.java
+@@ -19,6 +19,7 @@
+ 
+ package org.elasticsearch.cluster.metadata;
+ 
++import org.elasticsearch.ExceptionsHelper;
+ import org.elasticsearch.Version;
+ import org.elasticsearch.action.ActionListener;
+ import org.elasticsearch.action.admin.indices.settings.put.UpdateSettingsClusterStateUpdateRequest;
+@@ -43,7 +44,10 @@
+ import org.elasticsearch.common.settings.Settings;
+ import org.elasticsearch.common.unit.TimeValue;
+ import org.elasticsearch.index.Index;
++import org.elasticsearch.index.NodeServicesProvider;
++import org.elasticsearch.indices.IndicesService;
+ 
++import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.HashMap;
+ import java.util.HashSet;
+@@ -61,17 +65,20 @@
+ 
+     private final AllocationService allocationService;
+ 
+-    private final IndexNameExpressionResolver indexNameExpressionResolver;
+     private final IndexScopedSettings indexScopedSettings;
++    private final IndicesService indicesService;
++    private final NodeServicesProvider nodeServiceProvider;
+ 
+     @Inject
+-    public MetaDataUpdateSettingsService(Settings settings, ClusterService clusterService, AllocationService allocationService, IndexScopedSettings indexScopedSettings, IndexNameExpressionResolver indexNameExpressionResolver) {
++    public MetaDataUpdateSettingsService(Settings settings, ClusterService clusterService, AllocationService allocationService,
++                                         IndexScopedSettings indexScopedSettings, IndicesService indicesService, NodeServicesProvider nodeServicesProvider) {
+         super(settings);
+         this.clusterService = clusterService;
+-        this.indexNameExpressionResolver = indexNameExpressionResolver;
+         this.clusterService.add(this);
+         this.allocationService = allocationService;
+         this.indexScopedSettings = indexScopedSettings;
++        this.indicesService = indicesService;
++        this.nodeServiceProvider = nodeServicesProvider;
+     }
+ 
+     @Override
+@@ -266,11 +273,15 @@ public ClusterState execute(ClusterState currentState) {
+                 // now, reroute in case things change that require it (like number of replicas)
+                 RoutingAllocation.Result routingResult = allocationService.reroute(updatedState, "settings update");
+                 updatedState = ClusterState.builder(updatedState).routingResult(routingResult).build();
+-                for (Index index : openIndices) {
+-                    indexScopedSettings.dryRun(updatedState.metaData().getIndexSafe(index).getSettings());
+-                }
+-                for (Index index : closeIndices) {
+-                    indexScopedSettings.dryRun(updatedState.metaData().getIndexSafe(index).getSettings());
++                try {
++                    for (Index index : openIndices) {
++                        indicesService.verifyIndexMetadata(nodeServiceProvider, updatedState.getMetaData().getIndexSafe(index));
++                    }
++                    for (Index index : closeIndices) {
++                        indicesService.verifyIndexMetadata(nodeServiceProvider, updatedState.getMetaData().getIndexSafe(index));
++                    }
++                } catch (IOException ex) {
++                    ExceptionsHelper.convertToElastic(ex);
+                 }
+                 return updatedState;
+             }
+diff --git a/core/src/main/java/org/elasticsearch/common/settings/AbstractScopedSettings.java b/core/src/main/java/org/elasticsearch/common/settings/AbstractScopedSettings.java
+index 817e109bf4d9..efa4c1316ace 100644
+--- a/core/src/main/java/org/elasticsearch/common/settings/AbstractScopedSettings.java
++++ b/core/src/main/java/org/elasticsearch/common/settings/AbstractScopedSettings.java
+@@ -115,18 +115,18 @@ private static boolean isValidGroupKey(String key) {
+     }
+ 
+     /**
+-     * Applies the given settings to all listeners and rolls back the result after application. This
++     * Validates the given settings by running it through all update listeners without applying it. This
+      * method will not change any settings but will fail if any of the settings can't be applied.
+      */
+-    public synchronized Settings dryRun(Settings settings) {
++    public synchronized Settings validateUpdate(Settings settings) {
+         final Settings current = Settings.builder().put(this.settings).put(settings).build();
+         final Settings previous = Settings.builder().put(this.settings).put(this.lastSettingsApplied).build();
+         List<RuntimeException> exceptions = new ArrayList<>();
+         for (SettingUpdater<?> settingUpdater : settingUpdaters) {
+             try {
+-                if (settingUpdater.hasChanged(current, previous)) {
+-                    settingUpdater.getValue(current, previous);
+-                }
++                // ensure running this through the updater / dynamic validator
++                // don't check if the value has changed we wanna test this anyways
++                settingUpdater.getValue(current, previous);
+             } catch (RuntimeException ex) {
+                 exceptions.add(ex);
+                 logger.debug("failed to prepareCommit settings for [{}]", ex, settingUpdater);
+diff --git a/core/src/main/java/org/elasticsearch/index/IndexModule.java b/core/src/main/java/org/elasticsearch/index/IndexModule.java
+index d233faf4f196..f6227ca3276f 100644
+--- a/core/src/main/java/org/elasticsearch/index/IndexModule.java
++++ b/core/src/main/java/org/elasticsearch/index/IndexModule.java
+@@ -126,6 +126,17 @@ public IndexModule(IndexSettings indexSettings, IndexStoreConfig indexStoreConfi
+         indexSettings.getScopedSettings().addSettingsUpdateConsumer(setting, consumer);
+     }
+ 
++    /**
++     * Adds a Setting, it's consumer and validator for this index.
++     */
++    public <T> void addSettingsUpdateConsumer(Setting<T> setting, Consumer<T> consumer, Consumer<T> validator) {
++        ensureNotFrozen();
++        if (setting == null) {
++            throw new IllegalArgumentException("setting must not be null");
++        }
++        indexSettings.getScopedSettings().addSettingsUpdateConsumer(setting, consumer, validator);
++    }
++
+     /**
+      * Returns the index {@link Settings} for this index
+      */
+diff --git a/core/src/main/java/org/elasticsearch/index/IndexSettings.java b/core/src/main/java/org/elasticsearch/index/IndexSettings.java
+index 2c20697d757e..df348a5d6a10 100644
+--- a/core/src/main/java/org/elasticsearch/index/IndexSettings.java
++++ b/core/src/main/java/org/elasticsearch/index/IndexSettings.java
+@@ -275,6 +275,7 @@ public IndexSettings(final IndexMetaData indexMetaData, final Settings nodeSetti
+         scopedSettings.addSettingsUpdateConsumer(INDEX_REFRESH_INTERVAL_SETTING, this::setRefreshInterval);
+         scopedSettings.addSettingsUpdateConsumer(MAX_REFRESH_LISTENERS_PER_SHARD, this::setMaxRefreshListeners);
+         scopedSettings.addSettingsUpdateConsumer(MAX_SLICES_PER_SCROLL, this::setMaxSlicesPerScroll);
++
+     }
+ 
+     private void setTranslogFlushThresholdSize(ByteSizeValue byteSizeValue) {
+@@ -545,5 +546,5 @@ private void setMaxSlicesPerScroll(int value) {
+         this.maxSlicesPerScroll = value;
+     }
+ 
+-    IndexScopedSettings getScopedSettings() { return scopedSettings;}
++    public IndexScopedSettings getScopedSettings() { return scopedSettings;}
+ }
+diff --git a/core/src/main/java/org/elasticsearch/indices/IndicesService.java b/core/src/main/java/org/elasticsearch/indices/IndicesService.java
+index edd5e5d8e4b8..89cfad98c4fe 100644
+--- a/core/src/main/java/org/elasticsearch/indices/IndicesService.java
++++ b/core/src/main/java/org/elasticsearch/indices/IndicesService.java
+@@ -425,12 +425,13 @@ public synchronized void verifyIndexMetadata(final NodeServicesProvider nodeServ
+             // this will also fail if some plugin fails etc. which is nice since we can verify that early
+             final IndexService service = createIndexService("metadata verification", nodeServicesProvider,
+                 metaData, indicesQueryCache, indicesFieldDataCache, Collections.emptyList());
++            closeables.add(() -> service.close("metadata verification", false));
+             for (ObjectCursor<MappingMetaData> typeMapping : metaData.getMappings().values()) {
+                 // don't apply the default mapping, it has been applied when the mapping was created
+                 service.mapperService().merge(typeMapping.value.type(), typeMapping.value.source(),
+                     MapperService.MergeReason.MAPPING_RECOVERY, true);
+             }
+-            closeables.add(() -> service.close("metadata verification", false));
++            service.getIndexSettings().getScopedSettings().validateUpdate(metaData.getSettings());
+         } finally {
+             IOUtils.close(closeables);
+         }
+diff --git a/core/src/main/java/org/elasticsearch/snapshots/RestoreService.java b/core/src/main/java/org/elasticsearch/snapshots/RestoreService.java
+index 44ca6fb972e0..74434413ae91 100644
+--- a/core/src/main/java/org/elasticsearch/snapshots/RestoreService.java
++++ b/core/src/main/java/org/elasticsearch/snapshots/RestoreService.java
+@@ -39,7 +39,6 @@
+ import org.elasticsearch.cluster.metadata.MetaDataCreateIndexService;
+ import org.elasticsearch.cluster.metadata.MetaDataIndexUpgradeService;
+ import org.elasticsearch.cluster.metadata.RepositoriesMetaData;
+-import org.elasticsearch.cluster.node.DiscoveryNode;
+ import org.elasticsearch.cluster.routing.IndexRoutingTable;
+ import org.elasticsearch.cluster.routing.IndexShardRoutingTable;
+ import org.elasticsearch.cluster.routing.RestoreSource;
+@@ -436,7 +435,7 @@ private void restoreGlobalStateIfRequested(MetaData.Builder mdBuilder) {
+                     if (request.includeGlobalState()) {
+                         if (metaData.persistentSettings() != null) {
+                             Settings settings = metaData.persistentSettings();
+-                            clusterSettings.dryRun(settings);
++                            clusterSettings.validateUpdate(settings);
+                             mdBuilder.persistentSettings(settings);
+                         }
+                         if (metaData.templates() != null) {
+diff --git a/core/src/test/java/org/elasticsearch/common/settings/ScopedSettingsTests.java b/core/src/test/java/org/elasticsearch/common/settings/ScopedSettingsTests.java
+index 664f8cb96ab7..dee20d6b32e4 100644
+--- a/core/src/test/java/org/elasticsearch/common/settings/ScopedSettingsTests.java
++++ b/core/src/test/java/org/elasticsearch/common/settings/ScopedSettingsTests.java
+@@ -98,7 +98,7 @@ public void testApply() {
+         assertEquals(0, aC.get());
+         assertEquals(0, bC.get());
+         try {
+-            service.dryRun(Settings.builder().put("foo.bar", 2).put("foo.bar.baz", -15).build());
++            service.validateUpdate(Settings.builder().put("foo.bar", 2).put("foo.bar.baz", -15).build());
+             fail("invalid value");
+         } catch (IllegalArgumentException ex) {
+             assertEquals("illegal value can't update [foo.bar.baz] from [1] to [-15]", ex.getMessage());
+@@ -108,7 +108,7 @@ public void testApply() {
+         assertEquals(0, consumer2.get());
+         assertEquals(0, aC.get());
+         assertEquals(0, bC.get());
+-        service.dryRun(Settings.builder().put("foo.bar", 2).put("foo.bar.baz", 15).build());
++        service.validateUpdate(Settings.builder().put("foo.bar", 2).put("foo.bar.baz", 15).build());
+         assertEquals(0, consumer.get());
+         assertEquals(0, consumer2.get());
+         assertEquals(0, aC.get());
+diff --git a/core/src/test/java/org/elasticsearch/indices/cluster/ClusterStateChanges.java b/core/src/test/java/org/elasticsearch/indices/cluster/ClusterStateChanges.java
+index fc5b68f87d1d..09441f701108 100644
+--- a/core/src/test/java/org/elasticsearch/indices/cluster/ClusterStateChanges.java
++++ b/core/src/test/java/org/elasticsearch/indices/cluster/ClusterStateChanges.java
+@@ -19,7 +19,6 @@
+ 
+ package org.elasticsearch.indices.cluster;
+ 
+-import org.elasticsearch.Version;
+ import org.elasticsearch.action.ActionResponse;
+ import org.elasticsearch.action.admin.cluster.reroute.ClusterRerouteRequest;
+ import org.elasticsearch.action.admin.cluster.reroute.TransportClusterRerouteAction;
+@@ -156,7 +155,7 @@ public IndexMetaData upgradeIndexMetaData(IndexMetaData indexMetaData) {
+             metaDataIndexUpgradeService, nodeServicesProvider, indicesService);
+         MetaDataDeleteIndexService deleteIndexService = new MetaDataDeleteIndexService(settings, clusterService, allocationService);
+         MetaDataUpdateSettingsService metaDataUpdateSettingsService = new MetaDataUpdateSettingsService(settings, clusterService,
+-            allocationService, IndexScopedSettings.DEFAULT_SCOPED_SETTINGS, new IndexNameExpressionResolver(settings));
++            allocationService, IndexScopedSettings.DEFAULT_SCOPED_SETTINGS, indicesService, nodeServicesProvider);
+         MetaDataCreateIndexService createIndexService = new MetaDataCreateIndexService(settings, clusterService, indicesService,
+             allocationService, new AliasValidator(settings), Collections.emptySet(), environment,
+             nodeServicesProvider, IndexScopedSettings.DEFAULT_SCOPED_SETTINGS);
+diff --git a/core/src/test/java/org/elasticsearch/indices/settings/UpdateSettingsIT.java b/core/src/test/java/org/elasticsearch/indices/settings/UpdateSettingsIT.java
+index e7e3cb322264..2a67742fc68b 100644
+--- a/core/src/test/java/org/elasticsearch/indices/settings/UpdateSettingsIT.java
++++ b/core/src/test/java/org/elasticsearch/indices/settings/UpdateSettingsIT.java
+@@ -29,7 +29,9 @@
+ import org.elasticsearch.action.admin.indices.settings.get.GetSettingsResponse;
+ import org.elasticsearch.cluster.metadata.IndexMetaData;
+ import org.elasticsearch.common.Priority;
++import org.elasticsearch.common.settings.Setting;
+ import org.elasticsearch.common.settings.Settings;
++import org.elasticsearch.index.IndexModule;
+ import org.elasticsearch.index.IndexService;
+ import org.elasticsearch.index.engine.VersionConflictEngineException;
+ import org.elasticsearch.index.MergePolicyConfig;
+@@ -37,9 +39,13 @@
+ import org.elasticsearch.index.store.IndexStore;
+ import org.elasticsearch.index.store.Store;
+ import org.elasticsearch.indices.IndicesService;
++import org.elasticsearch.plugins.Plugin;
+ import org.elasticsearch.test.ESIntegTestCase;
+ 
+ import java.util.Arrays;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.List;
+ 
+ import static org.elasticsearch.cluster.metadata.IndexMetaData.SETTING_BLOCKS_METADATA;
+ import static org.elasticsearch.cluster.metadata.IndexMetaData.SETTING_BLOCKS_READ;
+@@ -53,6 +59,42 @@
+ 
+ public class UpdateSettingsIT extends ESIntegTestCase {
+ 
++
++    public void testInvalidDynamicUpdate() {
++        createIndex("test");
++        IllegalArgumentException exception = expectThrows(IllegalArgumentException.class, () ->
++            client().admin().indices().prepareUpdateSettings("test")
++                .setSettings(Settings.builder()
++                    .put("index.dummy", "boom")
++                )
++                .execute().actionGet());
++        assertEquals(exception.getCause().getMessage(), "this setting goes boom");
++        IndexMetaData indexMetaData = client().admin().cluster().prepareState().execute().actionGet().getState().metaData().index("test");
++        assertNotEquals(indexMetaData.getSettings().get("index.dummy"), "invalid dynamic value");
++    }
++
++    @Override
++    protected Collection<Class<? extends Plugin>> nodePlugins() {
++        return pluginList(DummySettingPlugin.class);
++    }
++
++    public static class DummySettingPlugin extends Plugin {
++        public static final Setting<String> DUMMY_SETTING = Setting.simpleString("index.dummy",
++            Setting.Property.IndexScope, Setting.Property.Dynamic);
++        @Override
++        public void onIndexModule(IndexModule indexModule) {
++            indexModule.addSettingsUpdateConsumer(DUMMY_SETTING, (s) -> {}, (s) -> {
++                if (s.equals("boom"))
++                    throw new IllegalArgumentException("this setting goes boom");
++            });
++        }
++
++        @Override
++        public List<Setting<?>> getSettings() {
++            return Collections.singletonList(DUMMY_SETTING);
++        }
++    }
++
+     public void testResetDefault() {
+         createIndex("test");
+ 

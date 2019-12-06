@@ -1,0 +1,1406 @@
+diff --git a/docs/reference/search/aggregations/metrics/tophits-aggregation.asciidoc b/docs/reference/search/aggregations/metrics/tophits-aggregation.asciidoc
+index 8f0adac5d808..49db86a4bd8c 100644
+--- a/docs/reference/search/aggregations/metrics/tophits-aggregation.asciidoc
++++ b/docs/reference/search/aggregations/metrics/tophits-aggregation.asciidoc
+@@ -194,3 +194,84 @@ relevancy order of the most relevant document in a bucket.
+ At the moment the `max` (or `min`) aggregator is needed to make sure the buckets from the `terms` aggregator are
+ ordered according to the score of the most relevant webpage per domain. The `top_hits` aggregator isn't a metric aggregator
+ and therefore can't be used in the `order` option of the `terms` aggregator.
++
++==== top_hits support in a nested or reverse_nested aggregator
++
++coming[1.5.0]
++
++If the `top_hits` aggregator is wrapped in a `nested` or `reverse_nested` aggregator then nested hits are being returned.
++Nested hits are in a sense hidden mini documents that are part of regular document where in the mapping a nested field type
++has been configured. The `top_hits` aggregator has the ability to un-hide these documents if it is wrapped in a `nested`
++or `reverse_nested` aggregator. Read more about nested in the <<mapping-nested-type,nested type mapping>>.
++
++If nested type has been configured a single document is actually indexed as multiple Lucene documents and they share
++the same id. In order to determine the identity of a nested hit there is more needed than just the id, so that is why
++nested hits also include their nested identity. The nested identity is kept under the `_nested` field in the search hit
++and includes the array field and the offset in the array field the nested hit belongs to. The offset is zero based.
++
++Top hits response snippet with a nested hit, which resides in the third slot of array field `nested_field1` in document with id `1`:
++
++[source,js]
++--------------------------------------------------
++...
++"hits": {
++ "total": 25365,
++ "max_score": 1,
++ "hits": [
++   {
++     "_index": "a",
++     "_type": "b",
++     "_id": "1",
++     "_score": 1,
++     "_nested" : {
++       "field" : "nested_field1",
++       "offset" : 2
++     }
++     "_source": ...
++   },
++   ...
++ ]
++}
++...
++--------------------------------------------------
++
++If `_source` is requested then just the part of the source of the nested object is returned, not the entire source of the document.
++Also stored fields on the *nested* inner object level are accessible via `top_hits` aggregator residing in a `nested` or `reverse_nested` aggregator.
++
++Only nested hits will have a `_nested` field in the hit, non nested (regular) hits will not have a `_nested` field.
++
++The information in `_nested` can also be used to parse the original source somewhere else if `_source` isn't enabled.
++
++If there are multiple levels of nested object types defined in mappings then the `_nested` information can also be hierarchical
++in order to express the identity of nested hits that are two layers deep or more.
++
++In the example below a nested hit resides in the first slot of the field `nested_grand_child_field` which then resides in
++the second slow of the `nested_child_field` field:
++
++[source,js]
++--------------------------------------------------
++...
++"hits": {
++ "total": 2565,
++ "max_score": 1,
++ "hits": [
++   {
++     "_index": "a",
++     "_type": "b",
++     "_id": "1",
++     "_score": 1,
++     "_nested" : {
++       "field" : "nested_child_field",
++       "offset" : 1,
++       "_nested" : {
++         "field" : "nested_grand_child_field",
++         "offset" : 0
++       }
++     }
++     "_source": ...
++   },
++   ...
++ ]
++}
++...
++--------------------------------------------------
+\ No newline at end of file
+diff --git a/src/main/java/org/elasticsearch/index/mapper/DocumentMapper.java b/src/main/java/org/elasticsearch/index/mapper/DocumentMapper.java
+index 28744863c860..e7724cfe3cbd 100644
+--- a/src/main/java/org/elasticsearch/index/mapper/DocumentMapper.java
++++ b/src/main/java/org/elasticsearch/index/mapper/DocumentMapper.java
+@@ -25,9 +25,11 @@
+ import org.apache.lucene.analysis.Analyzer;
+ import org.apache.lucene.document.Field;
+ import org.apache.lucene.document.FieldType;
++import org.apache.lucene.index.AtomicReaderContext;
+ import org.apache.lucene.index.IndexableField;
+ import org.apache.lucene.search.Filter;
+ import org.apache.lucene.util.CloseableThreadLocal;
++import org.apache.lucene.util.FixedBitSet;
+ import org.elasticsearch.ElasticsearchGenerationException;
+ import org.elasticsearch.ElasticsearchIllegalArgumentException;
+ import org.elasticsearch.common.Booleans;
+@@ -44,6 +46,7 @@
+ import org.elasticsearch.common.xcontent.*;
+ import org.elasticsearch.common.xcontent.smile.SmileXContent;
+ import org.elasticsearch.index.analysis.NamedAnalyzer;
++import org.elasticsearch.index.cache.fixedbitset.FixedBitSetFilterCache;
+ import org.elasticsearch.index.mapper.internal.*;
+ import org.elasticsearch.index.mapper.object.ObjectMapper;
+ import org.elasticsearch.index.mapper.object.RootObjectMapper;
+@@ -592,6 +595,45 @@ public ParsedDocument parse(SourceToParse source, @Nullable ParseListener listen
+         return doc;
+     }
+ 
++    /**
++     * Returns the best nested {@link ObjectMapper} instances that is in the scope of the specified nested docId.
++     */
++    public ObjectMapper findNestedObjectMapper(int nestedDocId, FixedBitSetFilterCache cache, AtomicReaderContext context) throws IOException {
++        ObjectMapper nestedObjectMapper = null;
++        for (ObjectMapper objectMapper : objectMappers().values()) {
++            if (!objectMapper.nested().isNested()) {
++                continue;
++            }
++
++            FixedBitSet nestedTypeBitSet = cache.getFixedBitSetFilter(objectMapper.nestedTypeFilter()).getDocIdSet(context, null);
++            if (nestedTypeBitSet != null && nestedTypeBitSet.get(nestedDocId)) {
++                if (nestedObjectMapper == null) {
++                    nestedObjectMapper = objectMapper;
++                } else {
++                    if (nestedObjectMapper.fullPath().length() < objectMapper.fullPath().length()) {
++                        nestedObjectMapper = objectMapper;
++                    }
++                }
++            }
++        }
++        return nestedObjectMapper;
++    }
++
++    /**
++     * Returns the parent {@link ObjectMapper} instance of the specified object mapper or <code>null</code> if there
++     * isn't any.
++     */
++    // TODO: We should add: ObjectMapper#getParentObjectMapper()
++    public ObjectMapper findParentObjectMapper(ObjectMapper objectMapper) {
++        int indexOfLastDot = objectMapper.fullPath().lastIndexOf('.');
++        if (indexOfLastDot != -1) {
++            String parentNestObjectPath = objectMapper.fullPath().substring(0, indexOfLastDot);
++            return objectMappers().get(parentNestObjectPath);
++        } else {
++            return null;
++        }
++    }
++
+     /**
+      * Transform the source when it is expressed as a map.  This is public so it can be transformed the source is loaded.
+      * @param sourceAsMap source to transform.  This may be mutated by the script.
+diff --git a/src/main/java/org/elasticsearch/index/mapper/object/ObjectMapper.java b/src/main/java/org/elasticsearch/index/mapper/object/ObjectMapper.java
+index 9a631a05c436..7699fbd166b2 100644
+--- a/src/main/java/org/elasticsearch/index/mapper/object/ObjectMapper.java
++++ b/src/main/java/org/elasticsearch/index/mapper/object/ObjectMapper.java
+@@ -1037,4 +1037,5 @@ public int compare(Mapper o1, Mapper o2) {
+     protected void doXContent(XContentBuilder builder, Params params) throws IOException {
+ 
+     }
++
+ }
+diff --git a/src/main/java/org/elasticsearch/percolator/PercolateContext.java b/src/main/java/org/elasticsearch/percolator/PercolateContext.java
+index 5476491fa726..2e4eb3b14777 100644
+--- a/src/main/java/org/elasticsearch/percolator/PercolateContext.java
++++ b/src/main/java/org/elasticsearch/percolator/PercolateContext.java
+@@ -36,7 +36,6 @@
+ import org.elasticsearch.index.cache.fixedbitset.FixedBitSetFilterCache;
+ import org.elasticsearch.index.engine.Engine;
+ import org.elasticsearch.index.fielddata.IndexFieldDataService;
+-import org.elasticsearch.index.fieldvisitor.JustSourceFieldsVisitor;
+ import org.elasticsearch.index.mapper.FieldMapper;
+ import org.elasticsearch.index.mapper.FieldMappers;
+ import org.elasticsearch.index.mapper.MapperService;
+@@ -145,7 +144,7 @@ public void initialize(Engine.Searcher docSearcher, ParsedDocument parsedDocumen
+         }
+         hitContext().reset(
+                 new InternalSearchHit(0, "unknown", new StringText(parsedDocument.type()), fields),
+-                atomicReaderContext, 0, indexReader, 0, new JustSourceFieldsVisitor()
++                atomicReaderContext, 0, indexReader
+         );
+     }
+ 
+diff --git a/src/main/java/org/elasticsearch/search/SearchHit.java b/src/main/java/org/elasticsearch/search/SearchHit.java
+index 5363ba208490..291a73f34e8b 100644
+--- a/src/main/java/org/elasticsearch/search/SearchHit.java
++++ b/src/main/java/org/elasticsearch/search/SearchHit.java
+@@ -23,6 +23,7 @@
+ import org.elasticsearch.ElasticsearchParseException;
+ import org.elasticsearch.common.bytes.BytesReference;
+ import org.elasticsearch.common.io.stream.Streamable;
++import org.elasticsearch.common.text.Text;
+ import org.elasticsearch.common.xcontent.ToXContent;
+ import org.elasticsearch.search.highlight.HighlightField;
+ 
+@@ -75,6 +76,11 @@
+      */
+     String getType();
+ 
++    /**
++     * If this is a nested hit then nested reference information is returned otherwise <code>null</code> is returned.
++     */
++    NestedIdentity getNestedIdentity();
++
+     /**
+      * The version of the hit.
+      */
+@@ -192,4 +198,27 @@
+      * The shard of the search hit.
+      */
+     SearchShardTarget getShard();
++
++    /**
++     * Encapsulates the nested identity of a hit.
++     */
++    public interface NestedIdentity {
++
++        /**
++         * Returns the nested field in the source this hit originates from
++         */
++        public Text getField();
++
++        /**
++         * Returns the offset in the nested array of objects in the source this hit
++         */
++        public int getOffset();
++
++        /**
++         * Returns the next child nested level if there is any, otherwise <code>null</code> is returned.
++         *
++         * In the case of mappings with multiple levels of nested object fields
++         */
++        public NestedIdentity getChild();
++    }
+ }
+diff --git a/src/main/java/org/elasticsearch/search/fetch/FetchPhase.java b/src/main/java/org/elasticsearch/search/fetch/FetchPhase.java
+index e070d212092e..fbbc024b0c58 100644
+--- a/src/main/java/org/elasticsearch/search/fetch/FetchPhase.java
++++ b/src/main/java/org/elasticsearch/search/fetch/FetchPhase.java
+@@ -22,14 +22,25 @@
+ import com.google.common.collect.ImmutableMap;
+ import org.apache.lucene.index.AtomicReaderContext;
+ import org.apache.lucene.index.ReaderUtil;
++import org.apache.lucene.search.Filter;
++import org.apache.lucene.util.FixedBitSet;
+ import org.elasticsearch.ElasticsearchIllegalArgumentException;
++import org.elasticsearch.ExceptionsHelper;
++import org.elasticsearch.common.bytes.BytesReference;
++import org.elasticsearch.common.collect.Tuple;
+ import org.elasticsearch.common.inject.Inject;
+ import org.elasticsearch.common.text.StringAndBytesText;
+ import org.elasticsearch.common.text.Text;
++import org.elasticsearch.common.xcontent.XContentHelper;
++import org.elasticsearch.common.xcontent.XContentType;
++import org.elasticsearch.common.xcontent.support.XContentMapValues;
+ import org.elasticsearch.index.fieldvisitor.*;
+ import org.elasticsearch.index.mapper.DocumentMapper;
+ import org.elasticsearch.index.mapper.FieldMappers;
+ import org.elasticsearch.index.mapper.internal.SourceFieldMapper;
++import org.elasticsearch.index.mapper.object.ObjectMapper;
++import org.elasticsearch.index.search.nested.NonNestedDocsFilter;
++import org.elasticsearch.search.SearchHit;
+ import org.elasticsearch.search.SearchHitField;
+ import org.elasticsearch.search.SearchParseElement;
+ import org.elasticsearch.search.SearchPhase;
+@@ -51,6 +62,7 @@
+ import java.util.*;
+ 
+ import static com.google.common.collect.Lists.newArrayList;
++import static org.elasticsearch.common.xcontent.XContentFactory.contentBuilder;
+ 
+ /**
+  *
+@@ -83,8 +95,10 @@ public void preProcess(SearchContext context) {
+ 
+     public void execute(SearchContext context) {
+         FieldsVisitor fieldsVisitor;
++        Set<String> fieldNames = null;
+         List<String> extractFieldNames = null;
+ 
++        boolean loadAllStored = false;
+         if (!context.hasFieldNames()) {
+             if (context.hasPartialFields()) {
+                 // partial fields need the source, so fetch it
+@@ -103,8 +117,6 @@ public void execute(SearchContext context) {
+                 fieldsVisitor = new JustUidFieldsVisitor();
+             }
+         } else {
+-            boolean loadAllStored = false;
+-            Set<String> fieldNames = null;
+             for (String fieldName : context.fieldNames()) {
+                 if (fieldName.equals("*")) {
+                     loadAllStored = true;
+@@ -152,82 +164,223 @@ public void execute(SearchContext context) {
+         FetchSubPhase.HitContext hitContext = new FetchSubPhase.HitContext();
+         for (int index = 0; index < context.docIdsToLoadSize(); index++) {
+             int docId = context.docIdsToLoad()[context.docIdsToLoadFrom() + index];
++            int readerIndex = ReaderUtil.subIndex(docId, context.searcher().getIndexReader().leaves());
++            AtomicReaderContext subReaderContext = context.searcher().getIndexReader().leaves().get(readerIndex);
++            int subDocId = docId - subReaderContext.docBase;
+ 
+-            loadStoredFields(context, fieldsVisitor, docId);
+-            fieldsVisitor.postProcess(context.mapperService());
++            final InternalSearchHit searchHit;
++            try {
++                int rootDocId = findRootDocumentIfNested(context, subReaderContext, subDocId);
++                if (rootDocId != -1) {
++                    searchHit = createNestedSearchHit(context, docId, subDocId, rootDocId, extractFieldNames, loadAllStored, fieldNames, subReaderContext);
++                } else {
++                    searchHit = createSearchHit(context, fieldsVisitor, docId, subDocId, extractFieldNames, subReaderContext);
++                }
++            } catch (IOException e) {
++                throw ExceptionsHelper.convertToElastic(e);
++            }
+ 
+-            Map<String, SearchHitField> searchFields = null;
+-            if (!fieldsVisitor.fields().isEmpty()) {
+-                searchFields = new HashMap<>(fieldsVisitor.fields().size());
+-                for (Map.Entry<String, List<Object>> entry : fieldsVisitor.fields().entrySet()) {
+-                    searchFields.put(entry.getKey(), new InternalSearchHitField(entry.getKey(), entry.getValue()));
++            hits[index] = searchHit;
++            hitContext.reset(searchHit, subReaderContext, subDocId, context.searcher().getIndexReader());
++            for (FetchSubPhase fetchSubPhase : fetchSubPhases) {
++                if (fetchSubPhase.hitExecutionNeeded(context)) {
++                    fetchSubPhase.hitExecute(context, hitContext);
+                 }
+             }
++        }
+ 
+-            DocumentMapper documentMapper = context.mapperService().documentMapper(fieldsVisitor.uid().type());
+-            Text typeText;
+-            if (documentMapper == null) {
+-                typeText = new StringAndBytesText(fieldsVisitor.uid().type());
+-            } else {
+-                typeText = documentMapper.typeText();
++        for (FetchSubPhase fetchSubPhase : fetchSubPhases) {
++            if (fetchSubPhase.hitsExecutionNeeded(context)) {
++                fetchSubPhase.hitsExecute(context, hits);
+             }
+-            InternalSearchHit searchHit = new InternalSearchHit(docId, fieldsVisitor.uid().id(), typeText, searchFields);
++        }
+ 
+-            hits[index] = searchHit;
++        context.fetchResult().hits(new InternalSearchHits(hits, context.queryResult().topDocs().totalHits, context.queryResult().topDocs().getMaxScore()));
++    }
+ 
+-            int readerIndex = ReaderUtil.subIndex(docId, context.searcher().getIndexReader().leaves());
+-            AtomicReaderContext subReaderContext = context.searcher().getIndexReader().leaves().get(readerIndex);
+-            int subDoc = docId - subReaderContext.docBase;
++    private int findRootDocumentIfNested(SearchContext context, AtomicReaderContext subReaderContext, int subDocId) throws IOException {
++        if (context.mapperService().hasNested()) {
++            FixedBitSet nonNested = context.fixedBitSetFilterCache().getFixedBitSetFilter(NonNestedDocsFilter.INSTANCE).getDocIdSet(subReaderContext, null);
++            if (!nonNested.get(subDocId)) {
++                return nonNested.nextSetBit(subDocId);
++            }
++        }
++        return -1;
++    }
+ 
+-            // go over and extract fields that are not mapped / stored
+-            context.lookup().setNextReader(subReaderContext);
+-            context.lookup().setNextDocId(subDoc);
+-            if (fieldsVisitor.source() != null) {
+-                context.lookup().source().setNextSource(fieldsVisitor.source());
++    private InternalSearchHit createSearchHit(SearchContext context, FieldsVisitor fieldsVisitor, int docId, int subDocId, List<String> extractFieldNames, AtomicReaderContext subReaderContext) {
++        loadStoredFields(context, subReaderContext, fieldsVisitor, subDocId);
++        fieldsVisitor.postProcess(context.mapperService());
++
++        Map<String, SearchHitField> searchFields = null;
++        if (!fieldsVisitor.fields().isEmpty()) {
++            searchFields = new HashMap<>(fieldsVisitor.fields().size());
++            for (Map.Entry<String, List<Object>> entry : fieldsVisitor.fields().entrySet()) {
++                searchFields.put(entry.getKey(), new InternalSearchHitField(entry.getKey(), entry.getValue()));
+             }
+-            if (extractFieldNames != null) {
+-                for (String extractFieldName : extractFieldNames) {
+-                    List<Object> values = context.lookup().source().extractRawValues(extractFieldName);
+-                    if (!values.isEmpty()) {
+-                        if (searchHit.fieldsOrNull() == null) {
+-                            searchHit.fields(new HashMap<String, SearchHitField>(2));
+-                        }
+-
+-                        SearchHitField hitField = searchHit.fields().get(extractFieldName);
+-                        if (hitField == null) {
+-                            hitField = new InternalSearchHitField(extractFieldName, new ArrayList<>(2));
+-                            searchHit.fields().put(extractFieldName, hitField);
+-                        }
+-                        for (Object value : values) {
+-                            hitField.values().add(value);
+-                        }
++        }
++
++        DocumentMapper documentMapper = context.mapperService().documentMapper(fieldsVisitor.uid().type());
++        Text typeText;
++        if (documentMapper == null) {
++            typeText = new StringAndBytesText(fieldsVisitor.uid().type());
++        } else {
++            typeText = documentMapper.typeText();
++        }
++        InternalSearchHit searchHit = new InternalSearchHit(docId, fieldsVisitor.uid().id(), typeText, searchFields);
++
++        // go over and extract fields that are not mapped / stored
++        context.lookup().setNextReader(subReaderContext);
++        context.lookup().setNextDocId(subDocId);
++        if (fieldsVisitor.source() != null) {
++            context.lookup().source().setNextSource(fieldsVisitor.source());
++        }
++        if (extractFieldNames != null) {
++            for (String extractFieldName : extractFieldNames) {
++                List<Object> values = context.lookup().source().extractRawValues(extractFieldName);
++                if (!values.isEmpty()) {
++                    if (searchHit.fieldsOrNull() == null) {
++                        searchHit.fields(new HashMap<String, SearchHitField>(2));
++                    }
++
++                    SearchHitField hitField = searchHit.fields().get(extractFieldName);
++                    if (hitField == null) {
++                        hitField = new InternalSearchHitField(extractFieldName, new ArrayList<>(2));
++                        searchHit.fields().put(extractFieldName, hitField);
++                    }
++                    for (Object value : values) {
++                        hitField.values().add(value);
+                     }
+                 }
+             }
++        }
+ 
+-            hitContext.reset(searchHit, subReaderContext, subDoc, context.searcher().getIndexReader(), docId, fieldsVisitor);
+-            for (FetchSubPhase fetchSubPhase : fetchSubPhases) {
+-                if (fetchSubPhase.hitExecutionNeeded(context)) {
+-                    fetchSubPhase.hitExecute(context, hitContext);
++        return searchHit;
++    }
++
++    private InternalSearchHit createNestedSearchHit(SearchContext context, int nestedTopDocId, int nestedSubDocId, int rootSubDocId, List<String> extractFieldNames, boolean loadAllStored, Set<String> fieldNames, AtomicReaderContext subReaderContext) throws IOException {
++        final FieldsVisitor rootFieldsVisitor;
++        if (context.sourceRequested() || extractFieldNames != null) {
++            rootFieldsVisitor = new UidAndSourceFieldsVisitor();
++        } else {
++            rootFieldsVisitor = new JustUidFieldsVisitor();
++        }
++        loadStoredFields(context, subReaderContext, rootFieldsVisitor, rootSubDocId);
++        rootFieldsVisitor.postProcess(context.mapperService());
++
++        Map<String, SearchHitField> searchFields = getSearchFields(context, nestedSubDocId, loadAllStored, fieldNames, subReaderContext);
++        DocumentMapper documentMapper = context.mapperService().documentMapper(rootFieldsVisitor.uid().type());
++        context.lookup().setNextReader(subReaderContext);
++        context.lookup().setNextDocId(nestedSubDocId);
++
++        ObjectMapper nestedObjectMapper = documentMapper.findNestedObjectMapper(nestedSubDocId, context.fixedBitSetFilterCache(), subReaderContext);
++        assert nestedObjectMapper != null;
++        InternalSearchHit.InternalNestedIdentity nestedIdentity = getInternalNestedIdentity(context, nestedSubDocId, subReaderContext, documentMapper, nestedObjectMapper);
++
++        BytesReference source = rootFieldsVisitor.source();
++        if (source != null) {
++            Tuple<XContentType, Map<String, Object>> tuple = XContentHelper.convertToMap(source, true);
++            Map<String, Object> sourceAsMap = tuple.v2();
++
++            List<Map<String, Object>> nestedParsedSource;
++            SearchHit.NestedIdentity nested = nestedIdentity;
++            do {
++                nestedParsedSource = (List<Map<String, Object>>) XContentMapValues.extractValue(nested.getField().string(), sourceAsMap);
++                sourceAsMap = nestedParsedSource.get(nested.getOffset());
++                nested = nested.getChild();
++            } while (nested != null);
++
++            context.lookup().source().setNextSource(sourceAsMap);
++            XContentType contentType = tuple.v1();
++            BytesReference nestedSource = contentBuilder(contentType).map(sourceAsMap).bytes();
++            context.lookup().source().setNextSource(nestedSource);
++            context.lookup().source().setNextSourceContentType(contentType);
++        }
++
++        InternalSearchHit searchHit = new InternalSearchHit(nestedTopDocId, rootFieldsVisitor.uid().id(), documentMapper.typeText(), nestedIdentity, searchFields);
++        if (extractFieldNames != null) {
++            for (String extractFieldName : extractFieldNames) {
++                List<Object> values = context.lookup().source().extractRawValues(extractFieldName);
++                if (!values.isEmpty()) {
++                    if (searchHit.fieldsOrNull() == null) {
++                        searchHit.fields(new HashMap<String, SearchHitField>(2));
++                    }
++
++                    SearchHitField hitField = searchHit.fields().get(extractFieldName);
++                    if (hitField == null) {
++                        hitField = new InternalSearchHitField(extractFieldName, new ArrayList<>(2));
++                        searchHit.fields().put(extractFieldName, hitField);
++                    }
++                    for (Object value : values) {
++                        hitField.values().add(value);
++                    }
+                 }
+             }
+         }
+ 
+-        for (FetchSubPhase fetchSubPhase : fetchSubPhases) {
+-            if (fetchSubPhase.hitsExecutionNeeded(context)) {
+-                fetchSubPhase.hitsExecute(context, hits);
++        return searchHit;
++    }
++
++    private Map<String, SearchHitField> getSearchFields(SearchContext context, int nestedSubDocId, boolean loadAllStored, Set<String> fieldNames, AtomicReaderContext subReaderContext) {
++        Map<String, SearchHitField> searchFields = null;
++        if (context.hasFieldNames() && !context.fieldNames().isEmpty()) {
++            FieldsVisitor nestedFieldsVisitor = null;
++            if (loadAllStored) {
++                nestedFieldsVisitor = new AllFieldsVisitor();
++            } else if (fieldNames != null) {
++                nestedFieldsVisitor = new CustomFieldsVisitor(fieldNames, false);
++            }
++
++            if (nestedFieldsVisitor != null) {
++                loadStoredFields(context, subReaderContext, nestedFieldsVisitor, nestedSubDocId);
++                nestedFieldsVisitor.postProcess(context.mapperService());
++                if (!nestedFieldsVisitor.fields().isEmpty()) {
++                    searchFields = new HashMap<>(nestedFieldsVisitor.fields().size());
++                    for (Map.Entry<String, List<Object>> entry : nestedFieldsVisitor.fields().entrySet()) {
++                        searchFields.put(entry.getKey(), new InternalSearchHitField(entry.getKey(), entry.getValue()));
++                    }
++                }
+             }
+         }
++        return searchFields;
++    }
+ 
+-        context.fetchResult().hits(new InternalSearchHits(hits, context.queryResult().topDocs().totalHits, context.queryResult().topDocs().getMaxScore()));
++    private InternalSearchHit.InternalNestedIdentity getInternalNestedIdentity(SearchContext context, int nestedSubDocId, AtomicReaderContext subReaderContext, DocumentMapper documentMapper, ObjectMapper nestedObjectMapper) throws IOException {
++        int currentParent = nestedSubDocId;
++        ObjectMapper nestedParentObjectMapper;
++        InternalSearchHit.InternalNestedIdentity nestedIdentity = null;
++        do {
++            String field;
++            Filter parentFilter;
++            nestedParentObjectMapper = documentMapper.findParentObjectMapper(nestedObjectMapper);
++            if (nestedParentObjectMapper != null && nestedObjectMapper.nested().isNested()) {
++                field = nestedObjectMapper.name();
++                parentFilter = nestedParentObjectMapper.nestedTypeFilter();
++            } else {
++                field = nestedObjectMapper.fullPath();
++                parentFilter = NonNestedDocsFilter.INSTANCE;
++            }
++
++            FixedBitSet parentBitSet = context.fixedBitSetFilterCache().getFixedBitSetFilter(parentFilter).getDocIdSet(subReaderContext, null);
++            int offset = 0;
++            FixedBitSet nestedDocsBitSet = context.fixedBitSetFilterCache().getFixedBitSetFilter(nestedObjectMapper.nestedTypeFilter()).getDocIdSet(subReaderContext, null);
++            int nextParent = parentBitSet.nextSetBit(currentParent);
++            for (int docId = nestedDocsBitSet.nextSetBit(currentParent + 1); docId < nextParent && docId != -1; docId = nestedDocsBitSet.nextSetBit(docId + 1)) {
++                offset++;
++            }
++            currentParent = nextParent;
++            nestedObjectMapper = nestedParentObjectMapper;
++            nestedIdentity = new InternalSearchHit.InternalNestedIdentity(field, offset, nestedIdentity);
++        } while (nestedParentObjectMapper != null);
++        return nestedIdentity;
+     }
+ 
+-    private void loadStoredFields(SearchContext context, FieldsVisitor fieldVisitor, int docId) {
++    private void loadStoredFields(SearchContext searchContext, AtomicReaderContext readerContext, FieldsVisitor fieldVisitor, int docId) {
+         fieldVisitor.reset();
+         try {
+-            context.searcher().doc(docId, fieldVisitor);
++            readerContext.reader().document(docId, fieldVisitor);
+         } catch (IOException e) {
+-            throw new FetchPhaseExecutionException(context, "Failed to fetch doc id [" + docId + "]", e);
++            throw new FetchPhaseExecutionException(searchContext, "Failed to fetch doc id [" + docId + "]", e);
+         }
+     }
+ }
+diff --git a/src/main/java/org/elasticsearch/search/fetch/FetchSubPhase.java b/src/main/java/org/elasticsearch/search/fetch/FetchSubPhase.java
+index b0e39bbf26ee..6e6400a1cd91 100644
+--- a/src/main/java/org/elasticsearch/search/fetch/FetchSubPhase.java
++++ b/src/main/java/org/elasticsearch/search/fetch/FetchSubPhase.java
+@@ -24,7 +24,7 @@
+ import org.apache.lucene.index.IndexReader;
+ import org.apache.lucene.search.IndexSearcher;
+ import org.elasticsearch.ElasticsearchException;
+-import org.elasticsearch.index.fieldvisitor.FieldsVisitor;
++import org.elasticsearch.search.SearchHit;
+ import org.elasticsearch.search.SearchParseElement;
+ import org.elasticsearch.search.internal.InternalSearchHit;
+ import org.elasticsearch.search.internal.SearchContext;
+@@ -39,20 +39,16 @@
+     public static class HitContext {
+         private InternalSearchHit hit;
+         private IndexReader topLevelReader;
+-        private int topLevelDocId;
+         private AtomicReaderContext readerContext;
+         private int docId;
+-        private FieldsVisitor fieldVisitor;
+         private Map<String, Object> cache;
+         private IndexSearcher atomicIndexSearcher;
+ 
+-        public void reset(InternalSearchHit hit, AtomicReaderContext context, int docId, IndexReader topLevelReader, int topLevelDocId, FieldsVisitor fieldVisitor) {
++        public void reset(InternalSearchHit hit, AtomicReaderContext context, int docId, IndexReader topLevelReader) {
+             this.hit = hit;
+             this.readerContext = context;
+             this.docId = docId;
+             this.topLevelReader = topLevelReader;
+-            this.topLevelDocId = topLevelDocId;
+-            this.fieldVisitor = fieldVisitor;
+             this.atomicIndexSearcher = null;
+         }
+ 
+@@ -85,20 +81,32 @@ public IndexReader topLevelReader() {
+             return topLevelReader;
+         }
+ 
+-        public int topLevelDocId() {
+-            return topLevelDocId;
+-        }
+-
+-        public FieldsVisitor fieldVisitor() {
+-            return fieldVisitor;
+-        }
+-
+         public Map<String, Object> cache() {
+             if (cache == null) {
+                 cache = Maps.newHashMap();
+             }
+             return cache;
+         }
++
++        public String getSourcePath(String sourcePath) {
++            SearchHit.NestedIdentity nested = hit().getNestedIdentity();
++            if (nested != null) {
++                // in case of nested we need to figure out what is the _source field from the perspective
++                // of the nested hit it self. The nested _source is isolated and the root and potentially parent objects
++                // are gone
++                StringBuilder nestedPath = new StringBuilder();
++                for (; nested != null; nested = nested.getChild()) {
++                    nestedPath.append(nested.getField());
++                }
++
++                assert sourcePath.startsWith(nestedPath.toString());
++                int startIndex = nestedPath.length() + 1; // the path until the deepest nested object + '.'
++                return sourcePath.substring(startIndex);
++            } else {
++                return sourcePath;
++            }
++        }
++
+     }
+ 
+     Map<String, ? extends SearchParseElement> parseElements();
+diff --git a/src/main/java/org/elasticsearch/search/fetch/version/VersionFetchSubPhase.java b/src/main/java/org/elasticsearch/search/fetch/version/VersionFetchSubPhase.java
+index f0d8a44ded5a..1c2f7d4c8467 100644
+--- a/src/main/java/org/elasticsearch/search/fetch/version/VersionFetchSubPhase.java
++++ b/src/main/java/org/elasticsearch/search/fetch/version/VersionFetchSubPhase.java
+@@ -20,8 +20,10 @@
+ 
+ import com.google.common.collect.ImmutableMap;
+ import org.apache.lucene.index.Term;
++import org.apache.lucene.util.BytesRef;
+ import org.elasticsearch.ElasticsearchException;
+ import org.elasticsearch.common.lucene.uid.Versions;
++import org.elasticsearch.index.mapper.Uid;
+ import org.elasticsearch.index.mapper.internal.UidFieldMapper;
+ import org.elasticsearch.search.SearchParseElement;
+ import org.elasticsearch.search.fetch.FetchSubPhase;
+@@ -62,9 +64,10 @@ public void hitExecute(SearchContext context, HitContext hitContext) throws Elas
+         // the case below...
+         long version;
+         try {
++            BytesRef uid = Uid.createUidAsBytes(hitContext.hit().type(), hitContext.hit().id());
+             version = Versions.loadVersion(
+                     hitContext.readerContext().reader(),
+-                    new Term(UidFieldMapper.NAME, hitContext.fieldVisitor().uid().toBytesRef())
++                    new Term(UidFieldMapper.NAME, uid)
+             );
+         } catch (IOException e) {
+             throw new ElasticsearchException("Could not query index for _version", e);
+diff --git a/src/main/java/org/elasticsearch/search/highlight/FastVectorHighlighter.java b/src/main/java/org/elasticsearch/search/highlight/FastVectorHighlighter.java
+index 08525789f5a7..6d34c7a58ee4 100644
+--- a/src/main/java/org/elasticsearch/search/highlight/FastVectorHighlighter.java
++++ b/src/main/java/org/elasticsearch/search/highlight/FastVectorHighlighter.java
+@@ -107,7 +107,7 @@ public HighlightField highlight(HighlighterContext highlighterContext) {
+                     if (!forceSource && mapper.fieldType().stored()) {
+                         fragmentsBuilder = new SimpleFragmentsBuilder(mapper, field.fieldOptions().preTags(), field.fieldOptions().postTags(), boundaryScanner);
+                     } else {
+-                        fragmentsBuilder = new SourceSimpleFragmentsBuilder(mapper, context, field.fieldOptions().preTags(), field.fieldOptions().postTags(), boundaryScanner);
++                        fragmentsBuilder = new SourceSimpleFragmentsBuilder(mapper, context, hitContext, field.fieldOptions().preTags(), field.fieldOptions().postTags(), boundaryScanner);
+                     }
+                 } else {
+                     fragListBuilder = field.fieldOptions().fragmentOffset() == -1 ? new SimpleFragListBuilder() : new SimpleFragListBuilder(field.fieldOptions().fragmentOffset());
+@@ -115,13 +115,13 @@ public HighlightField highlight(HighlighterContext highlighterContext) {
+                         if (!forceSource && mapper.fieldType().stored()) {
+                             fragmentsBuilder = new ScoreOrderFragmentsBuilder(field.fieldOptions().preTags(), field.fieldOptions().postTags(), boundaryScanner);
+                         } else {
+-                            fragmentsBuilder = new SourceScoreOrderFragmentsBuilder(mapper, context, field.fieldOptions().preTags(), field.fieldOptions().postTags(), boundaryScanner);
++                            fragmentsBuilder = new SourceScoreOrderFragmentsBuilder(mapper, context, hitContext, field.fieldOptions().preTags(), field.fieldOptions().postTags(), boundaryScanner);
+                         }
+                     } else {
+                         if (!forceSource && mapper.fieldType().stored()) {
+                             fragmentsBuilder = new SimpleFragmentsBuilder(mapper, field.fieldOptions().preTags(), field.fieldOptions().postTags(), boundaryScanner);
+                         } else {
+-                            fragmentsBuilder = new SourceSimpleFragmentsBuilder(mapper, context, field.fieldOptions().preTags(), field.fieldOptions().postTags(), boundaryScanner);
++                            fragmentsBuilder = new SourceSimpleFragmentsBuilder(mapper, context, hitContext, field.fieldOptions().preTags(), field.fieldOptions().postTags(), boundaryScanner);
+                         }
+                     }
+                 }
+diff --git a/src/main/java/org/elasticsearch/search/highlight/HighlightUtils.java b/src/main/java/org/elasticsearch/search/highlight/HighlightUtils.java
+index 042c2438e829..ff198e78248a 100644
+--- a/src/main/java/org/elasticsearch/search/highlight/HighlightUtils.java
++++ b/src/main/java/org/elasticsearch/search/highlight/HighlightUtils.java
+@@ -57,7 +57,7 @@ private HighlightUtils() {
+             SearchLookup lookup = searchContext.lookup();
+             lookup.setNextReader(hitContext.readerContext());
+             lookup.setNextDocId(hitContext.docId());
+-            textsToHighlight = lookup.source().extractRawValues(mapper.names().sourcePath());
++            textsToHighlight = lookup.source().extractRawValues(hitContext.getSourcePath(mapper.names().sourcePath()));
+         }
+         assert textsToHighlight != null;
+         return textsToHighlight;
+diff --git a/src/main/java/org/elasticsearch/search/highlight/vectorhighlight/SourceScoreOrderFragmentsBuilder.java b/src/main/java/org/elasticsearch/search/highlight/vectorhighlight/SourceScoreOrderFragmentsBuilder.java
+index 1b666c4feaad..cd648ff9bdfc 100644
+--- a/src/main/java/org/elasticsearch/search/highlight/vectorhighlight/SourceScoreOrderFragmentsBuilder.java
++++ b/src/main/java/org/elasticsearch/search/highlight/vectorhighlight/SourceScoreOrderFragmentsBuilder.java
+@@ -27,6 +27,7 @@
+ import org.apache.lucene.search.vectorhighlight.FieldFragList.WeightedFragInfo;
+ import org.apache.lucene.search.vectorhighlight.ScoreOrderFragmentsBuilder;
+ import org.elasticsearch.index.mapper.FieldMapper;
++import org.elasticsearch.search.fetch.FetchSubPhase;
+ import org.elasticsearch.search.internal.SearchContext;
+ import org.elasticsearch.search.lookup.SearchLookup;
+ 
+@@ -42,11 +43,14 @@
+ 
+     private final SearchContext searchContext;
+ 
++    private final FetchSubPhase.HitContext hitContext;
++
+     public SourceScoreOrderFragmentsBuilder(FieldMapper<?> mapper, SearchContext searchContext,
+-                                            String[] preTags, String[] postTags, BoundaryScanner boundaryScanner) {
++                                            FetchSubPhase.HitContext hitContext, String[] preTags, String[] postTags, BoundaryScanner boundaryScanner) {
+         super(preTags, postTags, boundaryScanner);
+         this.mapper = mapper;
+         this.searchContext = searchContext;
++        this.hitContext = hitContext;
+     }
+ 
+     @Override
+@@ -56,7 +60,7 @@ public SourceScoreOrderFragmentsBuilder(FieldMapper<?> mapper, SearchContext sea
+         lookup.setNextReader((AtomicReaderContext) reader.getContext());
+         lookup.setNextDocId(docId);
+ 
+-        List<Object> values = lookup.source().extractRawValues(mapper.names().sourcePath());
++        List<Object> values = lookup.source().extractRawValues(hitContext.getSourcePath(mapper.names().sourcePath()));
+         Field[] fields = new Field[values.size()];
+         for (int i = 0; i < values.size(); i++) {
+             fields[i] = new Field(mapper.names().indexName(), values.get(i).toString(), TextField.TYPE_NOT_STORED);
+diff --git a/src/main/java/org/elasticsearch/search/highlight/vectorhighlight/SourceSimpleFragmentsBuilder.java b/src/main/java/org/elasticsearch/search/highlight/vectorhighlight/SourceSimpleFragmentsBuilder.java
+index abfd907af29d..c8621a91c0a9 100644
+--- a/src/main/java/org/elasticsearch/search/highlight/vectorhighlight/SourceSimpleFragmentsBuilder.java
++++ b/src/main/java/org/elasticsearch/search/highlight/vectorhighlight/SourceSimpleFragmentsBuilder.java
+@@ -24,6 +24,7 @@
+ import org.apache.lucene.index.IndexReader;
+ import org.apache.lucene.search.vectorhighlight.BoundaryScanner;
+ import org.elasticsearch.index.mapper.FieldMapper;
++import org.elasticsearch.search.fetch.FetchSubPhase;
+ import org.elasticsearch.search.internal.SearchContext;
+ import org.elasticsearch.search.lookup.SearchLookup;
+ 
+@@ -37,10 +38,13 @@
+ 
+     private final SearchContext searchContext;
+ 
++    private final FetchSubPhase.HitContext hitContext;
++
+     public SourceSimpleFragmentsBuilder(FieldMapper<?> mapper, SearchContext searchContext,
+-                                        String[] preTags, String[] postTags, BoundaryScanner boundaryScanner) {
++                                        FetchSubPhase.HitContext hitContext, String[] preTags, String[] postTags, BoundaryScanner boundaryScanner) {
+         super(mapper, preTags, postTags, boundaryScanner);
+         this.searchContext = searchContext;
++        this.hitContext = hitContext;
+     }
+ 
+     public static final Field[] EMPTY_FIELDS = new Field[0];
+@@ -52,7 +56,7 @@ public SourceSimpleFragmentsBuilder(FieldMapper<?> mapper, SearchContext searchC
+         lookup.setNextReader((AtomicReaderContext) reader.getContext());
+         lookup.setNextDocId(docId);
+ 
+-        List<Object> values = lookup.source().extractRawValues(mapper.names().sourcePath());
++        List<Object> values = lookup.source().extractRawValues(hitContext.getSourcePath(mapper.names().sourcePath()));
+         if (values.isEmpty()) {
+             return EMPTY_FIELDS;
+         }
+diff --git a/src/main/java/org/elasticsearch/search/internal/InternalSearchHit.java b/src/main/java/org/elasticsearch/search/internal/InternalSearchHit.java
+index 883875700d90..0980fdb9d6ac 100644
+--- a/src/main/java/org/elasticsearch/search/internal/InternalSearchHit.java
++++ b/src/main/java/org/elasticsearch/search/internal/InternalSearchHit.java
+@@ -23,6 +23,7 @@
+ import org.apache.lucene.search.Explanation;
+ import org.apache.lucene.util.BytesRef;
+ import org.elasticsearch.ElasticsearchParseException;
++import org.elasticsearch.Version;
+ import org.elasticsearch.common.Nullable;
+ import org.elasticsearch.common.Strings;
+ import org.elasticsearch.common.bytes.BytesArray;
+@@ -30,8 +31,10 @@
+ import org.elasticsearch.common.compress.CompressorFactory;
+ import org.elasticsearch.common.io.stream.StreamInput;
+ import org.elasticsearch.common.io.stream.StreamOutput;
++import org.elasticsearch.common.io.stream.Streamable;
+ import org.elasticsearch.common.text.StringAndBytesText;
+ import org.elasticsearch.common.text.Text;
++import org.elasticsearch.common.xcontent.ToXContent;
+ import org.elasticsearch.common.xcontent.XContentBuilder;
+ import org.elasticsearch.common.xcontent.XContentBuilderString;
+ import org.elasticsearch.common.xcontent.XContentHelper;
+@@ -67,6 +70,8 @@
+     private Text id;
+     private Text type;
+ 
++    private InternalNestedIdentity nestedIdentity;
++
+     private long version = -1;
+ 
+     private BytesReference source;
+@@ -98,6 +103,14 @@ public InternalSearchHit(int docId, String id, Text type, Map<String, SearchHitF
+         this.fields = fields;
+     }
+ 
++    public InternalSearchHit(int nestedTopDocId, String id, Text type, InternalNestedIdentity nestedIdentity, Map<String, SearchHitField> fields) {
++        this.docId = nestedTopDocId;
++        this.id = new StringAndBytesText(id);
++        this.type = type;
++        this.nestedIdentity = nestedIdentity;
++        this.fields = fields;
++    }
++
+     public int docId() {
+         return this.docId;
+     }
+@@ -164,6 +177,10 @@ public String getType() {
+         return type();
+     }
+ 
++    @Override
++    public NestedIdentity getNestedIdentity() {
++        return nestedIdentity;
++    }
+ 
+     /**
+      * Returns bytes reference, also un compress the source if needed.
+@@ -401,6 +418,9 @@ public XContentBuilder toXContent(XContentBuilder builder, Params params) throws
+         builder.field(Fields._INDEX, shard.indexText());
+         builder.field(Fields._TYPE, type);
+         builder.field(Fields._ID, id);
++        if (nestedIdentity != null) {
++            nestedIdentity.toXContent(builder, params);
++        }
+         if (version != -1) {
+             builder.field(Fields._VERSION, version);
+         }
+@@ -505,6 +525,9 @@ public void readFrom(StreamInput in, InternalSearchHits.StreamContext context) t
+         score = in.readFloat();
+         id = in.readText();
+         type = in.readSharedText();
++        if (in.getVersion().onOrAfter(Version.V_1_5_0)) {
++            nestedIdentity = in.readOptionalStreamable(new InternalNestedIdentity());
++        }
+         version = in.readLong();
+         source = in.readBytesReference();
+         if (source.length() == 0) {
+@@ -640,6 +663,9 @@ public void writeTo(StreamOutput out, InternalSearchHits.StreamContext context)
+         out.writeFloat(score);
+         out.writeText(id);
+         out.writeSharedText(type);
++        if (out.getVersion().onOrAfter(Version.V_1_5_0)) {
++            out.writeOptionalStreamable(nestedIdentity);
++        }
+         out.writeLong(version);
+         out.writeBytesReference(source);
+         if (explanation == null) {
+@@ -732,4 +758,74 @@ public void writeTo(StreamOutput out, InternalSearchHits.StreamContext context)
+             }
+         }
+     }
++
++    public final static class InternalNestedIdentity implements NestedIdentity, Streamable, ToXContent {
++
++        private Text field;
++        private int offset;
++        private InternalNestedIdentity child;
++
++        public InternalNestedIdentity(String field, int offset, InternalNestedIdentity child) {
++            this.field = new StringAndBytesText(field);
++            this.offset = offset;
++            this.child = child;
++        }
++
++        InternalNestedIdentity() {
++        }
++
++        @Override
++        public Text getField() {
++            return field;
++        }
++
++        @Override
++        public int getOffset() {
++            return offset;
++        }
++
++        @Override
++        public NestedIdentity getChild() {
++            return child;
++        }
++
++        @Override
++        public void readFrom(StreamInput in) throws IOException {
++            field = in.readOptionalText();
++            offset = in.readInt();
++            child = in.readOptionalStreamable(new InternalNestedIdentity());
++        }
++
++        @Override
++        public void writeTo(StreamOutput out) throws IOException {
++            out.writeOptionalText(field);
++            out.writeInt(offset);
++            out.writeOptionalStreamable(child);
++        }
++
++        @Override
++        public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
++            builder.startObject(Fields._NESTED);
++            if (field != null) {
++                builder.field(Fields._NESTED_FIELD, field);
++            }
++            if (offset != -1) {
++                builder.field(Fields._NESTED_OFFSET, offset);
++            }
++            if (child != null) {
++                builder = child.toXContent(builder, params);
++            }
++            builder.endObject();
++            return builder;
++        }
++
++        public static class Fields {
++
++            static final XContentBuilderString _NESTED = new XContentBuilderString("_nested");
++            static final XContentBuilderString _NESTED_FIELD = new XContentBuilderString("field");
++            static final XContentBuilderString _NESTED_OFFSET = new XContentBuilderString("offset");
++
++        }
++    }
++
+ }
+\ No newline at end of file
+diff --git a/src/main/java/org/elasticsearch/search/lookup/SourceLookup.java b/src/main/java/org/elasticsearch/search/lookup/SourceLookup.java
+index add63b40a1f6..c9ff9d185fbd 100644
+--- a/src/main/java/org/elasticsearch/search/lookup/SourceLookup.java
++++ b/src/main/java/org/elasticsearch/search/lookup/SourceLookup.java
+@@ -122,6 +122,10 @@ public void setNextSource(BytesReference source) {
+         this.sourceAsBytes = source;
+     }
+ 
++    public void setNextSourceContentType(XContentType sourceContentType) {
++        this.sourceContentType = sourceContentType;
++    }
++
+     public void setNextSource(Map<String, Object> source) {
+         this.source = source;
+     }
+diff --git a/src/main/java/org/elasticsearch/search/sort/SortParseElement.java b/src/main/java/org/elasticsearch/search/sort/SortParseElement.java
+index a5a4f92d240e..b8e7b6d5a97b 100644
+--- a/src/main/java/org/elasticsearch/search/sort/SortParseElement.java
++++ b/src/main/java/org/elasticsearch/search/sort/SortParseElement.java
+@@ -41,6 +41,7 @@
+ import org.elasticsearch.search.MultiValueMode;
+ import org.elasticsearch.search.SearchParseElement;
+ import org.elasticsearch.search.SearchParseException;
++import org.elasticsearch.search.aggregations.metrics.tophits.TopHitsContext;
+ import org.elasticsearch.search.internal.SearchContext;
+ 
+ import java.util.List;
+@@ -233,7 +234,7 @@ private void addSortField(SearchContext context, List<SortField> sortFields, Str
+             }
+ 
+ 
+-            ObjectMapper objectMapper;
++            ObjectMapper objectMapper = null;
+             if (nestedPath != null) {
+                 ObjectMappers objectMappers = context.mapperService().objectMapper(nestedPath);
+                 if (objectMappers == null) {
+@@ -243,7 +244,8 @@ private void addSortField(SearchContext context, List<SortField> sortFields, Str
+                 if (!objectMapper.nested().isNested()) {
+                     throw new ElasticsearchIllegalArgumentException("mapping for explicit nested path is not mapped as nested: [" + nestedPath + "]");
+                 }
+-            } else {
++            } else if (!(context instanceof TopHitsContext)) {
++                // Only automatically resolve nested path when sort isn't defined for top_hits
+                 objectMapper = context.mapperService().resolveClosestNestedObjectMapper(fieldName);
+             }
+             final Nested nested;
+diff --git a/src/test/java/org/elasticsearch/search/aggregations/bucket/TopHitsTests.java b/src/test/java/org/elasticsearch/search/aggregations/bucket/TopHitsTests.java
+index 0dcec77f83cd..7fbe77da1ff7 100644
+--- a/src/test/java/org/elasticsearch/search/aggregations/bucket/TopHitsTests.java
++++ b/src/test/java/org/elasticsearch/search/aggregations/bucket/TopHitsTests.java
+@@ -23,15 +23,19 @@
+ import org.elasticsearch.action.search.SearchPhaseExecutionException;
+ import org.elasticsearch.action.search.SearchResponse;
+ import org.elasticsearch.action.search.SearchType;
++import org.elasticsearch.common.xcontent.XContentBuilder;
+ import org.elasticsearch.index.query.FilterBuilders;
+ import org.elasticsearch.search.SearchHit;
+ import org.elasticsearch.search.SearchHitField;
+ import org.elasticsearch.search.SearchHits;
+ import org.elasticsearch.search.aggregations.Aggregator.SubAggCollectionMode;
++import org.elasticsearch.search.aggregations.bucket.histogram.Histogram;
++import org.elasticsearch.search.aggregations.bucket.nested.Nested;
+ import org.elasticsearch.search.aggregations.bucket.terms.Terms;
+ import org.elasticsearch.search.aggregations.bucket.terms.TermsAggregatorFactory.ExecutionMode;
+-import org.elasticsearch.search.aggregations.metrics.tophits.TopHits;
+ import org.elasticsearch.search.aggregations.metrics.max.Max;
++import org.elasticsearch.search.aggregations.metrics.tophits.TopHits;
++import org.elasticsearch.search.highlight.HighlightBuilder;
+ import org.elasticsearch.search.highlight.HighlightField;
+ import org.elasticsearch.search.sort.SortBuilders;
+ import org.elasticsearch.search.sort.SortOrder;
+@@ -43,13 +47,15 @@
+ import java.util.List;
+ 
+ import static org.elasticsearch.common.xcontent.XContentFactory.jsonBuilder;
++import static org.elasticsearch.common.xcontent.XContentFactory.smileBuilder;
++import static org.elasticsearch.common.xcontent.XContentFactory.yamlBuilder;
+ import static org.elasticsearch.index.query.QueryBuilders.matchQuery;
++import static org.elasticsearch.index.query.QueryBuilders.nestedQuery;
+ import static org.elasticsearch.search.aggregations.AggregationBuilders.*;
+-import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertSearchResponse;
+-import static org.hamcrest.Matchers.containsString;
+-import static org.hamcrest.Matchers.equalTo;
+-import static org.hamcrest.Matchers.not;
++import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.*;
++import static org.hamcrest.Matchers.*;
+ import static org.hamcrest.core.IsNull.notNullValue;
++import static org.hamcrest.core.IsNull.nullValue;
+ 
+ /**
+  *
+@@ -64,10 +70,38 @@ public static String randomExecutionHint() {
+         return randomBoolean() ? null : randomFrom(ExecutionMode.values()).toString();
+     }
+ 
++    static int numArticles;
++
+     @Override
+     public void setupSuiteScopeCluster() throws Exception {
+         createIndex("idx");
+         createIndex("empty");
++        assertAcked(prepareCreate("articles").addMapping("article", jsonBuilder().startObject().startObject("article").startObject("properties")
++                .startObject("comments")
++                    .field("type", "nested")
++                    .startObject("properties")
++                        .startObject("date")
++                            .field("type", "long")
++                        .endObject()
++                        .startObject("message")
++                            .field("type", "string")
++                            .field("store", true)
++                            .field("term_vector", "with_positions_offsets")
++                            .field("index_options", "offsets")
++                            .endObject()
++                        .startObject("reviewers")
++                            .field("type", "nested")
++                            .startObject("properties")
++                                .startObject("name")
++                                    .field("type", "string")
++                                    .field("index", "not_analyzed")
++                                .endObject()
++                            .endObject()
++                        .endObject()
++                    .endObject()
++                .endObject()
++                .endObject().endObject().endObject()));
++
+         List<IndexRequestBuilder> builders = new ArrayList<>();
+         for (int i = 0; i < 50; i++) {
+             builders.add(client().prepareIndex("idx", "type", Integer.toString(i)).setSource(jsonBuilder()
+@@ -125,6 +159,56 @@ public void setupSuiteScopeCluster() throws Exception {
+                 .field("text", "rare x term")
+                 .endObject()));
+ 
++        numArticles = scaledRandomIntBetween(10, 100);
++        numArticles -= (numArticles % 5);
++        for (int i = 0; i < numArticles; i++) {
++            XContentBuilder builder = randomFrom(jsonBuilder(), yamlBuilder(), smileBuilder());
++            builder.startObject().field("date", i).startArray("comments");
++            for (int j = 0; j < i; j++) {
++                String user = Integer.toString(j);
++                builder.startObject().field("id", j).field("user", user).field("message", "some text").endObject();
++            }
++            builder.endArray().endObject();
++
++            builders.add(
++                    client().prepareIndex("articles", "article").setCreate(true).setSource(builder)
++            );
++        }
++
++        builders.add(
++                client().prepareIndex("articles", "article", "1")
++                        .setSource(jsonBuilder().startObject().field("title", "title 1").field("body", "some text").startArray("comments")
++                                .startObject()
++                                    .field("user", "a").field("date", 1l).field("message", "some comment")
++                                    .startArray("reviewers")
++                                        .startObject().field("name", "user a").endObject()
++                                        .startObject().field("name", "user b").endObject()
++                                        .startObject().field("name", "user c").endObject()
++                                    .endArray()
++                                .endObject()
++                                .startObject()
++                                    .field("user", "b").field("date", 2l).field("message", "some other comment")
++                                    .startArray("reviewers")
++                                        .startObject().field("name", "user c").endObject()
++                                        .startObject().field("name", "user d").endObject()
++                                        .startObject().field("name", "user e").endObject()
++                                    .endArray()
++                                .endObject()
++                                .endArray().endObject())
++        );
++        builders.add(
++                client().prepareIndex("articles", "article", "2")
++                        .setSource(jsonBuilder().startObject().field("title", "title 2").field("body", "some different text").startArray("comments")
++                                .startObject()
++                                    .field("user", "b").field("date", 3l).field("message", "some comment")
++                                    .startArray("reviewers")
++                                        .startObject().field("name", "user f").endObject()
++                                    .endArray()
++                                .endObject()
++                                .startObject().field("user", "c").field("date", 4l).field("message", "some other comment").endObject()
++                                .endArray().endObject())
++        );
++
+         indexRandom(true, builders);
+         ensureSearchable();
+     }
+@@ -503,4 +587,261 @@ public void testTrackScores() throws Exception {
+         }
+     }
+ 
++    @Test
++    public void testTopHitsInNestedSimple() throws Exception {
++        SearchResponse searchResponse = client().prepareSearch("articles")
++                .setQuery(matchQuery("title", "title"))
++                .addAggregation(
++                        nested("to-comments")
++                                .path("comments")
++                                .subAggregation(
++                                        terms("users")
++                                                .field("comments.user")
++                                                .subAggregation(
++                                                        topHits("top-comments").addSort("comments.date", SortOrder.ASC)
++                                                )
++                                )
++                )
++                .get();
++
++        Nested nested = searchResponse.getAggregations().get("to-comments");
++        assertThat(nested.getDocCount(), equalTo(4l));
++
++        Terms terms = nested.getAggregations().get("users");
++        Terms.Bucket bucket = terms.getBucketByKey("a");
++        assertThat(bucket.getDocCount(), equalTo(1l));
++        TopHits topHits = bucket.getAggregations().get("top-comments");
++        SearchHits searchHits = topHits.getHits();
++        assertThat(searchHits.totalHits(), equalTo(1l));
++        assertThat(searchHits.getAt(0).getNestedIdentity().getField().string(), equalTo("comments"));
++        assertThat(searchHits.getAt(0).getNestedIdentity().getOffset(), equalTo(0));
++        assertThat((Integer) searchHits.getAt(0).getSource().get("date"), equalTo(1));
++
++        bucket = terms.getBucketByKey("b");
++        assertThat(bucket.getDocCount(), equalTo(2l));
++        topHits = bucket.getAggregations().get("top-comments");
++        searchHits = topHits.getHits();
++        assertThat(searchHits.totalHits(), equalTo(2l));
++        assertThat(searchHits.getAt(0).getNestedIdentity().getField().string(), equalTo("comments"));
++        assertThat(searchHits.getAt(0).getNestedIdentity().getOffset(), equalTo(1));
++        assertThat((Integer) searchHits.getAt(0).getSource().get("date"), equalTo(2));
++        assertThat(searchHits.getAt(1).getNestedIdentity().getField().string(), equalTo("comments"));
++        assertThat(searchHits.getAt(1).getNestedIdentity().getOffset(), equalTo(0));
++        assertThat((Integer) searchHits.getAt(1).getSource().get("date"), equalTo(3));
++
++        bucket = terms.getBucketByKey("c");
++        assertThat(bucket.getDocCount(), equalTo(1l));
++        topHits = bucket.getAggregations().get("top-comments");
++        searchHits = topHits.getHits();
++        assertThat(searchHits.totalHits(), equalTo(1l));
++        assertThat(searchHits.getAt(0).getNestedIdentity().getField().string(), equalTo("comments"));
++        assertThat(searchHits.getAt(0).getNestedIdentity().getOffset(), equalTo(1));
++        assertThat((Integer) searchHits.getAt(0).getSource().get("date"), equalTo(4));
++    }
++
++    @Test
++    public void testTopHitsInSecondLayerNested() throws Exception {
++        SearchResponse searchResponse = client().prepareSearch("articles")
++                .setQuery(matchQuery("title", "title"))
++                .addAggregation(
++                        nested("to-comments")
++                                .path("comments")
++                                .subAggregation(
++                                    nested("to-reviewers").path("comments.reviewers").subAggregation(
++                                            // Also need to sort on _doc because there are two reviewers with the same name
++                                            topHits("top-reviewers").addSort("comments.reviewers.name", SortOrder.ASC).addSort("_doc", SortOrder.DESC).setSize(7)
++                                    )
++                                )
++                                .subAggregation(topHits("top-comments").addSort("comments.date", SortOrder.DESC).setSize(4))
++                ).get();
++        assertNoFailures(searchResponse);
++
++        Nested toComments = searchResponse.getAggregations().get("to-comments");
++        assertThat(toComments.getDocCount(), equalTo(4l));
++
++        TopHits topComments = toComments.getAggregations().get("top-comments");
++        assertThat(topComments.getHits().totalHits(), equalTo(4l));
++        assertThat(topComments.getHits().getHits().length, equalTo(4));
++
++        assertThat(topComments.getHits().getAt(0).getId(), equalTo("2"));
++        assertThat(topComments.getHits().getAt(0).getNestedIdentity().getField().string(), equalTo("comments"));
++        assertThat(topComments.getHits().getAt(0).getNestedIdentity().getOffset(), equalTo(1));
++        assertThat(topComments.getHits().getAt(0).getNestedIdentity().getChild(), nullValue());
++
++        assertThat(topComments.getHits().getAt(1).getId(), equalTo("2"));
++        assertThat(topComments.getHits().getAt(1).getNestedIdentity().getField().string(), equalTo("comments"));
++        assertThat(topComments.getHits().getAt(1).getNestedIdentity().getOffset(), equalTo(0));
++        assertThat(topComments.getHits().getAt(1).getNestedIdentity().getChild(), nullValue());
++
++        assertThat(topComments.getHits().getAt(2).getId(), equalTo("1"));
++        assertThat(topComments.getHits().getAt(2).getNestedIdentity().getField().string(), equalTo("comments"));
++        assertThat(topComments.getHits().getAt(2).getNestedIdentity().getOffset(), equalTo(1));
++        assertThat(topComments.getHits().getAt(2).getNestedIdentity().getChild(), nullValue());
++
++        assertThat(topComments.getHits().getAt(3).getId(), equalTo("1"));
++        assertThat(topComments.getHits().getAt(3).getNestedIdentity().getField().string(), equalTo("comments"));
++        assertThat(topComments.getHits().getAt(3).getNestedIdentity().getOffset(), equalTo(0));
++        assertThat(topComments.getHits().getAt(3).getNestedIdentity().getChild(), nullValue());
++
++        Nested toReviewers = toComments.getAggregations().get("to-reviewers");
++        assertThat(toReviewers.getDocCount(), equalTo(7l));
++
++        TopHits topReviewers = toReviewers.getAggregations().get("top-reviewers");
++        assertThat(topReviewers.getHits().totalHits(), equalTo(7l));
++        assertThat(topReviewers.getHits().getHits().length, equalTo(7));
++
++        assertThat(topReviewers.getHits().getAt(0).getId(), equalTo("1"));
++        assertThat((String) topReviewers.getHits().getAt(0).sourceAsMap().get("name"), equalTo("user a"));
++        assertThat(topReviewers.getHits().getAt(0).getNestedIdentity().getField().string(), equalTo("comments"));
++        assertThat(topReviewers.getHits().getAt(0).getNestedIdentity().getOffset(), equalTo(0));
++        assertThat(topReviewers.getHits().getAt(0).getNestedIdentity().getChild().getField().string(), equalTo("reviewers"));
++        assertThat(topReviewers.getHits().getAt(0).getNestedIdentity().getChild().getOffset(), equalTo(0));
++
++        assertThat(topReviewers.getHits().getAt(1).getId(), equalTo("1"));
++        assertThat((String) topReviewers.getHits().getAt(1).sourceAsMap().get("name"), equalTo("user b"));
++        assertThat(topReviewers.getHits().getAt(1).getNestedIdentity().getField().string(), equalTo("comments"));
++        assertThat(topReviewers.getHits().getAt(1).getNestedIdentity().getOffset(), equalTo(0));
++        assertThat(topReviewers.getHits().getAt(1).getNestedIdentity().getChild().getField().string(), equalTo("reviewers"));
++        assertThat(topReviewers.getHits().getAt(1).getNestedIdentity().getChild().getOffset(), equalTo(1));
++
++        assertThat(topReviewers.getHits().getAt(2).getId(), equalTo("1"));
++        assertThat((String) topReviewers.getHits().getAt(2).sourceAsMap().get("name"), equalTo("user c"));
++        assertThat(topReviewers.getHits().getAt(2).getNestedIdentity().getField().string(), equalTo("comments"));
++        assertThat(topReviewers.getHits().getAt(2).getNestedIdentity().getOffset(), equalTo(0));
++        assertThat(topReviewers.getHits().getAt(2).getNestedIdentity().getChild().getField().string(), equalTo("reviewers"));
++        assertThat(topReviewers.getHits().getAt(2).getNestedIdentity().getChild().getOffset(), equalTo(2));
++
++        assertThat(topReviewers.getHits().getAt(3).getId(), equalTo("1"));
++        assertThat((String) topReviewers.getHits().getAt(3).sourceAsMap().get("name"), equalTo("user c"));
++        assertThat(topReviewers.getHits().getAt(3).getNestedIdentity().getField().string(), equalTo("comments"));
++        assertThat(topReviewers.getHits().getAt(3).getNestedIdentity().getOffset(), equalTo(1));
++        assertThat(topReviewers.getHits().getAt(3).getNestedIdentity().getChild().getField().string(), equalTo("reviewers"));
++        assertThat(topReviewers.getHits().getAt(3).getNestedIdentity().getChild().getOffset(), equalTo(0));
++
++        assertThat(topReviewers.getHits().getAt(4).getId(), equalTo("1"));
++        assertThat((String) topReviewers.getHits().getAt(4).sourceAsMap().get("name"), equalTo("user d"));
++        assertThat(topReviewers.getHits().getAt(4).getNestedIdentity().getField().string(), equalTo("comments"));
++        assertThat(topReviewers.getHits().getAt(4).getNestedIdentity().getOffset(), equalTo(1));
++        assertThat(topReviewers.getHits().getAt(4).getNestedIdentity().getChild().getField().string(), equalTo("reviewers"));
++        assertThat(topReviewers.getHits().getAt(4).getNestedIdentity().getChild().getOffset(), equalTo(1));
++
++        assertThat(topReviewers.getHits().getAt(5).getId(), equalTo("1"));
++        assertThat((String) topReviewers.getHits().getAt(5).sourceAsMap().get("name"), equalTo("user e"));
++        assertThat(topReviewers.getHits().getAt(5).getNestedIdentity().getField().string(), equalTo("comments"));
++        assertThat(topReviewers.getHits().getAt(5).getNestedIdentity().getOffset(), equalTo(1));
++        assertThat(topReviewers.getHits().getAt(5).getNestedIdentity().getChild().getField().string(), equalTo("reviewers"));
++        assertThat(topReviewers.getHits().getAt(5).getNestedIdentity().getChild().getOffset(), equalTo(2));
++
++        assertThat(topReviewers.getHits().getAt(6).getId(), equalTo("2"));
++        assertThat((String) topReviewers.getHits().getAt(6).sourceAsMap().get("name"), equalTo("user f"));
++        assertThat(topReviewers.getHits().getAt(0).getNestedIdentity().getField().string(), equalTo("comments"));
++        assertThat(topReviewers.getHits().getAt(0).getNestedIdentity().getOffset(), equalTo(0));
++        assertThat(topReviewers.getHits().getAt(0).getNestedIdentity().getChild().getField().string(), equalTo("reviewers"));
++        assertThat(topReviewers.getHits().getAt(0).getNestedIdentity().getChild().getOffset(), equalTo(0));
++    }
++
++    @Test
++    public void testNestedFetchFeatures() {
++        String hlType = randomFrom("plain", "fvh", "postings");
++        HighlightBuilder.Field hlField = new HighlightBuilder.Field("message")
++                .highlightQuery(matchQuery("comments.message", "comment"))
++                .forceSource(randomBoolean()) // randomly from stored field or _source
++                .highlighterType(hlType);
++
++        SearchResponse searchResponse = client().prepareSearch("articles")
++                .setQuery(nestedQuery("comments", matchQuery("message", "comment").queryName("test")))
++                .addAggregation(
++                        nested("to-comments")
++                                .path("comments")
++                                .subAggregation(
++                                        topHits("top-comments").setSize(1)
++                                                .addHighlightedField(hlField)
++                                                .setExplain(true)
++                                                .addFieldDataField("comments.user")
++                                                .addScriptField("script", "doc['comments.user'].value")
++                                                .setFetchSource("message", null)
++                                                .setVersion(true)
++                                                .addSort("comments.date", SortOrder.ASC)
++                                )
++                )
++                .get();
++        assertHitCount(searchResponse, 2);
++        Nested nested = searchResponse.getAggregations().get("to-comments");
++        assertThat(nested.getDocCount(), equalTo(4l));
++
++        SearchHits hits = ((TopHits) nested.getAggregations().get("top-comments")).getHits();
++        assertThat(hits.totalHits(), equalTo(4l));
++        SearchHit searchHit = hits.getAt(0);
++        assertThat(searchHit.getId(), equalTo("1"));
++        assertThat(searchHit.getNestedIdentity().getField().string(), equalTo("comments"));
++        assertThat(searchHit.getNestedIdentity().getOffset(), equalTo(0));
++
++        HighlightField highlightField = searchHit.getHighlightFields().get("message");
++        assertThat(highlightField.getFragments().length, equalTo(1));
++        assertThat(highlightField.getFragments()[0].string(), equalTo("some <em>comment</em>"));
++
++        // Can't explain nested hit with the main query, since both are in a different scopes, also the nested doc may not even have matched with the main query
++        // If top_hits would have a query option then we can explain that query
++        Explanation explanation = searchHit.explanation();
++        assertThat(explanation.toString(), containsString("Not a match"));
++
++        // Returns the version of the root document. Nested docs don't have a separate version
++        long version = searchHit.version();
++        assertThat(version, equalTo(1l));
++
++        // Can't use named queries for the same reason explain doesn't work:
++        assertThat(searchHit.matchedQueries(), emptyArray());
++
++        SearchHitField field = searchHit.field("comments.user");
++        assertThat(field.getValue().toString(), equalTo("a"));
++
++        field = searchHit.field("script");
++        assertThat(field.getValue().toString(), equalTo("a"));
++
++        assertThat(searchHit.sourceAsMap().size(), equalTo(1));
++        assertThat(searchHit.sourceAsMap().get("message").toString(), equalTo("some comment"));
++    }
++
++    @Test
++    public void testTopHitsInNested() throws Exception {
++        SearchResponse searchResponse = client().prepareSearch("articles")
++                .addAggregation(
++                        histogram("dates")
++                                .field("date")
++                                .interval(5)
++                                .order(Histogram.Order.aggregation("to-comments", true))
++                                .subAggregation(
++                                        nested("to-comments")
++                                                .path("comments")
++                                                .subAggregation(topHits("comments")
++                                                        .addHighlightedField(new HighlightBuilder.Field("message").highlightQuery(matchQuery("comments.message", "text")))
++                                                        .addSort("comments.id", SortOrder.ASC))
++                                )
++                )
++                .get();
++
++        Histogram histogram = searchResponse.getAggregations().get("dates");
++        for (int i = 0; i < numArticles; i += 5) {
++            Histogram.Bucket bucket = histogram.getBucketByKey(i);
++            assertThat(bucket.getDocCount(), equalTo(5l));
++
++            long numNestedDocs = 10 + (5 * i);
++            Nested nested = bucket.getAggregations().get("to-comments");
++            assertThat(nested.getDocCount(), equalTo(numNestedDocs));
++
++            TopHits hits = nested.getAggregations().get("comments");
++            SearchHits searchHits = hits.getHits();
++            assertThat(searchHits.totalHits(), equalTo(numNestedDocs));
++            for (int j = 0; j < 3; j++) {
++                assertThat(searchHits.getAt(j).getNestedIdentity().getField().string(), equalTo("comments"));
++                assertThat(searchHits.getAt(j).getNestedIdentity().getOffset(), equalTo(0));
++                assertThat((Integer) searchHits.getAt(j).sourceAsMap().get("id"), equalTo(0));
++
++                HighlightField highlightField = searchHits.getAt(j).getHighlightFields().get("message");
++                assertThat(highlightField.getFragments().length, equalTo(1));
++                assertThat(highlightField.getFragments()[0].string(), equalTo("some <em>text</em>"));
++            }
++        }
++    }
++
+ }

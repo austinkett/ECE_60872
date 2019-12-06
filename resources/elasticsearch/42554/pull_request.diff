@@ -1,0 +1,607 @@
+diff --git a/modules/percolator/src/main/java/org/elasticsearch/percolator/PercolateQuery.java b/modules/percolator/src/main/java/org/elasticsearch/percolator/PercolateQuery.java
+index 5bbf998883ee..fed4503cb855 100644
+--- a/modules/percolator/src/main/java/org/elasticsearch/percolator/PercolateQuery.java
++++ b/modules/percolator/src/main/java/org/elasticsearch/percolator/PercolateQuery.java
+@@ -31,6 +31,8 @@
+ import org.apache.lucene.search.TopDocs;
+ import org.apache.lucene.search.TwoPhaseIterator;
+ import org.apache.lucene.search.Weight;
++import org.apache.lucene.search.BooleanClause.Occur;
++import org.apache.lucene.search.BooleanQuery;
+ import org.apache.lucene.util.Accountable;
+ import org.apache.lucene.util.Bits;
+ import org.elasticsearch.common.CheckedFunction;
+@@ -53,14 +55,17 @@
+     private final Query candidateMatchesQuery;
+     private final Query verifiedMatchesQuery;
+     private final IndexSearcher percolatorIndexSearcher;
++    private final Query nonNestedDocsFilter;
+ 
+     PercolateQuery(String name, QueryStore queryStore, List<BytesReference> documents,
+-                   Query candidateMatchesQuery, IndexSearcher percolatorIndexSearcher, Query verifiedMatchesQuery) {
++                   Query candidateMatchesQuery, IndexSearcher percolatorIndexSearcher,
++                   Query nonNestedDocsFilter, Query verifiedMatchesQuery) {
+         this.name = name;
+         this.documents = Objects.requireNonNull(documents);
+         this.candidateMatchesQuery = Objects.requireNonNull(candidateMatchesQuery);
+         this.queryStore = Objects.requireNonNull(queryStore);
+         this.percolatorIndexSearcher = Objects.requireNonNull(percolatorIndexSearcher);
++        this.nonNestedDocsFilter = nonNestedDocsFilter;
+         this.verifiedMatchesQuery = Objects.requireNonNull(verifiedMatchesQuery);
+     }
+ 
+@@ -68,7 +73,8 @@
+     public Query rewrite(IndexReader reader) throws IOException {
+         Query rewritten = candidateMatchesQuery.rewrite(reader);
+         if (rewritten != candidateMatchesQuery) {
+-            return new PercolateQuery(name, queryStore, documents, rewritten, percolatorIndexSearcher, verifiedMatchesQuery);
++            return new PercolateQuery(name, queryStore, documents, rewritten, percolatorIndexSearcher,
++                    nonNestedDocsFilter, verifiedMatchesQuery);
+         } else {
+             return this;
+         }
+@@ -122,6 +128,12 @@ public Scorer scorer(LeafReaderContext leafReaderContext) throws IOException {
+                         boolean matchDocId(int docId) throws IOException {
+                             Query query = percolatorQueries.apply(docId);
+                             if (query != null) {
++                                if (nonNestedDocsFilter != null) {
++                                    query = new BooleanQuery.Builder()
++                                            .add(query, Occur.MUST)
++                                            .add(nonNestedDocsFilter, Occur.FILTER)
++                                            .build();
++                                }
+                                 TopDocs topDocs = percolatorIndexSearcher.search(query, 1);
+                                 if (topDocs.totalHits > 0) {
+                                     score = topDocs.scoreDocs[0].score;
+@@ -159,7 +171,16 @@ boolean matchDocId(int docId) throws IOException {
+                                 return true;
+                             }
+                             Query query = percolatorQueries.apply(docId);
+-                            return query != null && Lucene.exists(percolatorIndexSearcher, query);
++                            if (query == null) {
++                                return false;
++                            }
++                            if (nonNestedDocsFilter != null) {
++                                query = new BooleanQuery.Builder()
++                                        .add(query, Occur.MUST)
++                                        .add(nonNestedDocsFilter, Occur.FILTER)
++                                        .build();
++                            }
++                            return Lucene.exists(percolatorIndexSearcher, query);
+                         }
+                     };
+                 }
+@@ -182,6 +203,10 @@ IndexSearcher getPercolatorIndexSearcher() {
+         return percolatorIndexSearcher;
+     }
+ 
++    boolean excludesNestedDocs() {
++        return nonNestedDocsFilter != null;
++    }
++
+     List<BytesReference> getDocuments() {
+         return documents;
+     }
+diff --git a/modules/percolator/src/main/java/org/elasticsearch/percolator/PercolateQueryBuilder.java b/modules/percolator/src/main/java/org/elasticsearch/percolator/PercolateQueryBuilder.java
+index 1f8bcd1caa64..c66a34296006 100644
+--- a/modules/percolator/src/main/java/org/elasticsearch/percolator/PercolateQueryBuilder.java
++++ b/modules/percolator/src/main/java/org/elasticsearch/percolator/PercolateQueryBuilder.java
+@@ -30,8 +30,6 @@
+ import org.apache.lucene.index.LeafReader;
+ import org.apache.lucene.index.ReaderUtil;
+ import org.apache.lucene.index.memory.MemoryIndex;
+-import org.apache.lucene.search.BooleanClause;
+-import org.apache.lucene.search.BooleanQuery;
+ import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.search.Query;
+ import org.apache.lucene.search.Scorer;
+@@ -56,7 +54,6 @@
+ import org.elasticsearch.common.io.stream.StreamInput;
+ import org.elasticsearch.common.io.stream.StreamOutput;
+ import org.elasticsearch.common.logging.DeprecationLogger;
+-import org.elasticsearch.common.lucene.search.Queries;
+ import org.elasticsearch.common.xcontent.LoggingDeprecationHandler;
+ import org.elasticsearch.common.xcontent.NamedXContentRegistry;
+ import org.elasticsearch.common.xcontent.XContent;
+@@ -634,13 +631,19 @@ protected Analyzer getWrappedAnalyzer(String fieldName) {
+             }
+         };
+         final IndexSearcher docSearcher;
++        final boolean excludeNestedDocuments;
+         if (docs.size() > 1 || docs.get(0).docs().size() > 1) {
+             assert docs.size() != 1 || docMapper.hasNestedObjects();
+             docSearcher = createMultiDocumentSearcher(analyzer, docs);
++            excludeNestedDocuments = docMapper.hasNestedObjects() && docs.stream()
++                    .map(ParsedDocument::docs)
++                    .mapToInt(List::size)
++                    .anyMatch(size -> size > 1);
+         } else {
+             MemoryIndex memoryIndex = MemoryIndex.fromDocument(docs.get(0).rootDoc(), analyzer, true, false);
+             docSearcher = memoryIndex.createSearcher();
+             docSearcher.setQueryCache(null);
++            excludeNestedDocuments = false;
+         }
+ 
+         PercolatorFieldMapper.FieldType pft = (PercolatorFieldMapper.FieldType) fieldType;
+@@ -650,7 +653,7 @@ protected Analyzer getWrappedAnalyzer(String fieldName) {
+             percolateShardContext,
+             pft.mapUnmappedFieldsAsText);
+ 
+-        return pft.percolateQuery(name, queryStore, documents, docSearcher, context.indexVersionCreated());
++        return pft.percolateQuery(name, queryStore, documents, docSearcher, excludeNestedDocuments, context.indexVersionCreated());
+     }
+ 
+     public String getField() {
+@@ -686,17 +689,7 @@ static IndexSearcher createMultiDocumentSearcher(Analyzer analyzer, Collection<P
+ 
+             DirectoryReader directoryReader = DirectoryReader.open(indexWriter);
+             assert directoryReader.leaves().size() == 1 : "Expected single leaf, but got [" + directoryReader.leaves().size() + "]";
+-            final IndexSearcher slowSearcher = new IndexSearcher(directoryReader) {
+-
+-                @Override
+-                public Weight createNormalizedWeight(Query query, boolean needsScores) throws IOException {
+-                    BooleanQuery.Builder bq = new BooleanQuery.Builder();
+-                    bq.add(query, BooleanClause.Occur.MUST);
+-                    bq.add(Queries.newNestedFilter(), BooleanClause.Occur.MUST_NOT);
+-                    return super.createNormalizedWeight(bq.build(), needsScores);
+-                }
+-
+-            };
++            final IndexSearcher slowSearcher = new IndexSearcher(directoryReader);
+             slowSearcher.setQueryCache(null);
+             return slowSearcher;
+         } catch (IOException e) {
+diff --git a/modules/percolator/src/main/java/org/elasticsearch/percolator/PercolatorFieldMapper.java b/modules/percolator/src/main/java/org/elasticsearch/percolator/PercolatorFieldMapper.java
+index f302cd8aaba4..23c6dd411da4 100644
+--- a/modules/percolator/src/main/java/org/elasticsearch/percolator/PercolatorFieldMapper.java
++++ b/modules/percolator/src/main/java/org/elasticsearch/percolator/PercolatorFieldMapper.java
+@@ -52,6 +52,7 @@
+ import org.elasticsearch.common.hash.MurmurHash3;
+ import org.elasticsearch.common.io.stream.OutputStreamStreamOutput;
+ import org.elasticsearch.common.logging.DeprecationLogger;
++import org.elasticsearch.common.lucene.search.Queries;
+ import org.elasticsearch.common.settings.Setting;
+ import org.elasticsearch.common.settings.Settings;
+ import org.elasticsearch.common.xcontent.XContentBuilder;
+@@ -263,7 +264,7 @@ public Query termQuery(Object value, QueryShardContext context) {
+         }
+ 
+         Query percolateQuery(String name, PercolateQuery.QueryStore queryStore, List<BytesReference> documents,
+-                             IndexSearcher searcher, Version indexVersion) throws IOException {
++                             IndexSearcher searcher, boolean excludeNestedDocuments, Version indexVersion) throws IOException {
+             IndexReader indexReader = searcher.getIndexReader();
+             Tuple<BooleanQuery, Boolean> t = createCandidateQuery(indexReader, indexVersion);
+             Query candidateQuery = t.v1();
+@@ -280,7 +281,11 @@ Query percolateQuery(String name, PercolateQuery.QueryStore queryStore, List<Byt
+             } else {
+                 verifiedMatchesQuery = new MatchNoDocsQuery("multiple or nested docs or CoveringQuery could not be used");
+             }
+-            return new PercolateQuery(name, queryStore, documents, candidateQuery, searcher, verifiedMatchesQuery);
++            Query filter = null;
++            if (excludeNestedDocuments) {
++                filter = Queries.newNonNestedFilter(indexVersion);
++            }
++            return new PercolateQuery(name, queryStore, documents, candidateQuery, searcher, filter, verifiedMatchesQuery);
+         }
+ 
+         Tuple<BooleanQuery, Boolean> createCandidateQuery(IndexReader indexReader, Version indexVersion) throws IOException {
+diff --git a/modules/percolator/src/test/java/org/elasticsearch/percolator/CandidateQueryTests.java b/modules/percolator/src/test/java/org/elasticsearch/percolator/CandidateQueryTests.java
+index d8165bff531e..88500f11723d 100644
+--- a/modules/percolator/src/test/java/org/elasticsearch/percolator/CandidateQueryTests.java
++++ b/modules/percolator/src/test/java/org/elasticsearch/percolator/CandidateQueryTests.java
+@@ -595,7 +595,8 @@ public void testRangeQueries() throws Exception {
+         Version v = Version.V_6_1_0;
+         MemoryIndex memoryIndex = MemoryIndex.fromDocument(Collections.singleton(new IntPoint("int_field", 3)), new WhitespaceAnalyzer());
+         IndexSearcher percolateSearcher = memoryIndex.createSearcher();
+-        Query query = fieldType.percolateQuery("_name", queryStore, Collections.singletonList(new BytesArray("{}")), percolateSearcher, v);
++        Query query = fieldType.percolateQuery("_name", queryStore,
++            Collections.singletonList(new BytesArray("{}")), percolateSearcher, false, v);
+         TopDocs topDocs = shardSearcher.search(query, 1);
+         assertEquals(1L, topDocs.totalHits);
+         assertEquals(1, topDocs.scoreDocs.length);
+@@ -603,7 +604,7 @@ public void testRangeQueries() throws Exception {
+ 
+         memoryIndex = MemoryIndex.fromDocument(Collections.singleton(new LongPoint("long_field", 7L)), new WhitespaceAnalyzer());
+         percolateSearcher = memoryIndex.createSearcher();
+-        query = fieldType.percolateQuery("_name", queryStore, Collections.singletonList(new BytesArray("{}")), percolateSearcher, v);
++        query = fieldType.percolateQuery("_name", queryStore, Collections.singletonList(new BytesArray("{}")), percolateSearcher, false, v);
+         topDocs = shardSearcher.search(query, 1);
+         assertEquals(1L, topDocs.totalHits);
+         assertEquals(1, topDocs.scoreDocs.length);
+@@ -612,7 +613,7 @@ public void testRangeQueries() throws Exception {
+         memoryIndex = MemoryIndex.fromDocument(Collections.singleton(new HalfFloatPoint("half_float_field", 12)),
+             new WhitespaceAnalyzer());
+         percolateSearcher = memoryIndex.createSearcher();
+-        query = fieldType.percolateQuery("_name", queryStore, Collections.singletonList(new BytesArray("{}")), percolateSearcher, v);
++        query = fieldType.percolateQuery("_name", queryStore, Collections.singletonList(new BytesArray("{}")), percolateSearcher, false, v);
+         topDocs = shardSearcher.search(query, 1);
+         assertEquals(1L, topDocs.totalHits);
+         assertEquals(1, topDocs.scoreDocs.length);
+@@ -620,7 +621,7 @@ public void testRangeQueries() throws Exception {
+ 
+         memoryIndex = MemoryIndex.fromDocument(Collections.singleton(new FloatPoint("float_field", 17)), new WhitespaceAnalyzer());
+         percolateSearcher = memoryIndex.createSearcher();
+-        query = fieldType.percolateQuery("_name", queryStore, Collections.singletonList(new BytesArray("{}")), percolateSearcher, v);
++        query = fieldType.percolateQuery("_name", queryStore, Collections.singletonList(new BytesArray("{}")), percolateSearcher, false, v);
+         topDocs = shardSearcher.search(query, 1);
+         assertEquals(1, topDocs.totalHits);
+         assertEquals(1, topDocs.scoreDocs.length);
+@@ -628,7 +629,7 @@ public void testRangeQueries() throws Exception {
+ 
+         memoryIndex = MemoryIndex.fromDocument(Collections.singleton(new DoublePoint("double_field", 21)), new WhitespaceAnalyzer());
+         percolateSearcher = memoryIndex.createSearcher();
+-        query = fieldType.percolateQuery("_name", queryStore, Collections.singletonList(new BytesArray("{}")), percolateSearcher, v);
++        query = fieldType.percolateQuery("_name", queryStore, Collections.singletonList(new BytesArray("{}")), percolateSearcher, false, v);
+         topDocs = shardSearcher.search(query, 1);
+         assertEquals(1, topDocs.totalHits);
+         assertEquals(1, topDocs.scoreDocs.length);
+@@ -637,7 +638,7 @@ public void testRangeQueries() throws Exception {
+         memoryIndex = MemoryIndex.fromDocument(Collections.singleton(new InetAddressPoint("ip_field",
+             forString("192.168.0.4"))), new WhitespaceAnalyzer());
+         percolateSearcher = memoryIndex.createSearcher();
+-        query = fieldType.percolateQuery("_name", queryStore, Collections.singletonList(new BytesArray("{}")), percolateSearcher, v);
++        query = fieldType.percolateQuery("_name", queryStore, Collections.singletonList(new BytesArray("{}")), percolateSearcher, false, v);
+         topDocs = shardSearcher.search(query, 1);
+         assertEquals(1, topDocs.totalHits);
+         assertEquals(1, topDocs.scoreDocs.length);
+@@ -777,8 +778,8 @@ public void testPercolateMatchAll() throws Exception {
+         memoryIndex.addField("field", "value1", new WhitespaceAnalyzer());
+         IndexSearcher percolateSearcher = memoryIndex.createSearcher();
+         PercolateQuery query = (PercolateQuery) fieldType.percolateQuery("_name", queryStore,
+-            Collections.singletonList(new BytesArray("{}")), percolateSearcher, Version.CURRENT);
+-        TopDocs topDocs = shardSearcher.search(query, 10, new Sort(SortField.FIELD_DOC), true, true);
++            Collections.singletonList(new BytesArray("{}")), percolateSearcher, false, Version.CURRENT);
++        TopDocs topDocs = shardSearcher.search(query, 10, new Sort(SortField.FIELD_DOC));
+         assertEquals(3L, topDocs.totalHits);
+         assertEquals(3, topDocs.scoreDocs.length);
+         assertEquals(0, topDocs.scoreDocs[0].doc);
+@@ -810,8 +811,8 @@ public void testFunctionScoreQuery() throws Exception {
+         memoryIndex.addField("field", "value", new WhitespaceAnalyzer());
+         IndexSearcher percolateSearcher = memoryIndex.createSearcher();
+         PercolateQuery query = (PercolateQuery) fieldType.percolateQuery("_name", queryStore,
+-            Collections.singletonList(new BytesArray("{}")), percolateSearcher, Version.CURRENT);
+-        TopDocs topDocs = shardSearcher.search(query, 10, new Sort(SortField.FIELD_DOC), true, true);
++            Collections.singletonList(new BytesArray("{}")), percolateSearcher, false, Version.CURRENT);
++        TopDocs topDocs = shardSearcher.search(query, 10, new Sort(SortField.FIELD_DOC));
+         assertEquals(2L, topDocs.totalHits);
+         assertEquals(2, topDocs.scoreDocs.length);
+         assertEquals(0, topDocs.scoreDocs[0].doc);
+@@ -860,7 +861,8 @@ public void testPercolateSmallAndLargeDocument() throws Exception {
+             try (IndexReader ir = DirectoryReader.open(directory)){
+                 IndexSearcher percolateSearcher = new IndexSearcher(ir);
+                 PercolateQuery query = (PercolateQuery)
+-                    fieldType.percolateQuery("_name", queryStore, Collections.singletonList(new BytesArray("{}")), percolateSearcher, v);
++                    fieldType.percolateQuery("_name", queryStore, Collections.singletonList(new BytesArray("{}")),
++                            percolateSearcher, false, v);
+                 BooleanQuery candidateQuery = (BooleanQuery) query.getCandidateMatchesQuery();
+                 assertThat(candidateQuery.clauses().get(0).getQuery(), instanceOf(CoveringQuery.class));
+                 TopDocs topDocs = shardSearcher.search(query, 10);
+@@ -890,7 +892,8 @@ public void testPercolateSmallAndLargeDocument() throws Exception {
+             try (IndexReader ir = DirectoryReader.open(directory)){
+                 IndexSearcher percolateSearcher = new IndexSearcher(ir);
+                 PercolateQuery query = (PercolateQuery)
+-                    fieldType.percolateQuery("_name", queryStore, Collections.singletonList(new BytesArray("{}")), percolateSearcher, v);
++                    fieldType.percolateQuery("_name", queryStore, Collections.singletonList(new BytesArray("{}")),
++                            percolateSearcher, false, v);
+                 BooleanQuery candidateQuery = (BooleanQuery) query.getCandidateMatchesQuery();
+                 assertThat(candidateQuery.clauses().get(0).getQuery(), instanceOf(TermInSetQuery.class));
+ 
+@@ -951,7 +954,7 @@ public void testDuplicatedClauses() throws Exception {
+         MemoryIndex memoryIndex = new MemoryIndex();
+         memoryIndex.addField("field", "value1 value2 value3", new WhitespaceAnalyzer());
+         IndexSearcher percolateSearcher = memoryIndex.createSearcher();
+-        PercolateQuery query = (PercolateQuery) fieldType.percolateQuery("_name", queryStore, sources, percolateSearcher, v);
++        PercolateQuery query = (PercolateQuery) fieldType.percolateQuery("_name", queryStore, sources, percolateSearcher, false, v);
+         TopDocs topDocs = shardSearcher.search(query, 10, new Sort(SortField.FIELD_DOC), true, true);
+         assertEquals(2L, topDocs.totalHits);
+         assertEquals(0, topDocs.scoreDocs[0].doc);
+@@ -985,7 +988,7 @@ public void testDuplicatedClauses2() throws Exception {
+         MemoryIndex memoryIndex = new MemoryIndex();
+         memoryIndex.addField("field", "value1 value4 value5", new WhitespaceAnalyzer());
+         IndexSearcher percolateSearcher = memoryIndex.createSearcher();
+-        PercolateQuery query = (PercolateQuery) fieldType.percolateQuery("_name", queryStore, sources, percolateSearcher, v);
++        PercolateQuery query = (PercolateQuery) fieldType.percolateQuery("_name", queryStore, sources, percolateSearcher, false, v);
+         TopDocs topDocs = shardSearcher.search(query, 10, new Sort(SortField.FIELD_DOC), true, true);
+         assertEquals(1L, topDocs.totalHits);
+         assertEquals(0, topDocs.scoreDocs[0].doc);
+@@ -993,7 +996,7 @@ public void testDuplicatedClauses2() throws Exception {
+         memoryIndex = new MemoryIndex();
+         memoryIndex.addField("field", "value1 value2", new WhitespaceAnalyzer());
+         percolateSearcher = memoryIndex.createSearcher();
+-        query = (PercolateQuery) fieldType.percolateQuery("_name", queryStore, sources, percolateSearcher, v);
++        query = (PercolateQuery) fieldType.percolateQuery("_name", queryStore, sources, percolateSearcher, false, v);
+         topDocs = shardSearcher.search(query, 10, new Sort(SortField.FIELD_DOC), true, true);
+         assertEquals(1L, topDocs.totalHits);
+         assertEquals(0, topDocs.scoreDocs[0].doc);
+@@ -1001,7 +1004,7 @@ public void testDuplicatedClauses2() throws Exception {
+         memoryIndex = new MemoryIndex();
+         memoryIndex.addField("field", "value3", new WhitespaceAnalyzer());
+         percolateSearcher = memoryIndex.createSearcher();
+-        query = (PercolateQuery) fieldType.percolateQuery("_name", queryStore, sources, percolateSearcher, v);
++        query = (PercolateQuery) fieldType.percolateQuery("_name", queryStore, sources, percolateSearcher, false, v);
+         topDocs = shardSearcher.search(query, 10, new Sort(SortField.FIELD_DOC), true, true);
+         assertEquals(1L, topDocs.totalHits);
+         assertEquals(0, topDocs.scoreDocs[0].doc);
+@@ -1036,7 +1039,7 @@ public void testMsmAndRanges_disjunction() throws Exception {
+         document.add(new IntPoint("int_field", 7));
+         MemoryIndex memoryIndex = MemoryIndex.fromDocument(document, new WhitespaceAnalyzer());
+         IndexSearcher percolateSearcher = memoryIndex.createSearcher();
+-        PercolateQuery query = (PercolateQuery) fieldType.percolateQuery("_name", queryStore, sources, percolateSearcher, v);
++        PercolateQuery query = (PercolateQuery) fieldType.percolateQuery("_name", queryStore, sources, percolateSearcher, false, v);
+         TopDocs topDocs = shardSearcher.search(query, 10, new Sort(SortField.FIELD_DOC), true, true);
+         assertEquals(1L, topDocs.totalHits);
+         assertEquals(0, topDocs.scoreDocs[0].doc);
+@@ -1046,7 +1049,7 @@ private void duelRun(PercolateQuery.QueryStore queryStore, MemoryIndex memoryInd
+         boolean requireScore = randomBoolean();
+         IndexSearcher percolateSearcher = memoryIndex.createSearcher();
+         Query percolateQuery = fieldType.percolateQuery("_name", queryStore,
+-            Collections.singletonList(new BytesArray("{}")), percolateSearcher, Version.CURRENT);
++            Collections.singletonList(new BytesArray("{}")), percolateSearcher, false, Version.CURRENT);
+         Query query = requireScore ? percolateQuery : new ConstantScoreQuery(percolateQuery);
+         TopDocs topDocs = shardSearcher.search(query, 100);
+ 
+@@ -1130,7 +1133,7 @@ private TopDocs executeQuery(PercolateQuery.QueryStore queryStore,
+                                  IndexSearcher shardSearcher) throws IOException {
+         IndexSearcher percolateSearcher = memoryIndex.createSearcher();
+         Query percolateQuery = fieldType.percolateQuery("_name", queryStore,
+-            Collections.singletonList(new BytesArray("{}")), percolateSearcher, Version.CURRENT);
++            Collections.singletonList(new BytesArray("{}")), percolateSearcher, false, Version.CURRENT);
+         return shardSearcher.search(percolateQuery, 10);
+     }
+ 
+diff --git a/modules/percolator/src/test/java/org/elasticsearch/percolator/PercolateQueryBuilderTests.java b/modules/percolator/src/test/java/org/elasticsearch/percolator/PercolateQueryBuilderTests.java
+index 517525b07894..d79288d9be08 100644
+--- a/modules/percolator/src/test/java/org/elasticsearch/percolator/PercolateQueryBuilderTests.java
++++ b/modules/percolator/src/test/java/org/elasticsearch/percolator/PercolateQueryBuilderTests.java
+@@ -19,12 +19,6 @@
+ 
+ package org.elasticsearch.percolator;
+ 
+-import org.apache.lucene.analysis.Analyzer;
+-import org.apache.lucene.analysis.core.WhitespaceAnalyzer;
+-import org.apache.lucene.search.BooleanClause;
+-import org.apache.lucene.search.BooleanQuery;
+-import org.apache.lucene.search.IndexSearcher;
+-import org.apache.lucene.search.MatchAllDocsQuery;
+ import org.apache.lucene.search.Query;
+ import org.elasticsearch.ResourceNotFoundException;
+ import org.elasticsearch.Version;
+@@ -42,8 +36,6 @@
+ import org.elasticsearch.common.xcontent.XContentType;
+ import org.elasticsearch.index.get.GetResult;
+ import org.elasticsearch.index.mapper.MapperService;
+-import org.elasticsearch.index.mapper.ParseContext;
+-import org.elasticsearch.index.mapper.ParsedDocument;
+ import org.elasticsearch.index.query.QueryBuilder;
+ import org.elasticsearch.index.query.QueryShardContext;
+ import org.elasticsearch.index.query.Rewriteable;
+@@ -68,7 +60,6 @@
+ 
+ import static org.elasticsearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO;
+ import static org.hamcrest.Matchers.equalTo;
+-import static org.hamcrest.Matchers.sameInstance;
+ 
+ public class PercolateQueryBuilderTests extends AbstractQueryTestCase<PercolateQueryBuilder> {
+ 
+@@ -77,8 +68,8 @@
+         PercolateQueryBuilder.DOCUMENTS_FIELD.getPreferredName()
+     };
+ 
+-    private static String queryField = "field";
+-    private static String aliasField = "alias";
++    protected static String queryField = "field";
++    protected static String aliasField = "alias";
+     private static String docType;
+ 
+     private String indexedDocumentIndex;
+@@ -272,48 +263,6 @@ public void testBothDocumentAndDocumentsSpecified() throws IOException {
+             () -> parseQuery("{\"percolate\" : { \"document\": {}, \"documents\": [{}, {}], \"field\":\"" + queryField + "\"}}"));
+     }
+ 
+-    public void testCreateNestedDocumentSearcher() throws Exception {
+-        int numNestedDocs = randomIntBetween(2, 8);
+-        List<ParseContext.Document> docs = new ArrayList<>(numNestedDocs);
+-        for (int i = 0; i < numNestedDocs; i++) {
+-            docs.add(new ParseContext.Document());
+-        }
+-
+-        Collection<ParsedDocument> parsedDocument = Collections.singleton(
+-            new ParsedDocument(null, null, "_id", "_type", null, docs, null, null, null));
+-        Analyzer analyzer = new WhitespaceAnalyzer();
+-        IndexSearcher indexSearcher = PercolateQueryBuilder.createMultiDocumentSearcher(analyzer, parsedDocument);
+-        assertThat(indexSearcher.getIndexReader().numDocs(), equalTo(numNestedDocs));
+-
+-        // ensure that any query get modified so that the nested docs are never included as hits:
+-        Query query = new MatchAllDocsQuery();
+-        BooleanQuery result = (BooleanQuery) indexSearcher.createNormalizedWeight(query, true).getQuery();
+-        assertThat(result.clauses().size(), equalTo(2));
+-        assertThat(result.clauses().get(0).getQuery(), sameInstance(query));
+-        assertThat(result.clauses().get(0).getOccur(), equalTo(BooleanClause.Occur.MUST));
+-        assertThat(result.clauses().get(1).getOccur(), equalTo(BooleanClause.Occur.MUST_NOT));
+-    }
+-
+-    public void testCreateMultiDocumentSearcher() throws Exception {
+-        int numDocs = randomIntBetween(2, 8);
+-        List<ParsedDocument> docs = new ArrayList<>();
+-        for (int i = 0; i < numDocs; i++) {
+-            docs.add(new ParsedDocument(null, null, "_id", "_type", null,
+-                Collections.singletonList(new ParseContext.Document()), null, null, null));
+-        }
+-        Analyzer analyzer = new WhitespaceAnalyzer();
+-        IndexSearcher indexSearcher = PercolateQueryBuilder.createMultiDocumentSearcher(analyzer, docs);
+-        assertThat(indexSearcher.getIndexReader().numDocs(), equalTo(numDocs));
+-
+-        // ensure that any query get modified so that the nested docs are never included as hits:
+-        Query query = new MatchAllDocsQuery();
+-        BooleanQuery result = (BooleanQuery) indexSearcher.createNormalizedWeight(query, true).getQuery();
+-        assertThat(result.clauses().size(), equalTo(2));
+-        assertThat(result.clauses().get(0).getQuery(), sameInstance(query));
+-        assertThat(result.clauses().get(0).getOccur(), equalTo(BooleanClause.Occur.MUST));
+-        assertThat(result.clauses().get(1).getOccur(), equalTo(BooleanClause.Occur.MUST_NOT));
+-    }
+-
+     public void testSerializationBwc() throws IOException {
+         final byte[] data = Base64.getDecoder().decode("P4AAAAAFZmllbGQEdHlwZQAAAAAAAA57ImZvbyI6ImJhciJ9AAAAAA==");
+         final Version version = randomFrom(Version.V_5_0_0, Version.V_5_0_1, Version.V_5_0_2,
+diff --git a/modules/percolator/src/test/java/org/elasticsearch/percolator/PercolateQueryTests.java b/modules/percolator/src/test/java/org/elasticsearch/percolator/PercolateQueryTests.java
+index ac9cc97499ce..97d59ab047ed 100644
+--- a/modules/percolator/src/test/java/org/elasticsearch/percolator/PercolateQueryTests.java
++++ b/modules/percolator/src/test/java/org/elasticsearch/percolator/PercolateQueryTests.java
+@@ -117,7 +117,7 @@ public void testPercolateQuery() throws Exception {
+         IndexSearcher percolateSearcher = memoryIndex.createSearcher();
+         // no scoring, wrapping it in a constant score query:
+         Query query = new ConstantScoreQuery(new PercolateQuery("_name", queryStore, Collections.singletonList(new BytesArray("a")),
+-                new TermQuery(new Term("select", "a")), percolateSearcher, new MatchNoDocsQuery("")));
++                new TermQuery(new Term("select", "a")), percolateSearcher, null, new MatchNoDocsQuery("")));
+         TopDocs topDocs = shardSearcher.search(query, 10);
+         assertThat(topDocs.totalHits, equalTo(1L));
+         assertThat(topDocs.scoreDocs.length, equalTo(1));
+@@ -127,7 +127,7 @@ public void testPercolateQuery() throws Exception {
+         assertThat(explanation.getValue(), equalTo(topDocs.scoreDocs[0].score));
+ 
+         query = new ConstantScoreQuery(new PercolateQuery("_name", queryStore, Collections.singletonList(new BytesArray("b")),
+-                new TermQuery(new Term("select", "b")), percolateSearcher, new MatchNoDocsQuery("")));
++                new TermQuery(new Term("select", "b")), percolateSearcher, null, new MatchNoDocsQuery("")));
+         topDocs = shardSearcher.search(query, 10);
+         assertThat(topDocs.totalHits, equalTo(3L));
+         assertThat(topDocs.scoreDocs.length, equalTo(3));
+@@ -147,12 +147,12 @@ public void testPercolateQuery() throws Exception {
+         assertThat(explanation.getValue(), equalTo(topDocs.scoreDocs[2].score));
+ 
+         query = new ConstantScoreQuery(new PercolateQuery("_name", queryStore, Collections.singletonList(new BytesArray("c")),
+-                new MatchAllDocsQuery(), percolateSearcher, new MatchAllDocsQuery()));
++                new MatchAllDocsQuery(), percolateSearcher, null, new MatchAllDocsQuery()));
+         topDocs = shardSearcher.search(query, 10);
+         assertThat(topDocs.totalHits, equalTo(4L));
+ 
+         query = new PercolateQuery("_name", queryStore, Collections.singletonList(new BytesArray("{}")),
+-            new TermQuery(new Term("select", "b")), percolateSearcher, new MatchNoDocsQuery(""));
++            new TermQuery(new Term("select", "b")), percolateSearcher, null, new MatchNoDocsQuery(""));
+         topDocs = shardSearcher.search(query, 10);
+         assertThat(topDocs.totalHits, equalTo(3L));
+         assertThat(topDocs.scoreDocs.length, equalTo(3));
+diff --git a/modules/percolator/src/test/java/org/elasticsearch/percolator/PercolateWithNestedQueryBuilderTests.java b/modules/percolator/src/test/java/org/elasticsearch/percolator/PercolateWithNestedQueryBuilderTests.java
+new file mode 100644
+index 000000000000..1586adc1ee5c
+--- /dev/null
++++ b/modules/percolator/src/test/java/org/elasticsearch/percolator/PercolateWithNestedQueryBuilderTests.java
+@@ -0,0 +1,57 @@
++/*
++ * Licensed to Elasticsearch under one or more contributor
++ * license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright
++ * ownership. Elasticsearch licenses this file to you under
++ * the Apache License, Version 2.0 (the "License"); you may
++ * not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++package org.elasticsearch.percolator;
++
++import org.elasticsearch.action.admin.indices.mapping.put.PutMappingRequest;
++import org.elasticsearch.common.Strings;
++import org.elasticsearch.common.bytes.BytesArray;
++import org.elasticsearch.common.compress.CompressedXContent;
++import org.elasticsearch.common.xcontent.XContentType;
++import org.elasticsearch.index.mapper.MapperService;
++import org.elasticsearch.index.query.QueryBuilder;
++import org.elasticsearch.index.query.QueryShardContext;
++
++import java.io.IOException;
++
++public class PercolateWithNestedQueryBuilderTests extends PercolateQueryBuilderTests {
++
++    @Override
++    protected void initializeAdditionalMappings(MapperService mapperService) throws IOException {
++        super.initializeAdditionalMappings(mapperService);
++        mapperService.merge("_doc", new CompressedXContent(Strings.toString(PutMappingRequest.buildFromSimplifiedDef(
++            "_doc", "some_nested_object", "type=nested"))),  MapperService.MergeReason.MAPPING_UPDATE, false);
++    }
++
++    public void testDetectsNestedDocuments() throws IOException {
++        QueryShardContext shardContext = createShardContext();
++
++        PercolateQueryBuilder builder = new PercolateQueryBuilder(queryField,
++            new BytesArray("{ \"foo\": \"bar\" }"), XContentType.JSON);
++        QueryBuilder rewrittenBuilder = rewriteAndFetch(builder, shardContext);
++        PercolateQuery query = (PercolateQuery) rewrittenBuilder.toQuery(shardContext);
++        assertFalse(query.excludesNestedDocs());
++
++        builder = new PercolateQueryBuilder(queryField,
++            new BytesArray("{ \"foo\": \"bar\", \"some_nested_object\": [ { \"baz\": 42 } ] }"), XContentType.JSON);
++        rewrittenBuilder = rewriteAndFetch(builder, shardContext);
++        query = (PercolateQuery) rewrittenBuilder.toQuery(shardContext);
++        assertTrue(query.excludesNestedDocs());
++    }
++}
+diff --git a/modules/percolator/src/test/java/org/elasticsearch/percolator/PercolatorHighlightSubFetchPhaseTests.java b/modules/percolator/src/test/java/org/elasticsearch/percolator/PercolatorHighlightSubFetchPhaseTests.java
+index e49204506e58..291a42c14665 100644
+--- a/modules/percolator/src/test/java/org/elasticsearch/percolator/PercolatorHighlightSubFetchPhaseTests.java
++++ b/modules/percolator/src/test/java/org/elasticsearch/percolator/PercolatorHighlightSubFetchPhaseTests.java
+@@ -45,7 +45,7 @@
+ 
+     public void testHitsExecutionNeeded() {
+         PercolateQuery percolateQuery = new PercolateQuery("_name", ctx -> null, Collections.singletonList(new BytesArray("{}")),
+-            new MatchAllDocsQuery(), Mockito.mock(IndexSearcher.class), new MatchAllDocsQuery());
++            new MatchAllDocsQuery(), Mockito.mock(IndexSearcher.class), null, new MatchAllDocsQuery());
+         PercolatorHighlightSubFetchPhase subFetchPhase = new PercolatorHighlightSubFetchPhase(emptyMap());
+         SearchContext searchContext = Mockito.mock(SearchContext.class);
+         Mockito.when(searchContext.highlight()).thenReturn(new SearchContextHighlight(Collections.emptyList()));
+@@ -58,7 +58,7 @@ public void testHitsExecutionNeeded() {
+ 
+     public void testLocatePercolatorQuery() {
+         PercolateQuery percolateQuery = new PercolateQuery("_name", ctx -> null, Collections.singletonList(new BytesArray("{}")),
+-            new MatchAllDocsQuery(), Mockito.mock(IndexSearcher.class), new MatchAllDocsQuery());
++            new MatchAllDocsQuery(), Mockito.mock(IndexSearcher.class), null, new MatchAllDocsQuery());
+         assertThat(PercolatorHighlightSubFetchPhase.locatePercolatorQuery(new MatchAllDocsQuery()).size(), equalTo(0));
+         BooleanQuery.Builder bq = new BooleanQuery.Builder();
+         bq.add(new MatchAllDocsQuery(), BooleanClause.Occur.FILTER);
+@@ -92,7 +92,7 @@ public void testLocatePercolatorQuery() {
+         assertThat(PercolatorHighlightSubFetchPhase.locatePercolatorQuery(disjunctionMaxQuery).get(0), sameInstance(percolateQuery));
+ 
+         PercolateQuery percolateQuery2 = new PercolateQuery("_name", ctx -> null, Collections.singletonList(new BytesArray("{}")),
+-            new MatchAllDocsQuery(), Mockito.mock(IndexSearcher.class), new MatchAllDocsQuery());
++            new MatchAllDocsQuery(), Mockito.mock(IndexSearcher.class), null, new MatchAllDocsQuery());
+         bq = new BooleanQuery.Builder();
+         bq.add(new MatchAllDocsQuery(), BooleanClause.Occur.FILTER);
+         assertThat(PercolatorHighlightSubFetchPhase.locatePercolatorQuery(bq.build()).size(), equalTo(0));
+diff --git a/modules/percolator/src/test/java/org/elasticsearch/percolator/PercolatorMatchedSlotSubFetchPhaseTests.java b/modules/percolator/src/test/java/org/elasticsearch/percolator/PercolatorMatchedSlotSubFetchPhaseTests.java
+index a428726225b9..d9c0fe5e4a5b 100644
+--- a/modules/percolator/src/test/java/org/elasticsearch/percolator/PercolatorMatchedSlotSubFetchPhaseTests.java
++++ b/modules/percolator/src/test/java/org/elasticsearch/percolator/PercolatorMatchedSlotSubFetchPhaseTests.java
+@@ -58,7 +58,7 @@ public void testHitsExecute() throws Exception {
+                     MemoryIndex memoryIndex = new MemoryIndex();
+                     memoryIndex.addField("field", "value", new WhitespaceAnalyzer());
+                     PercolateQuery percolateQuery =  new PercolateQuery("_name", queryStore, Collections.emptyList(),
+-                        new MatchAllDocsQuery(), memoryIndex.createSearcher(), new MatchNoDocsQuery());
++                        new MatchAllDocsQuery(), memoryIndex.createSearcher(), null, new MatchNoDocsQuery());
+ 
+                     PercolatorMatchedSlotSubFetchPhase.innerHitsExecute(percolateQuery, indexSearcher, hits);
+                     assertNotNull(hits[0].field(PercolatorMatchedSlotSubFetchPhase.FIELD_NAME_PREFIX));
+@@ -72,7 +72,7 @@ public void testHitsExecute() throws Exception {
+                     MemoryIndex memoryIndex = new MemoryIndex();
+                     memoryIndex.addField("field", "value1", new WhitespaceAnalyzer());
+                     PercolateQuery percolateQuery =  new PercolateQuery("_name", queryStore, Collections.emptyList(),
+-                        new MatchAllDocsQuery(), memoryIndex.createSearcher(), new MatchNoDocsQuery());
++                        new MatchAllDocsQuery(), memoryIndex.createSearcher(), null, new MatchNoDocsQuery());
+ 
+                     PercolatorMatchedSlotSubFetchPhase.innerHitsExecute(percolateQuery, indexSearcher, hits);
+                     assertNull(hits[0].field(PercolatorMatchedSlotSubFetchPhase.FIELD_NAME_PREFIX));
+@@ -85,7 +85,7 @@ public void testHitsExecute() throws Exception {
+                     MemoryIndex memoryIndex = new MemoryIndex();
+                     memoryIndex.addField("field", "value", new WhitespaceAnalyzer());
+                     PercolateQuery percolateQuery =  new PercolateQuery("_name", queryStore, Collections.emptyList(),
+-                        new MatchAllDocsQuery(), memoryIndex.createSearcher(), new MatchNoDocsQuery());
++                        new MatchAllDocsQuery(), memoryIndex.createSearcher(), null, new MatchNoDocsQuery());
+ 
+                     PercolatorMatchedSlotSubFetchPhase.innerHitsExecute(percolateQuery, indexSearcher, hits);
+                     assertNull(hits[0].field(PercolatorMatchedSlotSubFetchPhase.FIELD_NAME_PREFIX));

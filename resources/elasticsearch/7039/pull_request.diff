@@ -1,0 +1,387 @@
+diff --git a/docs/reference/search/request/sort.asciidoc b/docs/reference/search/request/sort.asciidoc
+index fa3d5919546c..182084adbd78 100644
+--- a/docs/reference/search/request/sort.asciidoc
++++ b/docs/reference/search/request/sort.asciidoc
+@@ -131,16 +131,23 @@ the `nested_filter` then a missing value is used.
+ 
+ ==== Ignoring Unmapped Fields
+ 
++coming[1.4.0] Before 1.4.0 there was the `ignore_unmapped` boolean
++parameter, which was not enough information to decide on the sort
++values to emit, and didn't work for cross-index search. It is still
++supported but users are encouraged to migrate to the new
++`unmapped_type` instead.
++
+ By default, the search request will fail if there is no mapping
+-associated with a field. The `ignore_unmapped` option allows to ignore
+-fields that have no mapping and not sort by them. Here is an example of
+-how it can be used:
++associated with a field. The `unmapped_type` option allows to ignore
++fields that have no mapping and not sort by them. The value of this
++parameter is used to determine what sort values to emit. Here is an
++example of how it can be used:
+ 
+ [source,js]
+ --------------------------------------------------
+ {
+     "sort" : [
+-        { "price" : {"ignore_unmapped" : true} },
++        { "price" : {"unmapped_type" : "long"} },
+     ],
+     "query" : {
+         "term" : { "user" : "kimchy" }
+@@ -148,6 +155,10 @@ how it can be used:
+ }
+ --------------------------------------------------
+ 
++If any of the indices that are queried doesn't have a mapping for `price`
++then Elasticsearch will handle it as if there was a mapping of type
++`long`, with all documents in this index having no value for this field.
++
+ ==== Geo Distance Sorting
+ 
+ Allow to sort by `_geo_distance`. Here is an example:
+diff --git a/src/main/java/org/elasticsearch/common/text/StringAndBytesText.java b/src/main/java/org/elasticsearch/common/text/StringAndBytesText.java
+index 1ec8195f41c2..41e9d0e7c62d 100644
+--- a/src/main/java/org/elasticsearch/common/text/StringAndBytesText.java
++++ b/src/main/java/org/elasticsearch/common/text/StringAndBytesText.java
+@@ -98,6 +98,9 @@ public int hashCode() {
+ 
+     @Override
+     public boolean equals(Object obj) {
++        if (obj == null) {
++            return false;
++        }
+         return bytes().equals(((Text) obj).bytes());
+     }
+ 
+diff --git a/src/main/java/org/elasticsearch/index/mapper/MapperService.java b/src/main/java/org/elasticsearch/index/mapper/MapperService.java
+index d96dd84d7965..64c3da476496 100755
+--- a/src/main/java/org/elasticsearch/index/mapper/MapperService.java
++++ b/src/main/java/org/elasticsearch/index/mapper/MapperService.java
+@@ -33,6 +33,7 @@
+ import org.apache.lucene.search.Filter;
+ import org.apache.lucene.util.BytesRef;
+ import org.elasticsearch.ElasticsearchGenerationException;
++import org.elasticsearch.ElasticsearchIllegalArgumentException;
+ import org.elasticsearch.common.Nullable;
+ import org.elasticsearch.common.collect.ImmutableOpenMap;
+ import org.elasticsearch.common.collect.Tuple;
+@@ -52,6 +53,7 @@
+ import org.elasticsearch.index.codec.docvaluesformat.DocValuesFormatService;
+ import org.elasticsearch.index.codec.postingsformat.PostingsFormatService;
+ import org.elasticsearch.index.fielddata.IndexFieldDataService;
++import org.elasticsearch.index.mapper.Mapper.BuilderContext;
+ import org.elasticsearch.index.mapper.internal.TypeFieldMapper;
+ import org.elasticsearch.index.mapper.object.ObjectMapper;
+ import org.elasticsearch.index.search.nested.NonNestedDocsFilter;
+@@ -125,6 +127,8 @@ public static int getFieldMappersCollectionSwitch(@Nullable Settings settings) {
+ 
+     private final List<DocumentTypeListener> typeListeners = new CopyOnWriteArrayList<>();
+ 
++    private volatile ImmutableMap<String, FieldMapper<?>> unmappedFieldMappers = ImmutableMap.of();
++
+     @Inject
+     public MapperService(Index index, @IndexSettings Settings indexSettings, Environment environment, AnalysisService analysisService, IndexFieldDataService fieldDataService,
+                          PostingsFormatService postingsFormatService, DocValuesFormatService docValuesFormatService, SimilarityLookupService similarityLookupService,
+@@ -863,6 +867,32 @@ public SmartNameFieldMappers smartName(String smartName) {
+         return null;
+     }
+ 
++    /**
++     * Given a type (eg. long, string, ...), return an anonymous field mapper that can be used for search operations.
++     */
++    public FieldMapper<?> unmappedFieldMapper(String type) {
++        final ImmutableMap<String, FieldMapper<?>> unmappedFieldMappers = this.unmappedFieldMappers;
++        FieldMapper<?> mapper = unmappedFieldMappers.get(type);
++        if (mapper == null) {
++            final Mapper.TypeParser.ParserContext parserContext = documentMapperParser().parserContext();
++            Mapper.TypeParser typeParser = parserContext.typeParser(type);
++            if (typeParser == null) {
++                throw new ElasticsearchIllegalArgumentException("No mapper found for type [" + type + "]");
++            }
++            final Mapper.Builder<?, ?> builder = typeParser.parse("__anonymous_" + type, ImmutableMap.<String, Object>of(), parserContext);
++            final BuilderContext builderContext = new BuilderContext(indexSettings, new ContentPath(1));
++            mapper = (FieldMapper<?>) builder.build(builderContext);
++
++            // There is no need to synchronize writes here. In the case of concurrent access, we could just
++            // compute some mappers several times, which is not a big deal
++            this.unmappedFieldMappers = ImmutableMap.<String, FieldMapper<?>>builder()
++                    .putAll(unmappedFieldMappers)
++                    .put(type, mapper)
++                    .build();
++        }
++        return mapper;
++    }
++
+     public Analyzer searchAnalyzer() {
+         return this.searchAnalyzer;
+     }
+diff --git a/src/main/java/org/elasticsearch/search/sort/FieldSortBuilder.java b/src/main/java/org/elasticsearch/search/sort/FieldSortBuilder.java
+index 3b8eee9fe1a9..1e1445ec4804 100644
+--- a/src/main/java/org/elasticsearch/search/sort/FieldSortBuilder.java
++++ b/src/main/java/org/elasticsearch/search/sort/FieldSortBuilder.java
+@@ -19,9 +19,9 @@
+ 
+ package org.elasticsearch.search.sort;
+ 
++import org.elasticsearch.ElasticsearchIllegalArgumentException;
+ import org.elasticsearch.common.xcontent.XContentBuilder;
+ import org.elasticsearch.index.query.FilterBuilder;
+-import org.elasticsearch.ElasticsearchIllegalArgumentException;
+ 
+ import java.io.IOException;
+ 
+@@ -38,6 +38,8 @@
+ 
+     private Boolean ignoreUnmapped;
+ 
++    private String unmappedType;
++
+     private String sortMode;
+ 
+     private FilterBuilder nestedFilter;
+@@ -78,12 +80,26 @@ public FieldSortBuilder missing(Object missing) {
+     /**
+      * Sets if the field does not exists in the index, it should be ignored and not sorted by or not. Defaults
+      * to <tt>false</tt> (not ignoring).
++     * @deprecated Use {@link #unmappedType(String)} instead.
+      */
++    @Deprecated
+     public FieldSortBuilder ignoreUnmapped(boolean ignoreUnmapped) {
+         this.ignoreUnmapped = ignoreUnmapped;
+         return this;
+     }
+ 
++    /**
++     * Set the type to use in case the current field is not mapped in an index.
++     * Specifying a type tells Elasticsearch what type the sort values should have, which is important
++     * for cross-index search, if there are sort fields that exist on some indices only.
++     * If the unmapped type is <tt>null</tt> then query execution will fail if one or more indices
++     * don't have a mapping for the current field.
++     */
++    public FieldSortBuilder unmappedType(String type) {
++        this.unmappedType = type;
++        return this;
++    }
++
+     /**
+      * Defines what values to pick in the case a document contains multiple values for the targeted sort field.
+      * Possible values: min, max, sum and avg
+@@ -124,7 +140,10 @@ public XContentBuilder toXContent(XContentBuilder builder, Params params) throws
+             builder.field("missing", missing);
+         }
+         if (ignoreUnmapped != null) {
+-            builder.field("ignore_unmapped", ignoreUnmapped);
++            builder.field(SortParseElement.IGNORE_UNMAPPED.getPreferredName(), ignoreUnmapped);
++        }
++        if (unmappedType != null) {
++            builder.field(SortParseElement.UNMAPPED_TYPE.getPreferredName(), unmappedType);
+         }
+         if (sortMode != null) {
+             builder.field("mode", sortMode);
+diff --git a/src/main/java/org/elasticsearch/search/sort/SortParseElement.java b/src/main/java/org/elasticsearch/search/sort/SortParseElement.java
+index 1f1a3a147b53..ab2f138d2ee9 100644
+--- a/src/main/java/org/elasticsearch/search/sort/SortParseElement.java
++++ b/src/main/java/org/elasticsearch/search/sort/SortParseElement.java
+@@ -26,11 +26,13 @@
+ import org.apache.lucene.search.SortField;
+ import org.elasticsearch.ElasticsearchIllegalArgumentException;
+ import org.elasticsearch.common.Nullable;
++import org.elasticsearch.common.ParseField;
+ import org.elasticsearch.common.xcontent.XContentParser;
+ import org.elasticsearch.index.fielddata.IndexFieldData;
+ import org.elasticsearch.index.fielddata.IndexFieldData.XFieldComparatorSource.Nested;
+ import org.elasticsearch.index.mapper.FieldMapper;
+ import org.elasticsearch.index.mapper.ObjectMappers;
++import org.elasticsearch.index.mapper.core.LongFieldMapper;
+ import org.elasticsearch.index.mapper.core.NumberFieldMapper;
+ import org.elasticsearch.index.mapper.object.ObjectMapper;
+ import org.elasticsearch.index.query.ParsedFilter;
+@@ -52,6 +54,9 @@
+     private static final SortField SORT_DOC = new SortField(null, SortField.Type.DOC);
+     private static final SortField SORT_DOC_REVERSE = new SortField(null, SortField.Type.DOC, true);
+ 
++    public static final ParseField IGNORE_UNMAPPED = new ParseField("ignore_unmapped");
++    public static final ParseField UNMAPPED_TYPE = new ParseField("unmapped_type");
++
+     public static final String SCORE_FIELD_NAME = "_score";
+     public static final String DOC_FIELD_NAME = "_doc";
+ 
+@@ -79,13 +84,13 @@ public void parse(XContentParser parser, SearchContext context) throws Exception
+                 if (token == XContentParser.Token.START_OBJECT) {
+                     addCompoundSortField(parser, context, sortFields);
+                 } else if (token == XContentParser.Token.VALUE_STRING) {
+-                    addSortField(context, sortFields, parser.text(), false, false, null, null, null, null);
++                    addSortField(context, sortFields, parser.text(), false, null, null, null, null, null);
+                 } else {
+                     throw new ElasticsearchIllegalArgumentException("malformed sort format, within the sort array, an object, or an actual string are allowed");
+                 }
+             }
+         } else if (token == XContentParser.Token.VALUE_STRING) {
+-            addSortField(context, sortFields, parser.text(), false, false, null, null, null, null);
++            addSortField(context, sortFields, parser.text(), false, null, null, null, null, null);
+         } else if (token == XContentParser.Token.START_OBJECT) {
+             addCompoundSortField(parser, context, sortFields);
+         } else {
+@@ -118,7 +123,7 @@ private void addCompoundSortField(XContentParser parser, SearchContext context,
+                 boolean reverse = false;
+                 String missing = null;
+                 String innerJsonName = null;
+-                boolean ignoreUnmapped = false;
++                String unmappedType = null;
+                 MultiValueMode sortMode = null;
+                 Filter nestedFilter = null;
+                 String nestedPath = null;
+@@ -132,7 +137,7 @@ private void addCompoundSortField(XContentParser parser, SearchContext context,
+                     } else {
+                         throw new ElasticsearchIllegalArgumentException("sort direction [" + fieldName + "] not supported");
+                     }
+-                    addSortField(context, sortFields, fieldName, reverse, ignoreUnmapped, missing, sortMode, nestedPath, nestedFilter);
++                    addSortField(context, sortFields, fieldName, reverse, unmappedType, missing, sortMode, nestedPath, nestedFilter);
+                 } else {
+                     if (parsers.containsKey(fieldName)) {
+                         sortFields.add(parsers.get(fieldName).parse(parser, context));
+@@ -151,8 +156,14 @@ private void addCompoundSortField(XContentParser parser, SearchContext context,
+                                     }
+                                 } else if ("missing".equals(innerJsonName)) {
+                                     missing = parser.textOrNull();
+-                                } else if ("ignore_unmapped".equals(innerJsonName) || "ignoreUnmapped".equals(innerJsonName)) {
+-                                    ignoreUnmapped = parser.booleanValue();
++                                } else if (IGNORE_UNMAPPED.match(innerJsonName)) {
++                                    // backward compatibility: ignore_unmapped has been replaced with unmapped_type
++                                    if (unmappedType == null // don't override if unmapped_type has been provided too
++                                            && parser.booleanValue()) {
++                                        unmappedType = LongFieldMapper.CONTENT_TYPE;
++                                    }
++                                } else if (UNMAPPED_TYPE.match(innerJsonName)) {
++                                    unmappedType = parser.textOrNull();
+                                 } else if ("mode".equals(innerJsonName)) {
+                                     sortMode = MultiValueMode.fromString(parser.text());
+                                 } else if ("nested_path".equals(innerJsonName) || "nestedPath".equals(innerJsonName)) {
+@@ -169,14 +180,14 @@ private void addCompoundSortField(XContentParser parser, SearchContext context,
+                                 }
+                             }
+                         }
+-                        addSortField(context, sortFields, fieldName, reverse, ignoreUnmapped, missing, sortMode, nestedPath, nestedFilter);
++                        addSortField(context, sortFields, fieldName, reverse, unmappedType, missing, sortMode, nestedPath, nestedFilter);
+                     }
+                 }
+             }
+         }
+     }
+ 
+-    private void addSortField(SearchContext context, List<SortField> sortFields, String fieldName, boolean reverse, boolean ignoreUnmapped, @Nullable final String missing, MultiValueMode sortMode, String nestedPath, Filter nestedFilter) {
++    private void addSortField(SearchContext context, List<SortField> sortFields, String fieldName, boolean reverse, String unmappedType, @Nullable final String missing, MultiValueMode sortMode, String nestedPath, Filter nestedFilter) {
+         if (SCORE_FIELD_NAME.equals(fieldName)) {
+             if (reverse) {
+                 sortFields.add(SORT_SCORE_REVERSE);
+@@ -192,10 +203,11 @@ private void addSortField(SearchContext context, List<SortField> sortFields, Str
+         } else {
+             FieldMapper<?> fieldMapper = context.smartNameFieldMapper(fieldName);
+             if (fieldMapper == null) {
+-                if (ignoreUnmapped) {
+-                    return;
++                if (unmappedType != null) {
++                    fieldMapper = context.mapperService().unmappedFieldMapper(unmappedType);
++                } else {
++                    throw new SearchParseException(context, "No mapping found for [" + fieldName + "] in order to sort on");
+                 }
+-                throw new SearchParseException(context, "No mapping found for [" + fieldName + "] in order to sort on");
+             }
+ 
+             if (!fieldMapper.isSortable()) {
+diff --git a/src/test/java/org/elasticsearch/search/sort/SimpleSortTests.java b/src/test/java/org/elasticsearch/search/sort/SimpleSortTests.java
+index 47abb0669ff4..1ab15a61d1f5 100644
+--- a/src/test/java/org/elasticsearch/search/sort/SimpleSortTests.java
++++ b/src/test/java/org/elasticsearch/search/sort/SimpleSortTests.java
+@@ -34,6 +34,7 @@
+ import org.elasticsearch.common.text.Text;
+ import org.elasticsearch.common.xcontent.XContentBuilder;
+ import org.elasticsearch.common.xcontent.XContentFactory;
++import org.elasticsearch.index.fielddata.IndexFieldData;
+ import org.elasticsearch.index.mapper.Uid;
+ import org.elasticsearch.index.query.FilterBuilders;
+ import org.elasticsearch.index.query.QueryBuilders;
+@@ -52,6 +53,7 @@
+ import static org.elasticsearch.common.xcontent.XContentFactory.jsonBuilder;
+ import static org.elasticsearch.index.query.QueryBuilders.*;
+ import static org.elasticsearch.index.query.functionscore.ScoreFunctionBuilders.scriptFunction;
++import static org.elasticsearch.search.sort.SortBuilders.fieldSort;
+ import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.*;
+ import static org.hamcrest.Matchers.*;
+ 
+@@ -1675,5 +1677,41 @@ public void testSortDuelBetweenSingleShardAndMultiShardIndex() throws Exception
+         }
+     }
+ 
++    public void testCrossIndexIgnoreUnmapped() throws Exception {
++        assertAcked(prepareCreate("test1").addMapping(
++                "type", "str_field1", "type=string",
++                "long_field", "type=long",
++                "double_field", "type=double").get());
++        assertAcked(prepareCreate("test2").get());
++
++        indexRandom(true,
++                client().prepareIndex("test1", "type").setSource("str_field", "bcd", "long_field", 3, "double_field", 0.65),
++                client().prepareIndex("test2", "type").setSource());
++
++        ensureYellow("test1", "test2");
++
++        SearchResponse resp = client().prepareSearch("test1", "test2")
++                .addSort(fieldSort("str_field").order(SortOrder.ASC).unmappedType("string"))
++                .addSort(fieldSort("str_field2").order(SortOrder.DESC).unmappedType("string")).get();
++
++        final StringAndBytesText maxTerm = new StringAndBytesText(IndexFieldData.XFieldComparatorSource.MAX_TERM.utf8ToString());
++        assertSortValues(resp,
++                new Object[] {new StringAndBytesText("bcd"), null},
++                new Object[] {maxTerm, null});
++
++        resp = client().prepareSearch("test1", "test2")
++                .addSort(fieldSort("long_field").order(SortOrder.ASC).unmappedType("long"))
++                .addSort(fieldSort("long_field2").order(SortOrder.DESC).unmappedType("long")).get();
++        assertSortValues(resp,
++                new Object[] {3L, Long.MIN_VALUE},
++                new Object[] {Long.MAX_VALUE, Long.MIN_VALUE});
++
++        resp = client().prepareSearch("test1", "test2")
++                .addSort(fieldSort("double_field").order(SortOrder.ASC).unmappedType("double"))
++                .addSort(fieldSort("double_field2").order(SortOrder.DESC).unmappedType("double")).get();
++        assertSortValues(resp,
++                new Object[] {0.65, Double.NEGATIVE_INFINITY},
++                new Object[] {Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY});
++    }
+ 
+ }
+diff --git a/src/test/java/org/elasticsearch/test/hamcrest/ElasticsearchAssertions.java b/src/test/java/org/elasticsearch/test/hamcrest/ElasticsearchAssertions.java
+index 6f6cfaf91b99..3ef1b8e794ba 100644
+--- a/src/test/java/org/elasticsearch/test/hamcrest/ElasticsearchAssertions.java
++++ b/src/test/java/org/elasticsearch/test/hamcrest/ElasticsearchAssertions.java
+@@ -78,8 +78,7 @@
+ import static org.elasticsearch.test.ElasticsearchTestCase.*;
+ import static org.hamcrest.MatcherAssert.assertThat;
+ import static org.hamcrest.Matchers.*;
+-import static org.junit.Assert.assertTrue;
+-import static org.junit.Assert.fail;
++import static org.junit.Assert.*;
+ 
+ /**
+  *
+@@ -155,6 +154,17 @@ public static void assertSearchHits(SearchResponse searchResponse, String... ids
+         assertVersionSerializable(searchResponse);
+     }
+ 
++    public static void assertSortValues(SearchResponse searchResponse, Object[]... sortValues) {
++        assertSearchResponse(searchResponse);
++        SearchHit[] hits = searchResponse.getHits().getHits();
++        assertEquals(sortValues.length, hits.length);
++        for (int i = 0; i < sortValues.length; ++i) {
++            final Object[] hitsSortValues = hits[i].getSortValues();
++            assertArrayEquals("Offset " + Integer.toString(i) + ", id " + hits[i].getId(), sortValues[i], hitsSortValues);
++        }
++        assertVersionSerializable(searchResponse);
++    }
++
+     public static void assertOrderedSearchHits(SearchResponse searchResponse, String... ids) {
+         String shardStatus = formatShardStatus(searchResponse);
+         assertThat("Expected different hit count. " + shardStatus, searchResponse.getHits().hits().length, equalTo(ids.length));

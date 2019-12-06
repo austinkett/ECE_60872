@@ -1,0 +1,140 @@
+diff --git a/core/src/main/java/org/elasticsearch/common/lease/Releasables.java b/core/src/main/java/org/elasticsearch/common/lease/Releasables.java
+index bfabd20976d3..bd7b2a6e772a 100644
+--- a/core/src/main/java/org/elasticsearch/common/lease/Releasables.java
++++ b/core/src/main/java/org/elasticsearch/common/lease/Releasables.java
+@@ -24,6 +24,7 @@
+ import java.io.IOException;
+ import java.io.UncheckedIOException;
+ import java.util.Arrays;
++import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ /** Utility methods to work with {@link Releasable}s. */
+ public enum Releasables {
+@@ -93,4 +94,16 @@ public static Releasable wrap(final Iterable<Releasable> releasables) {
+     public static Releasable wrap(final Releasable... releasables) {
+         return () -> close(releasables);
+     }
++
++    /**
++     * Equivalent to {@link #wrap(Releasable...)} but can be called multiple times without double releasing.
++     */
++    public static Releasable releaseOnce(final Releasable... releasables) {
++        final AtomicBoolean released = new AtomicBoolean(false);
++        return () -> {
++            if (released.compareAndSet(false, true)) {
++                close(releasables);
++            }
++        };
++    }
+ }
+diff --git a/core/src/main/java/org/elasticsearch/transport/TcpTransport.java b/core/src/main/java/org/elasticsearch/transport/TcpTransport.java
+index 15a85fe8d42e..ab38b120c86c 100644
+--- a/core/src/main/java/org/elasticsearch/transport/TcpTransport.java
++++ b/core/src/main/java/org/elasticsearch/transport/TcpTransport.java
+@@ -924,6 +924,9 @@ public void sendRequest(final DiscoveryNode node, final long requestId, final St
+         byte status = 0;
+         status = TransportStatus.setRequest(status);
+         ReleasableBytesStreamOutput bStream = new ReleasableBytesStreamOutput(bigArrays);
++        // we wrap this in a release once since if the onRequestSent callback throws an exception
++        // we might release things twice and this should be prevented
++        final Releasable toRelease = Releasables.releaseOnce(() -> Releasables.close(bStream.bytes()));
+         boolean addedReleaseListener = false;
+         StreamOutput stream = bStream;
+         try {
+@@ -944,9 +947,9 @@ public void sendRequest(final DiscoveryNode node, final long requestId, final St
+             stream.writeString(action);
+             BytesReference message = buildMessage(requestId, status, node.getVersion(), request, stream, bStream);
+             final TransportRequestOptions finalOptions = options;
+-            Runnable onRequestSent = () -> {
++            Runnable onRequestSent = () -> { // this might be called in a different thread
+                 try {
+-                    Releasables.close(bStream.bytes());
++                    toRelease.close();
+                 } finally {
+                     transportServiceAdapter.onRequestSent(node, requestId, action, request, finalOptions);
+                 }
+@@ -955,7 +958,7 @@ public void sendRequest(final DiscoveryNode node, final long requestId, final St
+         } finally {
+             IOUtils.close(stream);
+             if (!addedReleaseListener) {
+-                Releasables.close(bStream.bytes());
++                toRelease.close();
+             }
+         }
+     }
+@@ -1018,6 +1021,9 @@ public void sendResponse(Version nodeVersion, Channel channel, final TransportRe
+         byte status = 0;
+         status = TransportStatus.setResponse(status); // TODO share some code with sendRequest
+         ReleasableBytesStreamOutput bStream = new ReleasableBytesStreamOutput(bigArrays);
++        // we wrap this in a release once since if the onRequestSent callback throws an exception
++        // we might release things twice and this should be prevented
++        final Releasable toRelease = Releasables.releaseOnce(() -> Releasables.close(bStream.bytes()));
+         boolean addedReleaseListener = false;
+         StreamOutput stream = bStream;
+         try {
+@@ -1030,9 +1036,9 @@ public void sendResponse(Version nodeVersion, Channel channel, final TransportRe
+             BytesReference reference = buildMessage(requestId, status, nodeVersion, response, stream, bStream);
+ 
+             final TransportResponseOptions finalOptions = options;
+-            Runnable onRequestSent = () -> {
++            Runnable onRequestSent = () -> { // this might be called in a different thread
+                 try {
+-                    Releasables.close(bStream.bytes());
++                    toRelease.close();
+                 } finally {
+                     transportServiceAdapter.onResponseSent(requestId, action, response, finalOptions);
+                 }
+@@ -1043,7 +1049,8 @@ public void sendResponse(Version nodeVersion, Channel channel, final TransportRe
+                 IOUtils.close(stream);
+             } finally {
+                 if (!addedReleaseListener) {
+-                    Releasables.close(bStream.bytes());
++
++                    toRelease.close();
+                 }
+             }
+ 
+diff --git a/core/src/test/java/org/elasticsearch/common/ReleasablesTests.java b/core/src/test/java/org/elasticsearch/common/ReleasablesTests.java
+new file mode 100644
+index 000000000000..62686354913f
+--- /dev/null
++++ b/core/src/test/java/org/elasticsearch/common/ReleasablesTests.java
+@@ -0,0 +1,38 @@
++/*
++ * Licensed to Elasticsearch under one or more contributor
++ * license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright
++ * ownership. Elasticsearch licenses this file to you under
++ * the Apache License, Version 2.0 (the "License"); you may
++ * not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.elasticsearch.common;
++
++import org.elasticsearch.common.lease.Releasable;
++import org.elasticsearch.common.lease.Releasables;
++import org.elasticsearch.test.ESTestCase;
++
++import java.util.concurrent.atomic.AtomicInteger;
++
++public class ReleasablesTests extends ESTestCase {
++
++    public void testReleaseOnce() {
++        AtomicInteger count = new AtomicInteger(0);
++        Releasable releasable = Releasables.releaseOnce(count::incrementAndGet, count::incrementAndGet);
++        assertEquals(0, count.get());
++        releasable.close();
++        assertEquals(2, count.get());
++        releasable.close();
++        assertEquals(2, count.get());
++    }
++}

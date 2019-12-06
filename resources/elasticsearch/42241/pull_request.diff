@@ -1,0 +1,493 @@
+diff --git a/server/src/main/java/org/elasticsearch/ElasticsearchException.java b/server/src/main/java/org/elasticsearch/ElasticsearchException.java
+index 861228d22177..85df20d849af 100644
+--- a/server/src/main/java/org/elasticsearch/ElasticsearchException.java
++++ b/server/src/main/java/org/elasticsearch/ElasticsearchException.java
+@@ -1022,7 +1022,12 @@ public String toString() {
+                 org.elasticsearch.index.seqno.RetentionLeaseNotFoundException.class,
+                 org.elasticsearch.index.seqno.RetentionLeaseNotFoundException::new,
+                 154,
+-                Version.V_6_7_0);
++                Version.V_6_7_0),
++        SHARD_NOT_IN_PRIMARY_MODE_EXCEPTION(
++                org.elasticsearch.index.shard.ShardNotInPrimaryModeException.class,
++                org.elasticsearch.index.shard.ShardNotInPrimaryModeException::new,
++                155,
++                Version.V_6_8_1);
+ 
+         final Class<? extends ElasticsearchException> exceptionClass;
+         final CheckedFunction<StreamInput, ? extends ElasticsearchException, IOException> constructor;
+diff --git a/server/src/main/java/org/elasticsearch/action/support/replication/TransportReplicationAction.java b/server/src/main/java/org/elasticsearch/action/support/replication/TransportReplicationAction.java
+index 6edaa9503399..d19009433deb 100644
+--- a/server/src/main/java/org/elasticsearch/action/support/replication/TransportReplicationAction.java
++++ b/server/src/main/java/org/elasticsearch/action/support/replication/TransportReplicationAction.java
+@@ -63,6 +63,7 @@
+ import org.elasticsearch.index.shard.ReplicationGroup;
+ import org.elasticsearch.index.shard.ShardId;
+ import org.elasticsearch.index.shard.ShardNotFoundException;
++import org.elasticsearch.index.shard.ShardNotInPrimaryModeException;
+ import org.elasticsearch.indices.IndexClosedException;
+ import org.elasticsearch.indices.IndicesService;
+ import org.elasticsearch.node.NodeClosedException;
+@@ -307,10 +308,18 @@ protected void doRun() throws Exception {
+                     primaryRequest.getTargetAllocationID(), primaryRequest.getPrimaryTerm(), actualTerm);
+             }
+ 
+-            acquirePrimaryOperationPermit(indexShard, primaryRequest.getRequest(), ActionListener.wrap(
+-                releasable -> runWithPrimaryShardReference(new PrimaryShardReference(indexShard, releasable)),
+-                this::onFailure
+-            ));
++            acquirePrimaryOperationPermit(
++                    indexShard,
++                    primaryRequest.getRequest(),
++                    ActionListener.wrap(
++                            releasable -> runWithPrimaryShardReference(new PrimaryShardReference(indexShard, releasable)),
++                            e -> {
++                                if (e instanceof ShardNotInPrimaryModeException) {
++                                    onFailure(new ReplicationOperation.RetryOnPrimaryException(shardId, "shard is not in primary mode", e));
++                                } else {
++                                    onFailure(e);
++                                }
++                            }));
+         }
+ 
+         void runWithPrimaryShardReference(final PrimaryShardReference primaryShardReference) {
+diff --git a/server/src/main/java/org/elasticsearch/index/seqno/RetentionLeaseActions.java b/server/src/main/java/org/elasticsearch/index/seqno/RetentionLeaseActions.java
+index c69a4c6fab04..74c98bf3dca1 100644
+--- a/server/src/main/java/org/elasticsearch/index/seqno/RetentionLeaseActions.java
++++ b/server/src/main/java/org/elasticsearch/index/seqno/RetentionLeaseActions.java
+@@ -28,8 +28,6 @@
+ import org.elasticsearch.action.support.single.shard.TransportSingleShardAction;
+ import org.elasticsearch.cluster.ClusterState;
+ import org.elasticsearch.cluster.metadata.IndexNameExpressionResolver;
+-import org.elasticsearch.cluster.routing.IndexShardRoutingTable;
+-import org.elasticsearch.cluster.routing.PlainShardIterator;
+ import org.elasticsearch.cluster.routing.ShardsIterator;
+ import org.elasticsearch.cluster.service.ClusterService;
+ import org.elasticsearch.common.inject.Inject;
+@@ -45,7 +43,6 @@
+ import org.elasticsearch.transport.TransportService;
+ 
+ import java.io.IOException;
+-import java.util.Collections;
+ import java.util.Objects;
+ import java.util.function.Supplier;
+ 
+@@ -88,14 +85,10 @@
+ 
+         @Override
+         protected ShardsIterator shards(final ClusterState state, final InternalRequest request) {
+-            final IndexShardRoutingTable shardRoutingTable = state
++            return state
+                     .routingTable()
+-                    .shardRoutingTable(request.concreteIndex(), request.request().getShardId().id());
+-            if (shardRoutingTable.primaryShard().active()) {
+-                return shardRoutingTable.primaryShardIt();
+-            } else {
+-                return new PlainShardIterator(request.request().getShardId(), Collections.emptyList());
+-            }
++                    .shardRoutingTable(request.concreteIndex(), request.request().getShardId().id())
++                    .primaryShardIt();
+         }
+ 
+         @Override
+@@ -174,6 +167,7 @@ void doRetentionLeaseAction(final IndexShard indexShard, final AddRequest reques
+             protected Writeable.Reader<Response> getResponseReader() {
+                 return Response::new;
+             }
++
+         }
+ 
+         @Override
+@@ -400,9 +394,10 @@ public RemoveRequest(final ShardId shardId, final String id) {
+         public Response() {
+         }
+ 
+-        Response(StreamInput in) throws IOException {
++        Response(final StreamInput in) throws IOException {
+             super(in);
+         }
++
+     }
+ 
+ }
+diff --git a/server/src/main/java/org/elasticsearch/index/shard/IndexShard.java b/server/src/main/java/org/elasticsearch/index/shard/IndexShard.java
+index 11e4fb81d9fb..da5ee8f8363f 100644
+--- a/server/src/main/java/org/elasticsearch/index/shard/IndexShard.java
++++ b/server/src/main/java/org/elasticsearch/index/shard/IndexShard.java
+@@ -20,7 +20,6 @@
+ package org.elasticsearch.index.shard;
+ 
+ import com.carrotsearch.hppc.ObjectLongMap;
+-
+ import org.apache.logging.log4j.Logger;
+ import org.apache.logging.log4j.message.ParameterizedMessage;
+ import org.apache.lucene.index.CheckIndex;
+@@ -2496,7 +2495,7 @@ public void acquirePrimaryOperationPermit(ActionListener<Releasable> onPermitAcq
+         verifyNotClosed();
+         assert shardRouting.primary() : "acquirePrimaryOperationPermit should only be called on primary shard: " + shardRouting;
+ 
+-        indexShardOperationPermits.acquire(onPermitAcquired, executorOnDelay, false, debugInfo);
++        indexShardOperationPermits.acquire(wrapPrimaryOperationPermitListener(onPermitAcquired), executorOnDelay, false, debugInfo);
+     }
+ 
+     /**
+@@ -2507,7 +2506,27 @@ public void acquireAllPrimaryOperationsPermits(final ActionListener<Releasable>
+         verifyNotClosed();
+         assert shardRouting.primary() : "acquireAllPrimaryOperationsPermits should only be called on primary shard: " + shardRouting;
+ 
+-        asyncBlockOperations(onPermitAcquired, timeout.duration(), timeout.timeUnit());
++        asyncBlockOperations(wrapPrimaryOperationPermitListener(onPermitAcquired), timeout.duration(), timeout.timeUnit());
++    }
++
++    /**
++     * Wraps the action to run on a primary after acquiring permit. This wrapping is used to check if the shard is in primary mode before
++     * executing the action.
++     *
++     * @param listener the listener to wrap
++     * @return the wrapped listener
++     */
++    private ActionListener<Releasable> wrapPrimaryOperationPermitListener(final ActionListener<Releasable> listener) {
++        return ActionListener.delegateFailure(
++                listener,
++                (l, r) -> {
++                    if (replicationTracker.isPrimaryMode()) {
++                        l.onResponse(r);
++                    } else {
++                        r.close();
++                        l.onFailure(new ShardNotInPrimaryModeException(shardId, state));
++                    }
++                });
+     }
+ 
+     private void asyncBlockOperations(ActionListener<Releasable> onPermitAcquired, long timeout, TimeUnit timeUnit) {
+diff --git a/server/src/main/java/org/elasticsearch/index/shard/ShardNotInPrimaryModeException.java b/server/src/main/java/org/elasticsearch/index/shard/ShardNotInPrimaryModeException.java
+new file mode 100644
+index 000000000000..8bc23dcdd00f
+--- /dev/null
++++ b/server/src/main/java/org/elasticsearch/index/shard/ShardNotInPrimaryModeException.java
+@@ -0,0 +1,36 @@
++/*
++ * Licensed to Elasticsearch under one or more contributor
++ * license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright
++ * ownership. Elasticsearch licenses this file to you under
++ * the Apache License, Version 2.0 (the "License"); you may
++ * not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++package org.elasticsearch.index.shard;
++
++import org.elasticsearch.common.io.stream.StreamInput;
++
++import java.io.IOException;
++
++public class ShardNotInPrimaryModeException extends IllegalIndexShardStateException {
++
++    public ShardNotInPrimaryModeException(final ShardId shardId, final IndexShardState currentState) {
++        super(shardId, currentState, "shard is not in primary mode");
++    }
++
++    public ShardNotInPrimaryModeException(final StreamInput in) throws IOException {
++        super(in);
++    }
++
++}
+diff --git a/server/src/test/java/org/elasticsearch/ExceptionSerializationTests.java b/server/src/test/java/org/elasticsearch/ExceptionSerializationTests.java
+index 1fac56886de4..a0aafbb41d37 100644
+--- a/server/src/test/java/org/elasticsearch/ExceptionSerializationTests.java
++++ b/server/src/test/java/org/elasticsearch/ExceptionSerializationTests.java
+@@ -66,6 +66,7 @@
+ import org.elasticsearch.index.shard.IllegalIndexShardStateException;
+ import org.elasticsearch.index.shard.IndexShardState;
+ import org.elasticsearch.index.shard.ShardId;
++import org.elasticsearch.index.shard.ShardNotInPrimaryModeException;
+ import org.elasticsearch.indices.IndexTemplateMissingException;
+ import org.elasticsearch.indices.InvalidIndexTemplateException;
+ import org.elasticsearch.indices.recovery.RecoverFilesRecoveryException;
+@@ -816,6 +817,7 @@ public void testIds() {
+         ids.put(152, NoSuchRemoteClusterException.class);
+         ids.put(153, RetentionLeaseAlreadyExistsException.class);
+         ids.put(154, RetentionLeaseNotFoundException.class);
++        ids.put(155, ShardNotInPrimaryModeException.class);
+ 
+         Map<Class<? extends ElasticsearchException>, Integer> reverse = new HashMap<>();
+         for (Map.Entry<Integer, Class<? extends ElasticsearchException>> entry : ids.entrySet()) {
+diff --git a/server/src/test/java/org/elasticsearch/action/support/replication/TransportReplicationActionTests.java b/server/src/test/java/org/elasticsearch/action/support/replication/TransportReplicationActionTests.java
+index 12cc9097b652..4459aa555698 100644
+--- a/server/src/test/java/org/elasticsearch/action/support/replication/TransportReplicationActionTests.java
++++ b/server/src/test/java/org/elasticsearch/action/support/replication/TransportReplicationActionTests.java
+@@ -64,9 +64,11 @@
+ import org.elasticsearch.index.IndexService;
+ import org.elasticsearch.index.shard.IndexShard;
+ import org.elasticsearch.index.shard.IndexShardClosedException;
++import org.elasticsearch.index.shard.IndexShardState;
+ import org.elasticsearch.index.shard.ReplicationGroup;
+ import org.elasticsearch.index.shard.ShardId;
+ import org.elasticsearch.index.shard.ShardNotFoundException;
++import org.elasticsearch.index.shard.ShardNotInPrimaryModeException;
+ import org.elasticsearch.indices.IndexClosedException;
+ import org.elasticsearch.indices.IndicesService;
+ import org.elasticsearch.indices.breaker.NoneCircuitBreakerService;
+@@ -390,6 +392,43 @@ public void testNotStartedPrimary() {
+         assertIndexShardCounter(0);
+     }
+ 
++    public void testShardNotInPrimaryMode() {
++        final String index = "test";
++        final ShardId shardId = new ShardId(index, "_na_", 0);
++        final ClusterState state = state(index, true, ShardRoutingState.RELOCATING);
++        setState(clusterService, state);
++        final ReplicationTask task = maybeTask();
++        final Request request = new Request(shardId);
++        PlainActionFuture<TestResponse> listener = new PlainActionFuture<>();
++        final AtomicBoolean executed = new AtomicBoolean();
++
++        final ShardRouting primaryShard = state.getRoutingTable().shardRoutingTable(shardId).primaryShard();
++        final long primaryTerm = state.metaData().index(index).primaryTerm(shardId.id());
++        final TransportReplicationAction.ConcreteShardRequest<Request> primaryRequest
++                = new TransportReplicationAction.ConcreteShardRequest<>(request, primaryShard.allocationId().getId(), primaryTerm);
++
++        isPrimaryMode.set(false);
++
++        new TestAction(Settings.EMPTY, "internal:test-action", transportService, clusterService, shardStateAction, threadPool) {
++            @Override
++            protected void shardOperationOnPrimary(Request shardRequest, IndexShard primary,
++                                                   ActionListener<PrimaryResult<Request, TestResponse>> listener) {
++                assertPhase(task, "primary");
++                assertFalse(executed.getAndSet(true));
++                super.shardOperationOnPrimary(shardRequest, primary, listener);
++            }
++        }.new AsyncPrimaryAction(primaryRequest, listener, task).run();
++
++        assertFalse(executed.get());
++        assertIndexShardCounter(0);  // no permit should be held
++
++        final ExecutionException e = expectThrows(ExecutionException.class, listener::get);
++        assertThat(e.getCause(), instanceOf(ReplicationOperation.RetryOnPrimaryException.class));
++        assertThat(e.getCause(), hasToString(containsString("shard is not in primary mode")));
++        assertThat(e.getCause().getCause(), instanceOf(ShardNotInPrimaryModeException.class));
++        assertThat(e.getCause().getCause(), hasToString(containsString("shard is not in primary mode")));
++    }
++
+     /**
+      * When relocating a primary shard, there is a cluster state update at the end of relocation where the active primary is switched from
+      * the relocation source to the relocation target. If relocation source receives and processes this cluster state
+@@ -1126,6 +1165,8 @@ private void assertIndexShardCounter(int expected) {
+ 
+     private final AtomicBoolean isRelocated = new AtomicBoolean(false);
+ 
++    private final AtomicBoolean isPrimaryMode = new AtomicBoolean(true);
++
+     /**
+      * Sometimes build a ReplicationTask for tracking the phase of the
+      * TransportReplicationAction. Since TransportReplicationAction has to work
+@@ -1271,10 +1312,16 @@ private IndexService mockIndexService(final IndexMetaData indexMetaData, Cluster
+     private IndexShard mockIndexShard(ShardId shardId, ClusterService clusterService) {
+         final IndexShard indexShard = mock(IndexShard.class);
+         when(indexShard.shardId()).thenReturn(shardId);
++        when(indexShard.state()).thenReturn(IndexShardState.STARTED);
+         doAnswer(invocation -> {
+             ActionListener<Releasable> callback = (ActionListener<Releasable>) invocation.getArguments()[0];
+-            count.incrementAndGet();
+-            callback.onResponse(count::decrementAndGet);
++            if (isPrimaryMode.get()) {
++                count.incrementAndGet();
++                callback.onResponse(count::decrementAndGet);
++
++            } else {
++                callback.onFailure(new ShardNotInPrimaryModeException(shardId, IndexShardState.STARTED));
++            }
+             return null;
+         }).when(indexShard).acquirePrimaryOperationPermit(any(ActionListener.class), anyString(), anyObject());
+         doAnswer(invocation -> {
+diff --git a/server/src/test/java/org/elasticsearch/index/shard/IndexShardTests.java b/server/src/test/java/org/elasticsearch/index/shard/IndexShardTests.java
+index 0be7b4433fac..786d5bc5e8df 100644
+--- a/server/src/test/java/org/elasticsearch/index/shard/IndexShardTests.java
++++ b/server/src/test/java/org/elasticsearch/index/shard/IndexShardTests.java
+@@ -636,11 +636,13 @@ public void testOperationPermitsOnPrimaryShards() throws Exception {
+         final ShardId shardId = new ShardId("test", "_na_", 0);
+         final IndexShard indexShard;
+ 
++        final boolean isPrimaryMode;
+         if (randomBoolean()) {
+             // relocation target
+             indexShard = newShard(newShardRouting(shardId, "local_node", "other node",
+                 true, ShardRoutingState.INITIALIZING, AllocationId.newRelocation(AllocationId.newInitializing())));
+             assertEquals(0, indexShard.getActiveOperationsCount());
++            isPrimaryMode = false;
+         } else if (randomBoolean()) {
+             // simulate promotion
+             indexShard = newStartedShard(false);
+@@ -660,21 +662,60 @@ public void testOperationPermitsOnPrimaryShards() throws Exception {
+             if (randomBoolean()) {
+                 assertBusy(() -> assertEquals(0, indexShard.getActiveOperationsCount()));
+             }
++            isPrimaryMode = true;
+         } else {
+             indexShard = newStartedShard(true);
+             assertEquals(0, indexShard.getActiveOperationsCount());
++            isPrimaryMode = true;
+         }
+-        final long primaryTerm = indexShard.getPendingPrimaryTerm();
+-        Releasable operation1 = acquirePrimaryOperationPermitBlockingly(indexShard);
+-        assertEquals(1, indexShard.getActiveOperationsCount());
+-        Releasable operation2 = acquirePrimaryOperationPermitBlockingly(indexShard);
+-        assertEquals(2, indexShard.getActiveOperationsCount());
++        assert indexShard.getReplicationTracker().isPrimaryMode() == isPrimaryMode;
++        final long pendingPrimaryTerm = indexShard.getPendingPrimaryTerm();
++        if (isPrimaryMode) {
++            Releasable operation1 = acquirePrimaryOperationPermitBlockingly(indexShard);
++            assertEquals(1, indexShard.getActiveOperationsCount());
++            Releasable operation2 = acquirePrimaryOperationPermitBlockingly(indexShard);
++            assertEquals(2, indexShard.getActiveOperationsCount());
+ 
+-        Releasables.close(operation1, operation2);
+-        assertEquals(0, indexShard.getActiveOperationsCount());
++            Releasables.close(operation1, operation2);
++            assertEquals(0, indexShard.getActiveOperationsCount());
++        } else {
++            indexShard.acquirePrimaryOperationPermit(
++                    new ActionListener<>() {
++                        @Override
++                        public void onResponse(final Releasable releasable) {
++                            throw new AssertionError();
++                        }
++
++                        @Override
++                        public void onFailure(final Exception e) {
++                            assertThat(e, instanceOf(ShardNotInPrimaryModeException.class));
++                            assertThat(e, hasToString(containsString("shard is not in primary mode")));
++                        }
++                    },
++                    ThreadPool.Names.SAME,
++                    "test");
++
++            final CountDownLatch latch = new CountDownLatch(1);
++            indexShard.acquireAllPrimaryOperationsPermits(
++                    new ActionListener<>() {
++                        @Override
++                        public void onResponse(final Releasable releasable) {
++                            throw new AssertionError();
++                        }
++
++                        @Override
++                        public void onFailure(final Exception e) {
++                            assertThat(e, instanceOf(ShardNotInPrimaryModeException.class));
++                            assertThat(e, hasToString(containsString("shard is not in primary mode")));
++                            latch.countDown();
++                        }
++                    },
++                    TimeValue.timeValueSeconds(30));
++            latch.await();
++        }
+ 
+         if (Assertions.ENABLED && indexShard.routingEntry().isRelocationTarget() == false) {
+-            assertThat(expectThrows(AssertionError.class, () -> indexShard.acquireReplicaOperationPermit(primaryTerm,
++            assertThat(expectThrows(AssertionError.class, () -> indexShard.acquireReplicaOperationPermit(pendingPrimaryTerm,
+                 indexShard.getGlobalCheckpoint(), indexShard.getMaxSeqNoOfUpdatesOrDeletes(), new ActionListener<Releasable>() {
+                     @Override
+                     public void onResponse(Releasable releasable) {
+@@ -1688,10 +1729,9 @@ public void testLockingBeforeAndAfterRelocated() throws Exception {
+         // recovery can be now finalized
+         recoveryThread.join();
+         assertTrue(shard.isRelocatedPrimary());
+-        try (Releasable ignored = acquirePrimaryOperationPermitBlockingly(shard)) {
+-            // lock can again be acquired
+-            assertTrue(shard.isRelocatedPrimary());
+-        }
++        final ExecutionException e = expectThrows(ExecutionException.class, () -> acquirePrimaryOperationPermitBlockingly(shard));
++        assertThat(e.getCause(), instanceOf(ShardNotInPrimaryModeException.class));
++        assertThat(e.getCause(), hasToString(containsString("shard is not in primary mode")));
+ 
+         closeShards(shard);
+     }
+@@ -1699,30 +1739,64 @@ public void testLockingBeforeAndAfterRelocated() throws Exception {
+     public void testDelayedOperationsBeforeAndAfterRelocated() throws Exception {
+         final IndexShard shard = newStartedShard(true);
+         IndexShardTestCase.updateRoutingEntry(shard, ShardRoutingHelper.relocate(shard.routingEntry(), "other_node"));
++        final CountDownLatch startRecovery = new CountDownLatch(1);
++        final CountDownLatch relocationStarted = new CountDownLatch(1);
+         Thread recoveryThread = new Thread(() -> {
+             try {
+-                shard.relocated(primaryContext -> {});
++                startRecovery.await();
++                shard.relocated(primaryContext -> relocationStarted.countDown());
+             } catch (InterruptedException e) {
+                 throw new RuntimeException(e);
+             }
+         });
+ 
+         recoveryThread.start();
+-        List<PlainActionFuture<Releasable>> onLockAcquiredActions = new ArrayList<>();
+-        for (int i = 0; i < 10; i++) {
+-            PlainActionFuture<Releasable> onLockAcquired = new PlainActionFuture<Releasable>() {
+-                @Override
+-                public void onResponse(Releasable releasable) {
+-                    releasable.close();
+-                    super.onResponse(releasable);
+-                }
+-            };
+-            shard.acquirePrimaryOperationPermit(onLockAcquired, ThreadPool.Names.WRITE, "i_" + i);
+-            onLockAcquiredActions.add(onLockAcquired);
+-        }
+ 
+-        for (PlainActionFuture<Releasable> onLockAcquired : onLockAcquiredActions) {
+-            assertNotNull(onLockAcquired.get(30, TimeUnit.SECONDS));
++        final int numberOfAcquisitions = randomIntBetween(1, 10);
++        final int recoveryIndex = randomIntBetween(1, numberOfAcquisitions);
++
++        for (int i = 0; i < numberOfAcquisitions; i++) {
++
++            final PlainActionFuture<Releasable> onLockAcquired;
++            final Runnable assertion;
++            if (i < recoveryIndex) {
++                final AtomicBoolean invoked = new AtomicBoolean();
++                onLockAcquired = new PlainActionFuture<>() {
++
++                    @Override
++                    public void onResponse(Releasable releasable) {
++                        invoked.set(true);
++                        releasable.close();
++                        super.onResponse(releasable);
++                    }
++
++                    @Override
++                    public void onFailure(Exception e) {
++                        throw new AssertionError();
++                    }
++
++                };
++                assertion = () -> assertTrue(invoked.get());
++            } else if (recoveryIndex == i) {
++                startRecovery.countDown();
++                relocationStarted.await();
++                onLockAcquired = new PlainActionFuture<>();
++                assertion = () -> {
++                    final ExecutionException e = expectThrows(ExecutionException.class, () -> onLockAcquired.get(30, TimeUnit.SECONDS));
++                    assertThat(e.getCause(), instanceOf(ShardNotInPrimaryModeException.class));
++                    assertThat(e.getCause(), hasToString(containsString("shard is not in primary mode")));
++                };
++            } else {
++                onLockAcquired = new PlainActionFuture<>();
++                assertion = () -> {
++                    final ExecutionException e = expectThrows(ExecutionException.class, () -> onLockAcquired.get(30, TimeUnit.SECONDS));
++                    assertThat(e.getCause(), instanceOf(ShardNotInPrimaryModeException.class));
++                    assertThat(e.getCause(), hasToString(containsString("shard is not in primary mode")));
++                };
++            }
++
++            shard.acquirePrimaryOperationPermit(onLockAcquired, ThreadPool.Names.WRITE, "i_" + i);
++            assertion.run();
+         }
+ 
+         recoveryThread.join();

@@ -1,0 +1,120 @@
+diff --git a/x-pack/plugin/security/src/main/java/org/elasticsearch/xpack/security/transport/nio/SSLDriver.java b/x-pack/plugin/security/src/main/java/org/elasticsearch/xpack/security/transport/nio/SSLDriver.java
+index 382230684c77..fa7791689aaa 100644
+--- a/x-pack/plugin/security/src/main/java/org/elasticsearch/xpack/security/transport/nio/SSLDriver.java
++++ b/x-pack/plugin/security/src/main/java/org/elasticsearch/xpack/security/transport/nio/SSLDriver.java
+@@ -349,7 +349,10 @@ private void handshake() throws SSLException {
+                         if (hasFlushPending() == false) {
+                             handshakeStatus = wrap(EMPTY_BUFFER_ARRAY).getHandshakeStatus();
+                         }
+-                        continueHandshaking = false;
++                        // If we need NEED_TASK we should run the tasks immediately
++                        if (handshakeStatus != SSLEngineResult.HandshakeStatus.NEED_TASK) {
++                            continueHandshaking = false;
++                        }
+                         break;
+                     case NEED_TASK:
+                         runTasks();
+@@ -432,8 +435,16 @@ private void runTasks() {
+         }
+ 
+         private void maybeFinishHandshake() {
+-            // We only acknowledge that we are done handshaking if there are no bytes that need to be written
+-            if (hasFlushPending() == false) {
++            if (engine.isOutboundDone() || engine.isInboundDone()) {
++                // If the engine is partially closed, immediate transition to close mode.
++                if (currentMode.isHandshake()) {
++                    currentMode = new CloseMode(true);
++                } else {
++                    String message = "Expected to be in handshaking mode. Instead in non-handshaking mode: " + currentMode;
++                    throw new AssertionError(message);
++                }
++            } else if (hasFlushPending() == false) {
++                // We only acknowledge that we are done handshaking if there are no bytes that need to be written
+                 if (currentMode.isHandshake()) {
+                     currentMode = new ApplicationMode();
+                 } else {
+@@ -510,7 +521,7 @@ private CloseMode(boolean isHandshaking) {
+             if (isHandshaking && engine.isInboundDone() == false) {
+                 // If we attempt to close during a handshake either we are sending an alert and inbound
+                 // should already be closed or we are sending a close_notify. If we send a close_notify
+-                // the peer will send an handshake error alert. If we attempt to receive the handshake alert,
++                // the peer might send an handshake error alert. If we attempt to receive the handshake alert,
+                 // the engine will throw an IllegalStateException as it is not in a proper state to receive
+                 // handshake message. Closing inbound immediately after close_notify is the cleanest option.
+                 needToReceiveClose = false;
+diff --git a/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/transport/nio/SSLDriverTests.java b/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/transport/nio/SSLDriverTests.java
+index e1e05032014b..303ed92130aa 100644
+--- a/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/transport/nio/SSLDriverTests.java
++++ b/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/transport/nio/SSLDriverTests.java
+@@ -57,8 +57,15 @@ public void testPingPongAndClose() throws Exception {
+     public void testRenegotiate() throws Exception {
+         SSLContext sslContext = getSSLContext();
+ 
+-        SSLDriver clientDriver = getDriver(sslContext.createSSLEngine(), true);
+-        SSLDriver serverDriver = getDriver(sslContext.createSSLEngine(), false);
++        SSLEngine serverEngine = sslContext.createSSLEngine();
++        SSLEngine clientEngine = sslContext.createSSLEngine();
++
++        String[] serverProtocols = {"TLSv1.2"};
++        serverEngine.setEnabledProtocols(serverProtocols);
++        String[] clientProtocols = {"TLSv1.2"};
++        clientEngine.setEnabledProtocols(clientProtocols);
++        SSLDriver clientDriver = getDriver(clientEngine, true);
++        SSLDriver serverDriver = getDriver(serverEngine, false);
+ 
+         handshake(clientDriver, serverDriver);
+ 
+@@ -119,16 +126,27 @@ public void testHandshakeFailureBecauseProtocolMismatch() throws Exception {
+         SSLContext sslContext = getSSLContext();
+         SSLEngine clientEngine = sslContext.createSSLEngine();
+         SSLEngine serverEngine = sslContext.createSSLEngine();
+-        String[] serverProtocols = {"TLSv1.1", "TLSv1.2"};
++        String[] serverProtocols = {"TLSv1.2"};
+         serverEngine.setEnabledProtocols(serverProtocols);
+-        String[] clientProtocols = {"TLSv1"};
++        String[] clientProtocols = {"TLSv1.1"};
+         clientEngine.setEnabledProtocols(clientProtocols);
+         SSLDriver clientDriver = getDriver(clientEngine, true);
+         SSLDriver serverDriver = getDriver(serverEngine, false);
+ 
+         SSLException sslException = expectThrows(SSLException.class, () -> handshake(clientDriver, serverDriver));
+-        assertEquals("Client requested protocol TLSv1 not enabled or not supported", sslException.getMessage());
+-        failedCloseAlert(serverDriver, clientDriver);
++        String oldExpected = "Client requested protocol TLSv1.1 not enabled or not supported";
++        String jdk11Expected = "Received fatal alert: protocol_version";
++        boolean expectedMessage = oldExpected.equals(sslException.getMessage()) || jdk11Expected.equals(sslException.getMessage());
++        assertTrue("Unexpected exception message: " + sslException.getMessage(), expectedMessage);
++
++        // In JDK11 we need an non-application write
++        if (serverDriver.needsNonApplicationWrite()) {
++            serverDriver.nonApplicationWrite();
++        }
++        // Prior to JDK11 we still need to send a close alert
++        if (serverDriver.isClosed() == false) {
++            failedCloseAlert(serverDriver, clientDriver);
++        }
+     }
+ 
+     public void testHandshakeFailureBecauseNoCiphers() throws Exception {
+@@ -144,11 +162,18 @@ public void testHandshakeFailureBecauseNoCiphers() throws Exception {
+         SSLDriver clientDriver = getDriver(clientEngine, true);
+         SSLDriver serverDriver = getDriver(serverEngine, false);
+ 
+-        SSLException sslException = expectThrows(SSLException.class, () -> handshake(clientDriver, serverDriver));
+-        assertEquals("no cipher suites in common", sslException.getMessage());
+-        failedCloseAlert(serverDriver, clientDriver);
++        expectThrows(SSLException.class, () -> handshake(clientDriver, serverDriver));
++        // In JDK11 we need an non-application write
++        if (serverDriver.needsNonApplicationWrite()) {
++            serverDriver.nonApplicationWrite();
++        }
++        // Prior to JDK11 we still need to send a close alert
++        if (serverDriver.isClosed() == false) {
++            failedCloseAlert(serverDriver, clientDriver);
++        }
+     }
+ 
++    @AwaitsFix(bugUrl = "https://github.com/elastic/elasticsearch/issues/32144")
+     public void testCloseDuringHandshake() throws Exception {
+         SSLContext sslContext = getSSLContext();
+         SSLDriver clientDriver = getDriver(sslContext.createSSLEngine(), true);

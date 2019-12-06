@@ -1,0 +1,149 @@
+diff --git a/APMrover2/APMrover2.cpp b/APMrover2/APMrover2.cpp
+index abee206b5292..7d6cb20fa7ee 100644
+--- a/APMrover2/APMrover2.cpp
++++ b/APMrover2/APMrover2.cpp
+@@ -57,7 +57,7 @@ const AP_Scheduler::Task Rover::scheduler_tasks[] = {
+     SCHED_TASK(update_visual_odom,     50,     50),
+     SCHED_TASK(update_wheel_encoder,   20,     50),
+     SCHED_TASK(update_compass,         10,   2000),
+-    SCHED_TASK(update_mission,         10,   1000),
++    SCHED_TASK(update_mission,         50,    500),
+     SCHED_TASK(update_logging1,        10,   1000),
+     SCHED_TASK(update_logging2,        10,   1000),
+     SCHED_TASK(gcs_retry_deferred,     50,   1000),
+diff --git a/APMrover2/mode.cpp b/APMrover2/mode.cpp
+index 38f5a3b07fa6..0bfdfa7678eb 100644
+--- a/APMrover2/mode.cpp
++++ b/APMrover2/mode.cpp
+@@ -97,8 +97,13 @@ void Mode::get_pilot_desired_steering_and_throttle(float &steering_out, float &t
+ // set desired location
+ void Mode::set_desired_location(const struct Location& destination, float next_leg_bearing_cd)
+ {
+-    // record targets
+-    _origin = rover.current_loc;
++    // set origin to last destination if waypoint controller active
++    if ((AP_HAL::millis() - last_steer_to_wp_ms < 100) && _reached_destination) {
++        _origin = _destination;
++    } else {
++        // otherwise use reasonable stopping point
++        calc_stopping_location(_origin);
++    }
+     _destination = destination;
+ 
+     // initialise distance
+@@ -108,13 +113,13 @@ void Mode::set_desired_location(const struct Location& destination, float next_l
+     // set final desired speed
+     _desired_speed_final = 0.0f;
+     if (!is_equal(next_leg_bearing_cd, MODE_NEXT_HEADING_UNKNOWN)) {
+-        // if not turning can continue at full speed
+-        if (is_zero(next_leg_bearing_cd)) {
++        const float curr_leg_bearing_cd = get_bearing_cd(_origin, _destination);
++        const float turn_angle_cd = wrap_180_cd(next_leg_bearing_cd - curr_leg_bearing_cd);
++        if (is_zero(turn_angle_cd)) {
++            // if not turning can continue at full speed
+             _desired_speed_final = _desired_speed;
+         } else {
+             // calculate maximum speed that keeps overshoot within bounds
+-            const float curr_leg_bearing_cd = get_bearing_cd(_origin, _destination);
+-            const float turn_angle_cd = wrap_180_cd(next_leg_bearing_cd - curr_leg_bearing_cd);
+             const float radius_m = fabsf(g.waypoint_overshoot / (cosf(radians(turn_angle_cd * 0.01f)) - 1.0f));
+             _desired_speed_final = MIN(_desired_speed, safe_sqrt(g.turn_max_g * GRAVITY_MSS * radius_m));
+         }
+@@ -302,6 +307,9 @@ float Mode::calc_reduced_speed_for_turn_or_distance(float desired_speed)
+ // this function updates the _yaw_error_cd value
+ void Mode::calc_steering_to_waypoint(const struct Location &origin, const struct Location &destination, bool reversed)
+ {
++    // record system time of call
++    last_steer_to_wp_ms = AP_HAL::millis();
++
+     // Calculate the required turn of the wheels
+     // negative error = left turn
+     // positive error = right turn
+@@ -351,3 +359,28 @@ void Mode::calc_steering_to_heading(float desired_heading_cd, bool reversed)
+     const float steering_out = attitude_control.get_steering_out_angle_error(yaw_error, g2.motors.have_skid_steering(), g2.motors.limit.steer_left, g2.motors.limit.steer_right, reversed);
+     g2.motors.set_steering(steering_out * 4500.0f);
+ }
++
++// calculate vehicle stopping point using current location, velocity and maximum acceleration
++void Mode::calc_stopping_location(Location& stopping_loc)
++{
++    // default stopping location
++    stopping_loc = rover.current_loc;
++
++    // get current velocity vector and speed
++    const Vector2f velocity = ahrs.groundspeed_vector();
++    const float speed = velocity.length();
++
++    // avoid divide by zero
++    if (!is_positive(speed)) {
++        stopping_loc = rover.current_loc;
++        return;
++    }
++
++    // get stopping distance in meters
++    const float stopping_dist = attitude_control.get_stopping_distance(speed);
++
++    // calculate stopping position from current location in meters
++    const Vector2f stopping_offset = velocity.normalized() * stopping_dist;
++
++    location_offset(stopping_loc, stopping_offset.x, stopping_offset.y);
++}
+diff --git a/APMrover2/mode.h b/APMrover2/mode.h
+index 9910c95753dc..ff3c5b6e9daf 100644
+--- a/APMrover2/mode.h
++++ b/APMrover2/mode.h
+@@ -136,6 +136,9 @@ class Mode
+     // relies on these internal members being updated: lateral_acceleration, _yaw_error_cd, _distance_to_destination
+     float calc_reduced_speed_for_turn_or_distance(float desired_speed);
+ 
++    // calculate vehicle stopping location using current location, velocity and maximum acceleration
++    void calc_stopping_location(Location& stopping_loc);
++
+     // references to avoid code churn:
+     class AP_AHRS &ahrs;
+     class Parameters &g;
+@@ -156,6 +159,7 @@ class Mode
+     float _desired_speed;       // desired speed in m/s
+     float _desired_speed_final; // desired speed in m/s when we reach the destination
+     float _speed_error;         // ground speed error in m/s
++    uint32_t last_steer_to_wp_ms;   // system time of last call to calc_steering_to_waypoint
+ };
+ 
+ 
+diff --git a/libraries/APM_Control/AR_AttitudeControl.cpp b/libraries/APM_Control/AR_AttitudeControl.cpp
+index 93b3d2dfc7a0..99e362294a09 100644
+--- a/libraries/APM_Control/AR_AttitudeControl.cpp
++++ b/libraries/APM_Control/AR_AttitudeControl.cpp
+@@ -461,3 +461,18 @@ float AR_AttitudeControl::get_desired_speed() const
+     }
+     return _desired_speed;
+ }
++
++// get minimum stopping distance (in meters) given a speed (in m/s)
++float AR_AttitudeControl::get_stopping_distance(float speed)
++{
++    // get maximum vehicle deceleration
++    const float accel_max = get_accel_max();
++
++    // avoid divide by zero
++    if ((accel_max <= 0.0f) || is_zero(speed)) {
++        return 0.0f;
++    }
++
++    // assume linear deceleration
++    return 0.5f * sq(speed) / accel_max;
++}
+diff --git a/libraries/APM_Control/AR_AttitudeControl.h b/libraries/APM_Control/AR_AttitudeControl.h
+index 1c862569ea66..d3e27b18be25 100644
+--- a/libraries/APM_Control/AR_AttitudeControl.h
++++ b/libraries/APM_Control/AR_AttitudeControl.h
+@@ -92,6 +92,9 @@ class AR_AttitudeControl {
+     // get latest desired speed recorded during call to get_throttle_out_speed.  For reporting purposes only
+     float get_desired_speed() const;
+ 
++    // get minimum stopping distance (in meters) given a speed (in m/s)
++    float get_stopping_distance(float speed);
++
+     // parameter var table
+     static const struct AP_Param::GroupInfo var_info[];
+ 

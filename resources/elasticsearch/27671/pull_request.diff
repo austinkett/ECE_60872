@@ -1,0 +1,177 @@
+diff --git a/core/src/main/java/org/elasticsearch/cluster/metadata/MetaDataUpdateSettingsService.java b/core/src/main/java/org/elasticsearch/cluster/metadata/MetaDataUpdateSettingsService.java
+index 2c0bc9292945..59c38be50e86 100644
+--- a/core/src/main/java/org/elasticsearch/cluster/metadata/MetaDataUpdateSettingsService.java
++++ b/core/src/main/java/org/elasticsearch/cluster/metadata/MetaDataUpdateSettingsService.java
+@@ -38,6 +38,7 @@
+ import org.elasticsearch.common.collect.Tuple;
+ import org.elasticsearch.common.component.AbstractComponent;
+ import org.elasticsearch.common.inject.Inject;
++import org.elasticsearch.common.regex.Regex;
+ import org.elasticsearch.common.settings.IndexScopedSettings;
+ import org.elasticsearch.common.settings.Setting;
+ import org.elasticsearch.common.settings.Settings;
+@@ -54,7 +55,6 @@
+ import java.util.Locale;
+ import java.util.Map;
+ import java.util.Set;
+-import java.util.function.Predicate;
+ 
+ import static org.elasticsearch.action.support.ContextPreservingActionListener.wrapPreservingContext;
+ 
+@@ -164,13 +164,16 @@ public void updateSettings(final UpdateSettingsClusterStateUpdateRequest request
+         Settings.Builder settingsForOpenIndices = Settings.builder();
+         final Set<String> skippedSettings = new HashSet<>();
+ 
+-        indexScopedSettings.validate(normalizedSettings, false); // don't validate dependencies here we check it below
+-        // never allow to change the number of shards
++        indexScopedSettings.validate(normalizedSettings.filter(s -> Regex.isSimpleMatchPattern(s) == false  /* don't validate wildcards */),
++            false); //don't validate dependencies here we check it below never allow to change the number of shards
+         for (String key : normalizedSettings.keySet()) {
+             Setting setting = indexScopedSettings.get(key);
+-            assert setting != null; // we already validated the normalized settings
++            boolean isWildcard = setting == null && Regex.isSimpleMatchPattern(key);
++            assert setting != null // we already validated the normalized settings
++                || (isWildcard && normalizedSettings.hasValue(key) == false)
++                : "unknown setting: " + key + " isWildcard: " + isWildcard + " hasValue: " + normalizedSettings.hasValue(key);
+             settingsForClosedIndices.copy(key, normalizedSettings);
+-            if (setting.isDynamic()) {
++            if (isWildcard || setting.isDynamic()) {
+                 settingsForOpenIndices.copy(key, normalizedSettings);
+             } else {
+                 skippedSettings.add(key);
+diff --git a/core/src/main/java/org/elasticsearch/common/settings/AbstractScopedSettings.java b/core/src/main/java/org/elasticsearch/common/settings/AbstractScopedSettings.java
+index 38eaef1d14df..f952eb36a0de 100644
+--- a/core/src/main/java/org/elasticsearch/common/settings/AbstractScopedSettings.java
++++ b/core/src/main/java/org/elasticsearch/common/settings/AbstractScopedSettings.java
+@@ -500,6 +500,16 @@ public boolean updateSettings(Settings toApply, Settings.Builder target, Setting
+         return updateSettings(toApply, target, updates, type, false);
+     }
+ 
++    /**
++     * Returns <code>true</code> if the given key is a valid delete key
++     */
++    private boolean isValidDelete(String key, boolean onlyDynamic) {
++        return isFinalSetting(key) == false && // it's not a final setting
++            (onlyDynamic && isDynamicSetting(key)  // it's a dynamicSetting and we only do dynamic settings
++                || get(key) == null && key.startsWith(ARCHIVED_SETTINGS_PREFIX) // the setting is not registered AND it's been archived
++                || (onlyDynamic == false && get(key) != null)); // if it's not dynamic AND we have a key
++    }
++
+     /**
+      * Updates a target settings builder with new, updated or deleted settings from a given settings builder.
+      *
+@@ -519,21 +529,16 @@ private boolean updateSettings(Settings toApply, Settings.Builder target, Settin
+         final Predicate<String> canUpdate = (key) -> (
+             isFinalSetting(key) == false && // it's not a final setting
+                 ((onlyDynamic == false && get(key) != null) || isDynamicSetting(key)));
+-        final Predicate<String> canRemove = (key) ->(// we can delete if
+-            isFinalSetting(key) == false && // it's not a final setting
+-                (onlyDynamic && isDynamicSetting(key)  // it's a dynamicSetting and we only do dynamic settings
+-                || get(key) == null && key.startsWith(ARCHIVED_SETTINGS_PREFIX) // the setting is not registered AND it's been archived
+-                || (onlyDynamic == false && get(key) != null))); // if it's not dynamic AND we have a key
+         for (String key : toApply.keySet()) {
+-            boolean isNull = toApply.get(key) == null;
+-            if (isNull && (canRemove.test(key) || key.endsWith("*"))) {
++            boolean isDelete = toApply.hasValue(key) == false;
++            if (isDelete && (isValidDelete(key, onlyDynamic) || key.endsWith("*"))) {
+                 // this either accepts null values that suffice the canUpdate test OR wildcard expressions (key ends with *)
+                 // we don't validate if there is any dynamic setting with that prefix yet we could do in the future
+                 toRemove.add(key);
+                 // we don't set changed here it's set after we apply deletes below if something actually changed
+             } else if (get(key) == null) {
+                 throw new IllegalArgumentException(type + " setting [" + key + "], not recognized");
+-            } else if (isNull == false && canUpdate.test(key)) {
++            } else if (isDelete == false && canUpdate.test(key)) {
+                 validate(key, toApply, false); // we might not have a full picture here do to a dependency validation
+                 settingsBuilder.copy(key, toApply);
+                 updates.copy(key, toApply);
+@@ -546,7 +551,7 @@ private boolean updateSettings(Settings toApply, Settings.Builder target, Settin
+                 }
+             }
+         }
+-        changed |= applyDeletes(toRemove, target, canRemove);
++        changed |= applyDeletes(toRemove, target, k -> isValidDelete(k, onlyDynamic));
+         target.put(settingsBuilder.build());
+         return changed;
+     }
+diff --git a/core/src/main/java/org/elasticsearch/common/settings/Settings.java b/core/src/main/java/org/elasticsearch/common/settings/Settings.java
+index 41acefdd8e87..3648abb78c0e 100644
+--- a/core/src/main/java/org/elasticsearch/common/settings/Settings.java
++++ b/core/src/main/java/org/elasticsearch/common/settings/Settings.java
+@@ -306,6 +306,13 @@ public Long getAsLong(String setting, Long defaultValue) {
+         }
+     }
+ 
++    /**
++     * Returns <code>true</code> iff the given key has a value in this settings object
++     */
++    public boolean hasValue(String key) {
++        return settings.get(key) != null;
++    }
++
+     /**
+      * We have to lazy initialize the deprecation logger as otherwise a static logger here would be constructed before logging is configured
+      * leading to a runtime failure (see {@link LogConfigurator#checkErrorListener()} ). The premature construction would come from any
+@@ -1229,8 +1236,9 @@ public Builder normalizePrefix(String prefix) {
+             Iterator<Map.Entry<String, Object>> iterator = map.entrySet().iterator();
+             while(iterator.hasNext()) {
+                 Map.Entry<String, Object> entry = iterator.next();
+-                if (entry.getKey().startsWith(prefix) == false) {
+-                    replacements.put(prefix + entry.getKey(), entry.getValue());
++                String key = entry.getKey();
++                if (key.startsWith(prefix) == false && key.endsWith("*") == false) {
++                    replacements.put(prefix + key, entry.getValue());
+                     iterator.remove();
+                 }
+             }
+diff --git a/core/src/test/java/org/elasticsearch/indices/settings/UpdateSettingsIT.java b/core/src/test/java/org/elasticsearch/indices/settings/UpdateSettingsIT.java
+index 7ff0725449e8..51c073c607e2 100644
+--- a/core/src/test/java/org/elasticsearch/indices/settings/UpdateSettingsIT.java
++++ b/core/src/test/java/org/elasticsearch/indices/settings/UpdateSettingsIT.java
+@@ -241,10 +241,45 @@ public void testUpdateDependentIndexSettings() {
+                 .actionGet();
+         }
+     }
++    public void testResetDefaultWithWildcard() {
++        createIndex("test");
++
++        client()
++            .admin()
++            .indices()
++            .prepareUpdateSettings("test")
++            .setSettings(
++                Settings.builder()
++                    .put("index.refresh_interval", -1))
++            .execute()
++            .actionGet();
++        IndexMetaData indexMetaData = client().admin().cluster().prepareState().execute().actionGet().getState().metaData().index("test");
++        assertEquals(indexMetaData.getSettings().get("index.refresh_interval"), "-1");
++        for (IndicesService service : internalCluster().getInstances(IndicesService.class)) {
++            IndexService indexService = service.indexService(resolveIndex("test"));
++            if (indexService != null) {
++                assertEquals(indexService.getIndexSettings().getRefreshInterval().millis(), -1);
++            }
++        }
++        client()
++            .admin()
++            .indices()
++            .prepareUpdateSettings("test")
++            .setSettings(Settings.builder().putNull("index.ref*"))
++            .execute()
++            .actionGet();
++        indexMetaData = client().admin().cluster().prepareState().execute().actionGet().getState().metaData().index("test");
++        assertNull(indexMetaData.getSettings().get("index.refresh_interval"));
++        for (IndicesService service : internalCluster().getInstances(IndicesService.class)) {
++            IndexService indexService = service.indexService(resolveIndex("test"));
++            if (indexService != null) {
++                assertEquals(indexService.getIndexSettings().getRefreshInterval().millis(), 1000);
++            }
++        }
++    }
+ 
+     public void testResetDefault() {
+         createIndex("test");
+-
+         client()
+             .admin()
+             .indices()

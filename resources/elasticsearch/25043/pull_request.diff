@@ -1,0 +1,319 @@
+diff --git a/core/src/main/java/org/elasticsearch/common/util/set/Sets.java b/core/src/main/java/org/elasticsearch/common/util/set/Sets.java
+index 4b323c42a371..f2bba5cde368 100644
+--- a/core/src/main/java/org/elasticsearch/common/util/set/Sets.java
++++ b/core/src/main/java/org/elasticsearch/common/util/set/Sets.java
+@@ -21,11 +21,19 @@
+ 
+ import java.util.Collection;
+ import java.util.Collections;
++import java.util.EnumSet;
+ import java.util.HashSet;
+ import java.util.Iterator;
+ import java.util.Objects;
+ import java.util.Set;
++import java.util.SortedSet;
++import java.util.TreeSet;
+ import java.util.concurrent.ConcurrentHashMap;
++import java.util.function.BiConsumer;
++import java.util.function.BinaryOperator;
++import java.util.function.Function;
++import java.util.function.Supplier;
++import java.util.stream.Collector;
+ import java.util.stream.Collectors;
+ 
+ public final class Sets {
+@@ -69,6 +77,47 @@ private Sets() {
+         return left.stream().filter(k -> !right.contains(k)).collect(Collectors.toSet());
+     }
+ 
++    public static <T> SortedSet<T> sortedDifference(Set<T> left, Set<T> right) {
++        Objects.requireNonNull(left);
++        Objects.requireNonNull(right);
++        return left.stream().filter(k -> !right.contains(k)).collect(new SortedSetCollector<>());
++    }
++
++    private static class SortedSetCollector<T> implements Collector<T, SortedSet<T>, SortedSet<T>> {
++
++        @Override
++        public Supplier<SortedSet<T>> supplier() {
++            return TreeSet::new;
++        }
++
++        @Override
++        public BiConsumer<SortedSet<T>, T> accumulator() {
++            return (s, e) -> s.add(e);
++        }
++
++        @Override
++        public BinaryOperator<SortedSet<T>> combiner() {
++            return (s, t) -> {
++                s.addAll(t);
++                return s;
++            };
++        }
++
++        @Override
++        public Function<SortedSet<T>, SortedSet<T>> finisher() {
++            return Function.identity();
++        }
++
++        static final Set<Characteristics> CHARACTERISTICS =
++                Collections.unmodifiableSet(EnumSet.of(Collector.Characteristics.IDENTITY_FINISH));
++
++        @Override
++        public Set<Characteristics> characteristics() {
++            return CHARACTERISTICS;
++        }
++
++    }
++
+     public static <T> Set<T> union(Set<T> left, Set<T> right) {
+         Objects.requireNonNull(left);
+         Objects.requireNonNull(right);
+diff --git a/core/src/main/java/org/elasticsearch/rest/action/admin/indices/RestGetAliasesAction.java b/core/src/main/java/org/elasticsearch/rest/action/admin/indices/RestGetAliasesAction.java
+index 5a211d63d3a5..ffb34c6b939c 100644
+--- a/core/src/main/java/org/elasticsearch/rest/action/admin/indices/RestGetAliasesAction.java
++++ b/core/src/main/java/org/elasticsearch/rest/action/admin/indices/RestGetAliasesAction.java
+@@ -19,15 +19,18 @@
+ 
+ package org.elasticsearch.rest.action.admin.indices;
+ 
++import com.carrotsearch.hppc.cursors.ObjectCursor;
+ import com.carrotsearch.hppc.cursors.ObjectObjectCursor;
+-
+ import org.elasticsearch.action.admin.indices.alias.get.GetAliasesRequest;
+ import org.elasticsearch.action.admin.indices.alias.get.GetAliasesResponse;
+ import org.elasticsearch.action.support.IndicesOptions;
+ import org.elasticsearch.client.node.NodeClient;
+ import org.elasticsearch.cluster.metadata.AliasMetaData;
+ import org.elasticsearch.common.Strings;
++import org.elasticsearch.common.collect.ImmutableOpenMap;
++import org.elasticsearch.common.regex.Regex;
+ import org.elasticsearch.common.settings.Settings;
++import org.elasticsearch.common.util.set.Sets;
+ import org.elasticsearch.common.xcontent.ToXContent;
+ import org.elasticsearch.common.xcontent.XContentBuilder;
+ import org.elasticsearch.rest.BaseRestHandler;
+@@ -39,14 +42,17 @@
+ import org.elasticsearch.rest.action.RestBuilderListener;
+ 
+ import java.io.IOException;
++import java.util.ArrayList;
+ import java.util.Arrays;
++import java.util.HashSet;
+ import java.util.List;
+ import java.util.Locale;
++import java.util.Set;
++import java.util.SortedSet;
+ import java.util.stream.Collectors;
+ 
+ import static org.elasticsearch.rest.RestRequest.Method.GET;
+ import static org.elasticsearch.rest.RestRequest.Method.HEAD;
+-import static org.elasticsearch.rest.RestStatus.OK;
+ 
+ /**
+  * The REST handler for get alias and head alias APIs.
+@@ -80,41 +86,68 @@ public RestChannelConsumer prepareRequest(final RestRequest request, final NodeC
+         return channel -> client.admin().indices().getAliases(getAliasesRequest, new RestBuilderListener<GetAliasesResponse>(channel) {
+             @Override
+             public RestResponse buildResponse(GetAliasesResponse response, XContentBuilder builder) throws Exception {
+-                if (response.getAliases().isEmpty()) {
+-                    // empty body if indices were specified but no matching aliases exist
+-                    if (indices.length > 0) {
+-                        return new BytesRestResponse(OK, builder.startObject().endObject());
++                final ImmutableOpenMap<String, List<AliasMetaData>> aliasMap = response.getAliases();
++
++                final Set<String> aliasNames = new HashSet<>();
++                for (final ObjectCursor<List<AliasMetaData>> cursor : aliasMap.values()) {
++                    for (final AliasMetaData aliasMetaData : cursor.value) {
++                        aliasNames.add(aliasMetaData.alias());
++                    }
++                }
++
++                // first remove requested aliases that are exact matches
++                final SortedSet<String> difference = Sets.sortedDifference(Arrays.stream(aliases).collect(Collectors.toSet()), aliasNames);
++
++                // now remove requested aliases that contain wildcards that are simple matches
++                final List<String> matches = new ArrayList<>();
++                outer:
++                for (final String pattern : difference) {
++                    if (pattern.contains("*")) {
++                        for (final String aliasName : aliasNames) {
++                            if (Regex.simpleMatch(pattern, aliasName)) {
++                                matches.add(pattern);
++                                continue outer;
++                            }
++                        }
++                    }
++                }
++                difference.removeAll(matches);
++
++                final RestStatus status;
++                builder.startObject();
++                {
++                    if (difference.isEmpty()) {
++                        status = RestStatus.OK;
+                     } else {
+-                        final String message = String.format(Locale.ROOT, "alias [%s] missing", toNamesString(getAliasesRequest.aliases()));
+-                        builder.startObject();
+-                        {
+-                            builder.field("error", message);
+-                            builder.field("status", RestStatus.NOT_FOUND.getStatus());
++                        status = RestStatus.NOT_FOUND;
++                        final String message;
++                        if (difference.size() == 1) {
++                            message = String.format(Locale.ROOT, "alias [%s] missing", toNamesString(difference.iterator().next()));
++                        } else {
++                            message = String.format(Locale.ROOT, "aliases [%s] missing", toNamesString(difference.toArray(new String[0])));
+                         }
+-                        builder.endObject();
+-                        return new BytesRestResponse(RestStatus.NOT_FOUND, builder);
++                        builder.field("error", message);
++                        builder.field("status", status.getStatus());
+                     }
+-                } else {
+-                    builder.startObject();
+-                    {
+-                        for (final ObjectObjectCursor<String, List<AliasMetaData>> entry : response.getAliases()) {
+-                            builder.startObject(entry.key);
++
++                    for (final ObjectObjectCursor<String, List<AliasMetaData>> entry : response.getAliases()) {
++                        builder.startObject(entry.key);
++                        {
++                            builder.startObject("aliases");
+                             {
+-                                builder.startObject("aliases");
+-                                {
+-                                    for (final AliasMetaData alias : entry.value) {
+-                                        AliasMetaData.Builder.toXContent(alias, builder, ToXContent.EMPTY_PARAMS);
+-                                    }
++                                for (final AliasMetaData alias : entry.value) {
++                                    AliasMetaData.Builder.toXContent(alias, builder, ToXContent.EMPTY_PARAMS);
+                                 }
+-                                builder.endObject();
+                             }
+                             builder.endObject();
+                         }
++                        builder.endObject();
+                     }
+-                    builder.endObject();
+-                    return new BytesRestResponse(OK, builder);
+                 }
++                builder.endObject();
++                return new BytesRestResponse(status, builder);
+             }
++
+         });
+     }
+ 
+diff --git a/modules/transport-netty4/src/test/java/org/elasticsearch/rest/Netty4HeadBodyIsEmptyIT.java b/modules/transport-netty4/src/test/java/org/elasticsearch/rest/Netty4HeadBodyIsEmptyIT.java
+index 703de568faaf..52dd23f1b449 100644
+--- a/modules/transport-netty4/src/test/java/org/elasticsearch/rest/Netty4HeadBodyIsEmptyIT.java
++++ b/modules/transport-netty4/src/test/java/org/elasticsearch/rest/Netty4HeadBodyIsEmptyIT.java
+@@ -108,6 +108,12 @@ public void testAliasExists() throws IOException {
+         }
+     }
+ 
++    public void testAliasDoesNotExist() throws IOException {
++        createTestDoc();
++        headTestCase("/_alias/test_alias", emptyMap(), NOT_FOUND.getStatus(), greaterThan(0));
++        headTestCase("/test/_alias/test_alias", emptyMap(), NOT_FOUND.getStatus(), greaterThan(0));
++    }
++
+     public void testTemplateExists() throws IOException {
+         try (XContentBuilder builder = jsonBuilder()) {
+             builder.startObject();
+diff --git a/rest-api-spec/src/main/resources/rest-api-spec/test/indices.delete_alias/10_basic.yml b/rest-api-spec/src/main/resources/rest-api-spec/test/indices.delete_alias/10_basic.yml
+index 87f61efc112b..cae598b1b81c 100644
+--- a/rest-api-spec/src/main/resources/rest-api-spec/test/indices.delete_alias/10_basic.yml
++++ b/rest-api-spec/src/main/resources/rest-api-spec/test/indices.delete_alias/10_basic.yml
+@@ -1,5 +1,8 @@
+ ---
+ "Basic test for delete alias":
++  - skip:
++      version: " - 5.99.99"
++      reason: Previous versions did not 404 on missing aliases
+ 
+   - do:
+       indices.create:
+@@ -25,8 +28,10 @@
+         name: testali
+ 
+   - do:
++      catch: missing
+       indices.get_alias:
+         index: testind
+         name:  testali
+   
+-  - match: { '': {}}
++  - match: { 'status': 404 }
++  - match: { 'error': 'alias [testali] missing' }
+diff --git a/rest-api-spec/src/main/resources/rest-api-spec/test/indices.get_alias/10_basic.yml b/rest-api-spec/src/main/resources/rest-api-spec/test/indices.get_alias/10_basic.yml
+index 3cbac46aa596..67e5c38e77b5 100644
+--- a/rest-api-spec/src/main/resources/rest-api-spec/test/indices.get_alias/10_basic.yml
++++ b/rest-api-spec/src/main/resources/rest-api-spec/test/indices.get_alias/10_basic.yml
+@@ -78,7 +78,6 @@ setup:
+ 
+ ---
+ "Get aliases via /{index}/_alias/prefix*":
+-
+   - do:
+       indices.get_alias:
+         index: test_index
+@@ -166,25 +165,51 @@ setup:
+ 
+ 
+ ---
+-"Non-existent alias on an existing index returns an empty body":
++"Non-existent alias on an existing index returns 404":
++  - skip:
++      version: " - 5.99.99"
++      reason: Previous versions did not 404 on missing aliases
+ 
+   - do:
++      catch: missing
+       indices.get_alias:
+         index: test_index
+         name: non-existent
+ 
+-  - match: { '': {}}
++  - match: { 'status': 404}
++  - match: { 'error': 'alias [non-existent] missing' }
+ 
+ ---
+-"Existent and non-existent alias returns just the existing":
++"Existent and non-existent alias returns 404 and the existing alias":
++  - skip:
++      version: " - 5.99.99"
++      reason: Previous versions did not 404 on missing aliases
+ 
+   - do:
++      catch: missing
+       indices.get_alias:
+         index: test_index
+         name: test_alias,non-existent
+ 
+-  - match: {test_index.aliases.test_alias: {}}
+-  - is_false: test_index.aliases.non-existent
++  - match: { 'status': 404 }
++  - match: { 'error': 'alias [non-existent] missing' }
++  - match: { test_index.aliases.test_alias: { } }
++
++---
++"Existent and non-existent aliases returns 404 and the existing alias":
++  - skip:
++      version: " - 5.99.99"
++      reason: Previous versions did not 404 on missing aliases
++
++  - do:
++      catch: missing
++      indices.get_alias:
++        index: test_index
++        name: test_alias,non-existent,another-non-existent
++
++  - match: { 'status': 404 }
++  - match: { 'error': 'aliases [another-non-existent,non-existent] missing' }
++  - match: { test_index.aliases.test_alias: { } }
+ 
+ ---
+ "Getting alias on an non-existent index should return 404":

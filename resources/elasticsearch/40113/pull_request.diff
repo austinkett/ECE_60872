@@ -1,0 +1,1185 @@
+diff --git a/docs/reference/sql/endpoints/jdbc.asciidoc b/docs/reference/sql/endpoints/jdbc.asciidoc
+index 051c608ea804..9b4e2fa74819 100644
+--- a/docs/reference/sql/endpoints/jdbc.asciidoc
++++ b/docs/reference/sql/endpoints/jdbc.asciidoc
+@@ -122,6 +122,10 @@ Query timeout (in seconds). That is the maximum amount of time waiting for a que
+ 
+ `proxy.socks`:: SOCKS proxy host name
+ 
++[float]
++==== Mapping
++`field.multi.value.leniency` (default `true`):: Whether to be lenient and return the first value for fields with multiple values (true) or throw an exception.
++
+ [float]
+ ==== Additional
+ 
+diff --git a/docs/reference/sql/endpoints/rest.asciidoc b/docs/reference/sql/endpoints/rest.asciidoc
+index 1f4340936268..c55b379bfffe 100644
+--- a/docs/reference/sql/endpoints/rest.asciidoc
++++ b/docs/reference/sql/endpoints/rest.asciidoc
+@@ -356,6 +356,10 @@ More information available https://docs.oracle.com/javase/8/docs/api/java/time/Z
+ |false
+ |Return the results in a columnar fashion, rather than row-based fashion. Valid for `json`, `yaml`, `cbor` and `smile`.
+ 
++|field_multi_value_leniency
++|false
++|Throw an exception when encountering multiple values for a field (default) or be lenient and return the first value from the list (without any guarantees of what that will be - typically the first in natural ascending order).
++
+ |===
+ 
+ Do note that most parameters (outside the timeout and `columnar` ones) make sense only during the initial query - any follow-up pagination request only requires the `cursor` parameter as explained in the <<sql-pagination, pagination>> chapter.
+diff --git a/docs/reference/sql/limitations.asciidoc b/docs/reference/sql/limitations.asciidoc
+index f3949a9a23ec..182f6a76bb8f 100644
+--- a/docs/reference/sql/limitations.asciidoc
++++ b/docs/reference/sql/limitations.asciidoc
+@@ -60,6 +60,8 @@ pagination taking place on the **root nested document and not on its inner hits*
+ 
+ Array fields are not supported due to the "invisible" way in which {es} handles an array of values: the mapping doesn't indicate whether
+ a field is an array (has multiple values) or not, so without reading all the data, {es-sql} cannot know whether a field is a single or multi value.
++When multiple values are returned for a field, by default, {es-sql} will throw an exception. However, it is possible to change this behavior through `field_multi_value_leniency` parameter in REST (disabled by default) or
++`field.multi.value.leniency` in drivers (enabled by default).
+ 
+ [float]
+ === Sorting by aggregation
+diff --git a/x-pack/plugin/sql/jdbc/src/main/java/org/elasticsearch/xpack/sql/jdbc/JdbcConfiguration.java b/x-pack/plugin/sql/jdbc/src/main/java/org/elasticsearch/xpack/sql/jdbc/JdbcConfiguration.java
+index c4ed3ec540ed..36df3488ff8b 100644
+--- a/x-pack/plugin/sql/jdbc/src/main/java/org/elasticsearch/xpack/sql/jdbc/JdbcConfiguration.java
++++ b/x-pack/plugin/sql/jdbc/src/main/java/org/elasticsearch/xpack/sql/jdbc/JdbcConfiguration.java
+@@ -47,20 +47,25 @@
+     // can be out/err/url
+     static final String DEBUG_OUTPUT_DEFAULT = "err";
+ 
+-    public static final String TIME_ZONE = "timezone";
++    static final String TIME_ZONE = "timezone";
+     // follow the JDBC spec and use the JVM default...
+     // to avoid inconsistency, the default is picked up once at startup and reused across connections
+     // to cater to the principle of least surprise
+     // really, the way to move forward is to specify a calendar or the timezone manually
+     static final String TIME_ZONE_DEFAULT = TimeZone.getDefault().getID();
+ 
++    static final String FIELD_MULTI_VALUE_LENIENCY = "field.multi.value.leniency";
++    static final String FIELD_MULTI_VALUE_LENIENCY_DEFAULT = "true";
++
++
+     // options that don't change at runtime
+-    private static final Set<String> OPTION_NAMES = new LinkedHashSet<>(Arrays.asList(TIME_ZONE, DEBUG, DEBUG_OUTPUT));
++    private static final Set<String> OPTION_NAMES = new LinkedHashSet<>(
++            Arrays.asList(TIME_ZONE, FIELD_MULTI_VALUE_LENIENCY, DEBUG, DEBUG_OUTPUT));
+ 
+     static {
+         // trigger version initialization
+         // typically this should have already happened but in case the
+-        // JdbcDriver/JdbcDataSource are not used and the impl. classes used directly
++        // EsDriver/EsDataSource are not used and the impl. classes used directly
+         // this covers that case
+         Version.CURRENT.toString();
+     }
+@@ -71,6 +76,7 @@
+ 
+     // mutable ones
+     private ZoneId zoneId;
++    private boolean fieldMultiValueLeniency;
+ 
+     public static JdbcConfiguration create(String u, Properties props, int loginTimeoutSeconds) throws JdbcSQLException {
+         URI uri = parseUrl(u);
+@@ -151,6 +157,8 @@ private JdbcConfiguration(URI baseURI, String u, Properties props) throws JdbcSQ
+ 
+         this.zoneId = parseValue(TIME_ZONE, props.getProperty(TIME_ZONE, TIME_ZONE_DEFAULT),
+                 s -> TimeZone.getTimeZone(s).toZoneId().normalized());
++        this.fieldMultiValueLeniency = parseValue(FIELD_MULTI_VALUE_LENIENCY,
++                props.getProperty(FIELD_MULTI_VALUE_LENIENCY, FIELD_MULTI_VALUE_LENIENCY_DEFAULT), Boolean::parseBoolean);
+     }
+ 
+     @Override
+@@ -174,6 +182,10 @@ public TimeZone timeZone() {
+         return zoneId != null ? TimeZone.getTimeZone(zoneId) : null;
+     }
+ 
++    public boolean fieldMultiValueLeniency() {
++        return fieldMultiValueLeniency;
++    }
++
+     public static boolean canAccept(String url) {
+         return (StringUtils.hasText(url) && url.trim().startsWith(JdbcConfiguration.URL_PREFIX));
+     }
+diff --git a/x-pack/plugin/sql/jdbc/src/main/java/org/elasticsearch/xpack/sql/jdbc/JdbcHttpClient.java b/x-pack/plugin/sql/jdbc/src/main/java/org/elasticsearch/xpack/sql/jdbc/JdbcHttpClient.java
+index 6f4e7ace2665..b059b83970dd 100644
+--- a/x-pack/plugin/sql/jdbc/src/main/java/org/elasticsearch/xpack/sql/jdbc/JdbcHttpClient.java
++++ b/x-pack/plugin/sql/jdbc/src/main/java/org/elasticsearch/xpack/sql/jdbc/JdbcHttpClient.java
+@@ -49,10 +49,15 @@ boolean ping(long timeoutInMs) throws SQLException {
+ 
+     Cursor query(String sql, List<SqlTypedParamValue> params, RequestMeta meta) throws SQLException {
+         int fetch = meta.fetchSize() > 0 ? meta.fetchSize() : conCfg.pageSize();
+-                SqlQueryRequest sqlRequest = new SqlQueryRequest(sql, params, null, conCfg.zoneId(),
++        SqlQueryRequest sqlRequest = new SqlQueryRequest(sql, params, conCfg.zoneId(),
+                 fetch,
+-                TimeValue.timeValueMillis(meta.timeoutInMs()), TimeValue.timeValueMillis(meta.queryTimeoutInMs()),
+-                false, new RequestInfo(Mode.JDBC));
++                TimeValue.timeValueMillis(meta.timeoutInMs()),
++                TimeValue.timeValueMillis(meta.queryTimeoutInMs()),
++                null,
++                Boolean.FALSE,
++                null,
++                new RequestInfo(Mode.JDBC),
++                conCfg.fieldMultiValueLeniency());
+         SqlQueryResponse response = httpClient.query(sqlRequest);
+         return new DefaultCursor(this, response.cursor(), toJdbcColumnInfo(response.columns()), response.rows(), meta);
+     }
+diff --git a/x-pack/plugin/sql/qa/src/main/java/org/elasticsearch/xpack/sql/qa/jdbc/JdbcIntegrationTestCase.java b/x-pack/plugin/sql/qa/src/main/java/org/elasticsearch/xpack/sql/qa/jdbc/JdbcIntegrationTestCase.java
+index c2b2f258504f..5a5ac373cd4e 100644
+--- a/x-pack/plugin/sql/qa/src/main/java/org/elasticsearch/xpack/sql/qa/jdbc/JdbcIntegrationTestCase.java
++++ b/x-pack/plugin/sql/qa/src/main/java/org/elasticsearch/xpack/sql/qa/jdbc/JdbcIntegrationTestCase.java
+@@ -50,9 +50,33 @@ public static String elasticsearchAddress() {
+     }
+ 
+     public Connection esJdbc() throws SQLException {
+-        return randomBoolean() ? useDriverManager() : useDataSource();
++        return esJdbc(connectionProperties());
+     }
+ 
++    public Connection esJdbc(Properties props) throws SQLException {
++        return createConnection(props);
++    }
++
++    protected Connection createConnection(Properties connectionProperties) throws SQLException {
++        String elasticsearchAddress = getProtocol() + "://" + elasticsearchAddress();
++        String address = "jdbc:es://" + elasticsearchAddress;
++        Connection connection = null;
++        if (randomBoolean()) {
++            connection = DriverManager.getConnection(address, connectionProperties);
++        } else {
++            EsDataSource dataSource = new EsDataSource();
++            dataSource.setUrl(address);
++            dataSource.setProperties(connectionProperties);
++            connection = dataSource.getConnection();
++        }
++
++        assertNotNull("The timezone should be specified", connectionProperties.getProperty("timezone"));
++        return connection;
++    }
++
++    //
++    // methods below are used inside the documentation only
++    //
+     protected Connection useDriverManager() throws SQLException {
+         String elasticsearchAddress = getProtocol() + "://" + elasticsearchAddress();
+         // tag::connect-dm
+@@ -114,6 +138,8 @@ protected String clusterName() {
+     protected Properties connectionProperties() {
+         Properties connectionProperties = new Properties();
+         connectionProperties.put("timezone", randomKnownTimeZone());
++        // in the tests, don't be lenient towards multi values
++        connectionProperties.put("field.multi.value.leniency", "false");
+         return connectionProperties;
+     }
+ 
+diff --git a/x-pack/plugin/sql/qa/src/main/java/org/elasticsearch/xpack/sql/qa/jdbc/ResultSetTestCase.java b/x-pack/plugin/sql/qa/src/main/java/org/elasticsearch/xpack/sql/qa/jdbc/ResultSetTestCase.java
+index 99947e4d6f0a..670a9238c364 100644
+--- a/x-pack/plugin/sql/qa/src/main/java/org/elasticsearch/xpack/sql/qa/jdbc/ResultSetTestCase.java
++++ b/x-pack/plugin/sql/qa/src/main/java/org/elasticsearch/xpack/sql/qa/jdbc/ResultSetTestCase.java
+@@ -9,11 +9,11 @@
+ import org.elasticsearch.common.CheckedBiFunction;
+ import org.elasticsearch.common.CheckedConsumer;
+ import org.elasticsearch.common.CheckedFunction;
++import org.elasticsearch.common.CheckedSupplier;
+ import org.elasticsearch.common.Strings;
+ import org.elasticsearch.common.collect.Tuple;
+ import org.elasticsearch.common.xcontent.XContentBuilder;
+ import org.elasticsearch.common.xcontent.json.JsonXContent;
+-import org.elasticsearch.xpack.sql.jdbc.EsDataSource;
+ import org.elasticsearch.xpack.sql.jdbc.EsType;
+ 
+ import java.io.IOException;
+@@ -22,7 +22,6 @@
+ import java.sql.Blob;
+ import java.sql.Clob;
+ import java.sql.Connection;
+-import java.sql.DriverManager;
+ import java.sql.NClob;
+ import java.sql.PreparedStatement;
+ import java.sql.ResultSet;
+@@ -80,6 +79,34 @@
+         dateTimeTestingFields.put(new Tuple<String, Object>("test_keyword", "true"), EsType.KEYWORD);
+     }
+     
++    public void testMultiValueFieldWithMultiValueLeniencyEnabled() throws Exception {
++        createTestDataForMultiValueTests();
++
++        doWithQuery(() -> esWithLeniency(true), "SELECT int, keyword FROM test", (results) -> {
++            results.next();
++            Object number = results.getObject(1);
++            Object string = results.getObject(2);
++            assertEquals(-10, number);
++            assertEquals("-10", string);
++            assertFalse(results.next());
++        });
++    }
++
++    public void testMultiValueFieldWithMultiValueLeniencyDisabled() throws Exception {
++        createTestDataForMultiValueTests();
++
++        SQLException expected = expectThrows(SQLException.class,
++                () -> doWithQuery(() -> esWithLeniency(false), "SELECT int, keyword FROM test", (results) -> {
++        }));
++        assertTrue(expected.getMessage().contains("Arrays (returned by [int]) are not supported"));
++        
++        // default has multi value disabled
++        expected = expectThrows(SQLException.class,
++                () -> doWithQuery(() -> esJdbc(), "SELECT int, keyword FROM test", (results) -> {
++        }));
++
++    }
++
+     // Byte values testing
+     public void testGettingValidByteWithoutCasting() throws Exception {
+         byte random1 = randomByte();
+@@ -1132,7 +1159,7 @@ public void testValidGetObjectCalls() throws Exception {
+     /*
+      * Checks StackOverflowError fix for https://github.com/elastic/elasticsearch/pull/31735
+      */
+-    public void testNoInfiniteRecursiveGetObjectCalls() throws SQLException, IOException {
++    public void testNoInfiniteRecursiveGetObjectCalls() throws Exception {
+         index("library", "1", builder -> {
+             builder.field("name", "Don Quixote");
+             builder.field("page_count", 1072);
+@@ -1303,17 +1330,16 @@ public void testUnsupportedUpdateMethods() throws IOException, SQLException {
+     }
+     
+     private void doWithQuery(String query, CheckedConsumer<ResultSet, SQLException> consumer) throws SQLException {
+-        try (Connection connection = esJdbc()) {
+-            try (PreparedStatement statement = connection.prepareStatement(query)) {
+-                try (ResultSet results = statement.executeQuery()) {
+-                    consumer.accept(results);
+-                }
+-            }
+-        }
++        doWithQuery(() -> esJdbc(), query, consumer);
+     }
+     
+     private void doWithQueryAndTimezone(String query, String tz, CheckedConsumer<ResultSet, SQLException> consumer) throws SQLException {
+-        try (Connection connection = esJdbc(tz)) {
++        doWithQuery(() -> esJdbc(tz), query, consumer);
++    }
++    
++    private void doWithQuery(CheckedSupplier<Connection, SQLException> con, String query, CheckedConsumer<ResultSet, SQLException> consumer)
++            throws SQLException {
++        try (Connection connection = con.get()) {
+             try (PreparedStatement statement = connection.prepareStatement(query)) {
+                 try (ResultSet results = statement.executeQuery()) {
+                     consumer.accept(results);
+@@ -1355,7 +1381,29 @@ protected static void updateMapping(String index, CheckedConsumer<XContentBuilde
+         client().performRequest(request);
+     }
+ 
+-    private void createTestDataForByteValueTests(byte random1, byte random2, byte random3) throws Exception, IOException {
++    private void createTestDataForMultiValueTests() throws Exception {
++        createIndex("test");
++        updateMapping("test", builder -> {
++            builder.startObject("int").field("type", "integer").endObject();
++            builder.startObject("keyword").field("type", "keyword").endObject();
++        });
++
++        Integer[] values = randomArray(3, 15, s -> new Integer[s], () -> Integer.valueOf(randomInt(50)));
++        // add the minimal value in the middle yet the test will pick it up since the results are sorted
++        values[2] = Integer.valueOf(-10);
++
++        String[] stringValues = new String[values.length];
++        for (int i = 0; i < values.length; i++) {
++            stringValues[i] = String.valueOf(values[i]);
++        }
++
++        index("test", "1", builder -> {
++            builder.array("int", (Object[]) values);
++            builder.array("keyword", stringValues);
++        });
++    }
++
++    private void createTestDataForByteValueTests(byte random1, byte random2, byte random3) throws Exception {
+         createIndex("test");
+         updateMapping("test", builder -> {
+             builder.startObject("test_byte").field("type", "byte").endObject();
+@@ -1373,7 +1421,7 @@ private void createTestDataForByteValueTests(byte random1, byte random2, byte ra
+         });
+     }
+ 
+-    private void createTestDataForShortValueTests(short random1, short random2, short random3) throws Exception, IOException {
++    private void createTestDataForShortValueTests(short random1, short random2, short random3) throws Exception {
+         createIndex("test");
+         updateMapping("test", builder -> {
+             builder.startObject("test_short").field("type", "short").endObject();
+@@ -1391,7 +1439,7 @@ private void createTestDataForShortValueTests(short random1, short random2, shor
+         });
+     }
+ 
+-    private void createTestDataForIntegerValueTests(int random1, int random2, int random3) throws Exception, IOException {
++    private void createTestDataForIntegerValueTests(int random1, int random2, int random3) throws Exception {
+         createIndex("test");
+         updateMapping("test", builder -> {
+             builder.startObject("test_integer").field("type", "integer").endObject();
+@@ -1409,7 +1457,7 @@ private void createTestDataForIntegerValueTests(int random1, int random2, int ra
+         });
+     }
+ 
+-    private void createTestDataForLongValueTests(long random1, long random2, long random3) throws Exception, IOException {
++    private void createTestDataForLongValueTests(long random1, long random2, long random3) throws Exception {
+         createIndex("test");
+         updateMapping("test", builder -> {
+             builder.startObject("test_long").field("type", "long").endObject();
+@@ -1427,7 +1475,7 @@ private void createTestDataForLongValueTests(long random1, long random2, long ra
+         });
+     }
+ 
+-    private void createTestDataForDoubleValueTests(double random1, double random2, double random3) throws Exception, IOException {
++    private void createTestDataForDoubleValueTests(double random1, double random2, double random3) throws Exception {
+         createIndex("test");
+         updateMapping("test", builder -> {
+             builder.startObject("test_double").field("type", "double").endObject();
+@@ -1445,7 +1493,7 @@ private void createTestDataForDoubleValueTests(double random1, double random2, d
+         });
+     }
+ 
+-    private void createTestDataForFloatValueTests(float random1, float random2, float random3) throws Exception, IOException {
++    private void createTestDataForFloatValueTests(float random1, float random2, float random3) throws Exception {
+         createIndex("test");
+         updateMapping("test", builder -> {
+             builder.startObject("test_float").field("type", "float").endObject();
+@@ -1481,7 +1529,7 @@ private void indexSimpleDocumentWithTrueValues(Long randomLongDate) throws IOExc
+      * Creates test data for all numeric get* methods. All values random and different from the other numeric fields already generated.
+      * It returns a map containing the field name and its randomly generated value to be later used in checking the returned values.
+      */
+-    private Map<String,Number> createTestDataForNumericValueTypes(Supplier<Number> randomGenerator) throws Exception, IOException {
++    private Map<String, Number> createTestDataForNumericValueTypes(Supplier<Number> randomGenerator) throws Exception {
+         Map<String,Number> map = new HashMap<>();
+         createIndex("test");
+         updateMappingForNumericValuesTests("test");
+@@ -1575,31 +1623,19 @@ private Double getMaxLongPlusOne() {
+     }
+ 
+     private Connection esJdbc(String timeZoneId) throws SQLException {
+-        return randomBoolean() ? useDriverManager(timeZoneId) : useDataSource(timeZoneId);
+-    }
+-
+-    private Connection useDriverManager(String timeZoneId) throws SQLException {
+-        String elasticsearchAddress = getProtocol() + "://" + elasticsearchAddress();
+-        String address = "jdbc:es://" + elasticsearchAddress;
+         Properties connectionProperties = connectionProperties();
+         connectionProperties.put(JDBC_TIMEZONE, timeZoneId);
+-        Connection connection = DriverManager.getConnection(address, connectionProperties);
+-        
++        Connection connection = esJdbc(connectionProperties);
+         assertNotNull("The timezone should be specified", connectionProperties.getProperty(JDBC_TIMEZONE));
+         return connection;
+     }
+ 
+-    private Connection useDataSource(String timeZoneId) throws SQLException {
+-        String elasticsearchAddress = getProtocol() + "://" + elasticsearchAddress();
+-        EsDataSource dataSource = new EsDataSource();
+-        String address = "jdbc:es://" + elasticsearchAddress;
+-        dataSource.setUrl(address);
++    private Connection esWithLeniency(boolean multiValueLeniency) throws SQLException {
++        String property = "field.multi.value.leniency";
+         Properties connectionProperties = connectionProperties();
+-        connectionProperties.put(JDBC_TIMEZONE, timeZoneId);
+-        dataSource.setProperties(connectionProperties);
+-        Connection connection = dataSource.getConnection();
+-        
+-        assertNotNull("The timezone should be specified", connectionProperties.getProperty(JDBC_TIMEZONE));
++        connectionProperties.setProperty(property, Boolean.toString(multiValueLeniency));
++        Connection connection = esJdbc(connectionProperties);
++        assertNotNull("The leniency should be specified", connectionProperties.getProperty(property));
+         return connection;
+     }
+ }
+diff --git a/x-pack/plugin/sql/sql-action/src/main/java/org/elasticsearch/xpack/sql/action/AbstractSqlQueryRequest.java b/x-pack/plugin/sql/sql-action/src/main/java/org/elasticsearch/xpack/sql/action/AbstractSqlQueryRequest.java
+index aaa8c56323d5..50a1ac239711 100644
+--- a/x-pack/plugin/sql/sql-action/src/main/java/org/elasticsearch/xpack/sql/action/AbstractSqlQueryRequest.java
++++ b/x-pack/plugin/sql/sql-action/src/main/java/org/elasticsearch/xpack/sql/action/AbstractSqlQueryRequest.java
+@@ -57,7 +57,7 @@ public AbstractSqlQueryRequest() {
+     }
+ 
+     public AbstractSqlQueryRequest(String query, List<SqlTypedParamValue> params, QueryBuilder filter, ZoneId zoneId,
+-                                   int fetchSize, TimeValue requestTimeout, TimeValue pageTimeout, RequestInfo requestInfo) {
++            int fetchSize, TimeValue requestTimeout, TimeValue pageTimeout, RequestInfo requestInfo) {
+         super(requestInfo);
+         this.query = query;
+         this.params = params;
+diff --git a/x-pack/plugin/sql/sql-action/src/main/java/org/elasticsearch/xpack/sql/action/SqlQueryRequest.java b/x-pack/plugin/sql/sql-action/src/main/java/org/elasticsearch/xpack/sql/action/SqlQueryRequest.java
+index 7eddd7496ccb..77f4a4994ed8 100644
+--- a/x-pack/plugin/sql/sql-action/src/main/java/org/elasticsearch/xpack/sql/action/SqlQueryRequest.java
++++ b/x-pack/plugin/sql/sql-action/src/main/java/org/elasticsearch/xpack/sql/action/SqlQueryRequest.java
+@@ -15,6 +15,7 @@
+ import org.elasticsearch.common.xcontent.XContentBuilder;
+ import org.elasticsearch.common.xcontent.XContentParser;
+ import org.elasticsearch.index.query.QueryBuilder;
++import org.elasticsearch.xpack.sql.proto.Protocol;
+ import org.elasticsearch.xpack.sql.proto.RequestInfo;
+ import org.elasticsearch.xpack.sql.proto.SqlTypedParamValue;
+ 
+@@ -31,10 +32,13 @@
+ public class SqlQueryRequest extends AbstractSqlQueryRequest {
+     private static final ObjectParser<SqlQueryRequest, Void> PARSER = objectParser(SqlQueryRequest::new);
+     static final ParseField COLUMNAR = new ParseField("columnar");
++    static final ParseField FIELD_MULTI_VALUE_LENIENCY = new ParseField("field_multi_value_leniency");
++
+ 
+     static {
+         PARSER.declareString(SqlQueryRequest::cursor, CURSOR);
+         PARSER.declareBoolean(SqlQueryRequest::columnar, COLUMNAR);
++        PARSER.declareBoolean(SqlQueryRequest::fieldMultiValueLeniency, FIELD_MULTI_VALUE_LENIENCY);
+     }
+ 
+     private String cursor = "";
+@@ -43,6 +47,7 @@
+      * See {@code SqlTranslateRequest.toXContent}
+      */
+     private Boolean columnar = Boolean.FALSE;
++    private boolean fieldMultiValueLeniency = Protocol.FIELD_MULTI_VALUE_LENIENCY;
+ 
+     public SqlQueryRequest() {
+         super();
+@@ -50,10 +55,11 @@ public SqlQueryRequest() {
+ 
+     public SqlQueryRequest(String query, List<SqlTypedParamValue> params, QueryBuilder filter, ZoneId zoneId,
+                            int fetchSize, TimeValue requestTimeout, TimeValue pageTimeout, Boolean columnar,
+-                           String cursor, RequestInfo requestInfo) {
++                           String cursor, RequestInfo requestInfo, boolean fieldMultiValueLeniency) {
+         super(query, params, filter, zoneId, fetchSize, requestTimeout, pageTimeout, requestInfo);
+         this.cursor = cursor;
+         this.columnar = columnar;
++        this.fieldMultiValueLeniency = fieldMultiValueLeniency;
+     }
+ 
+     @Override
+@@ -99,10 +105,21 @@ public SqlQueryRequest columnar(boolean columnar) {
+         return this;
+     }
+ 
++
++    public SqlQueryRequest fieldMultiValueLeniency(boolean leniency) {
++        this.fieldMultiValueLeniency = leniency;
++        return this;
++    }
++
++    public boolean fieldMultiValueLeniency() {
++        return fieldMultiValueLeniency;
++    }
++
+     public SqlQueryRequest(StreamInput in) throws IOException {
+         super(in);
+         cursor = in.readString();
+         columnar = in.readOptionalBoolean();
++        fieldMultiValueLeniency = in.readBoolean();
+     }
+ 
+     @Override
+@@ -110,6 +127,7 @@ public void writeTo(StreamOutput out) throws IOException {
+         super.writeTo(out);
+         out.writeString(cursor);
+         out.writeOptionalBoolean(columnar);
++        out.writeBoolean(fieldMultiValueLeniency);
+     }
+ 
+     @Override
+@@ -119,9 +137,10 @@ public int hashCode() {
+ 
+     @Override
+     public boolean equals(Object obj) {
+-        return super.equals(obj) 
++        return super.equals(obj)
+                 && Objects.equals(cursor, ((SqlQueryRequest) obj).cursor)
+-                && Objects.equals(columnar, ((SqlQueryRequest) obj).columnar);
++                && Objects.equals(columnar, ((SqlQueryRequest) obj).columnar)
++                && fieldMultiValueLeniency == ((SqlQueryRequest) obj).fieldMultiValueLeniency;
+     }
+ 
+     @Override
+@@ -133,7 +152,8 @@ public String getDescription() {
+     public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
+         // This is needed just to test round-trip compatibility with proto.SqlQueryRequest
+         return new org.elasticsearch.xpack.sql.proto.SqlQueryRequest(query(), params(), zoneId(), fetchSize(), requestTimeout(),
+-            pageTimeout(), filter(), columnar(), cursor(), requestInfo()).toXContent(builder, params);
++            pageTimeout(), filter(), columnar(), cursor(), requestInfo(), fieldMultiValueLeniency())
++                .toXContent(builder, params);
+     }
+ 
+     public static SqlQueryRequest fromXContent(XContentParser parser) {
+diff --git a/x-pack/plugin/sql/sql-action/src/main/java/org/elasticsearch/xpack/sql/action/SqlQueryRequestBuilder.java b/x-pack/plugin/sql/sql-action/src/main/java/org/elasticsearch/xpack/sql/action/SqlQueryRequestBuilder.java
+index acd3d860371e..71f2774def97 100644
+--- a/x-pack/plugin/sql/sql-action/src/main/java/org/elasticsearch/xpack/sql/action/SqlQueryRequestBuilder.java
++++ b/x-pack/plugin/sql/sql-action/src/main/java/org/elasticsearch/xpack/sql/action/SqlQueryRequestBuilder.java
+@@ -25,14 +25,15 @@
+ 
+     public SqlQueryRequestBuilder(ElasticsearchClient client, SqlQueryAction action) {
+         this(client, action, "", Collections.emptyList(), null, Protocol.TIME_ZONE, Protocol.FETCH_SIZE, Protocol.REQUEST_TIMEOUT,
+-            Protocol.PAGE_TIMEOUT, false, "", new RequestInfo(Mode.PLAIN));
++            Protocol.PAGE_TIMEOUT, false, "", new RequestInfo(Mode.PLAIN), Protocol.FIELD_MULTI_VALUE_LENIENCY);
+     }
+ 
+     public SqlQueryRequestBuilder(ElasticsearchClient client, SqlQueryAction action, String query, List<SqlTypedParamValue> params,
+             QueryBuilder filter, ZoneId zoneId, int fetchSize, TimeValue requestTimeout,
+-            TimeValue pageTimeout, boolean columnar, String nextPageInfo, RequestInfo requestInfo) {
++            TimeValue pageTimeout, boolean columnar, String nextPageInfo, RequestInfo requestInfo,
++            boolean multiValueFieldLeniency) {
+         super(client, action, new SqlQueryRequest(query, params, filter, zoneId, fetchSize, requestTimeout, pageTimeout, columnar,
+-                nextPageInfo, requestInfo));
++                nextPageInfo, requestInfo, multiValueFieldLeniency));
+     }
+ 
+     public SqlQueryRequestBuilder query(String query) {
+@@ -84,4 +85,9 @@ public SqlQueryRequestBuilder fetchSize(int fetchSize) {
+         request.fetchSize(fetchSize);
+         return this;
+     }
++
++    public SqlQueryRequestBuilder multiValueFieldLeniency(boolean lenient) {
++        request.fieldMultiValueLeniency(lenient);
++        return this;
++    }
+ }
+\ No newline at end of file
+diff --git a/x-pack/plugin/sql/sql-action/src/main/java/org/elasticsearch/xpack/sql/action/SqlTranslateRequest.java b/x-pack/plugin/sql/sql-action/src/main/java/org/elasticsearch/xpack/sql/action/SqlTranslateRequest.java
+index 537b40480704..009d0823d7c8 100644
+--- a/x-pack/plugin/sql/sql-action/src/main/java/org/elasticsearch/xpack/sql/action/SqlTranslateRequest.java
++++ b/x-pack/plugin/sql/sql-action/src/main/java/org/elasticsearch/xpack/sql/action/SqlTranslateRequest.java
+@@ -64,8 +64,12 @@ public static SqlTranslateRequest fromXContent(XContentParser parser) {
+     @Override
+     public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
+         // This is needed just to test parsing of SqlTranslateRequest, so we can reuse SqlQuerySerialization
+-        return new SqlQueryRequest(query(), params(), zoneId(), fetchSize(), requestTimeout(),
+-            pageTimeout(), filter(), null, null, requestInfo()).toXContent(builder, params);
++        return new SqlQueryRequest(query(), params(), zoneId(), fetchSize(), requestTimeout(), pageTimeout(), 
++            filter(), 
++            null, 
++            null, 
++            requestInfo(),
++            false).toXContent(builder, params);
+ 
+     }
+ }
+diff --git a/x-pack/plugin/sql/sql-action/src/test/java/org/elasticsearch/xpack/sql/action/SqlQueryRequestTests.java b/x-pack/plugin/sql/sql-action/src/test/java/org/elasticsearch/xpack/sql/action/SqlQueryRequestTests.java
+index f935d1d0d754..ce33f9a42e90 100644
+--- a/x-pack/plugin/sql/sql-action/src/test/java/org/elasticsearch/xpack/sql/action/SqlQueryRequestTests.java
++++ b/x-pack/plugin/sql/sql-action/src/test/java/org/elasticsearch/xpack/sql/action/SqlQueryRequestTests.java
+@@ -55,7 +55,8 @@ protected NamedXContentRegistry xContentRegistry() {
+     protected SqlQueryRequest createTestInstance() {
+         return new SqlQueryRequest(randomAlphaOfLength(10), randomParameters(), SqlTestUtils.randomFilterOrNull(random()),
+                 randomZone(), between(1, Integer.MAX_VALUE), randomTV(),
+-                randomTV(), randomBoolean(), randomAlphaOfLength(10), requestInfo
++                randomTV(), randomBoolean(), randomAlphaOfLength(10), requestInfo,
++                randomBoolean()
+         );
+     }
+     
+@@ -114,7 +115,7 @@ protected SqlQueryRequest mutateInstance(SqlQueryRequest instance) {
+         );
+         SqlQueryRequest newRequest = new SqlQueryRequest(instance.query(), instance.params(), instance.filter(),
+                 instance.zoneId(), instance.fetchSize(), instance.requestTimeout(), instance.pageTimeout(), instance.columnar(),
+-                instance.cursor(), instance.requestInfo());
++                instance.cursor(), instance.requestInfo(), instance.fieldMultiValueLeniency());
+         mutator.accept(newRequest);
+         return newRequest;
+     }
+diff --git a/x-pack/plugin/sql/sql-cli/src/main/java/org/elasticsearch/xpack/sql/cli/command/ServerQueryCliCommand.java b/x-pack/plugin/sql/sql-cli/src/main/java/org/elasticsearch/xpack/sql/cli/command/ServerQueryCliCommand.java
+index 86b5cf6c36ef..7a8faa397bc5 100644
+--- a/x-pack/plugin/sql/sql-cli/src/main/java/org/elasticsearch/xpack/sql/cli/command/ServerQueryCliCommand.java
++++ b/x-pack/plugin/sql/sql-cli/src/main/java/org/elasticsearch/xpack/sql/cli/command/ServerQueryCliCommand.java
+@@ -25,7 +25,7 @@ protected boolean doHandle(CliTerminal terminal, CliSession cliSession, String l
+         BasicFormatter formatter;
+         String data;
+         try {
+-            response = cliClient.queryInit(line, cliSession.getFetchSize());
++            response = cliClient.basicQuery(line, cliSession.getFetchSize());
+             formatter = new BasicFormatter(response.columns(), response.rows(), CLI);
+             data = formatter.formatWithHeader(response.columns(), response.rows());
+             while (true) {
+diff --git a/x-pack/plugin/sql/sql-cli/src/test/java/org/elasticsearch/xpack/sql/cli/command/ServerQueryCliCommandTests.java b/x-pack/plugin/sql/sql-cli/src/test/java/org/elasticsearch/xpack/sql/cli/command/ServerQueryCliCommandTests.java
+index 9d4ded4a39c1..feb1242fb8f3 100644
+--- a/x-pack/plugin/sql/sql-cli/src/test/java/org/elasticsearch/xpack/sql/cli/command/ServerQueryCliCommandTests.java
++++ b/x-pack/plugin/sql/sql-cli/src/test/java/org/elasticsearch/xpack/sql/cli/command/ServerQueryCliCommandTests.java
+@@ -31,11 +31,11 @@ public void testExceptionHandling() throws Exception {
+         TestTerminal testTerminal = new TestTerminal();
+         HttpClient client = mock(HttpClient.class);
+         CliSession cliSession = new CliSession(client);
+-        when(client.queryInit("blah", 1000)).thenThrow(new SQLException("test exception"));
++        when(client.basicQuery("blah", 1000)).thenThrow(new SQLException("test exception"));
+         ServerQueryCliCommand cliCommand = new ServerQueryCliCommand();
+         assertTrue(cliCommand.handle(testTerminal, cliSession, "blah"));
+         assertEquals("<b>Bad request [</b><i>test exception</i><b>]</b>\n", testTerminal.toString());
+-        verify(client, times(1)).queryInit(eq("blah"), eq(1000));
++        verify(client, times(1)).basicQuery(eq("blah"), eq(1000));
+         verifyNoMoreInteractions(client);
+     }
+ 
+@@ -44,11 +44,11 @@ public void testOnePageQuery() throws Exception {
+         HttpClient client = mock(HttpClient.class);
+         CliSession cliSession = new CliSession(client);
+         cliSession.setFetchSize(10);
+-        when(client.queryInit("test query", 10)).thenReturn(fakeResponse("", true, "foo"));
++        when(client.basicQuery("test query", 10)).thenReturn(fakeResponse("", true, "foo"));
+         ServerQueryCliCommand cliCommand = new ServerQueryCliCommand();
+         assertTrue(cliCommand.handle(testTerminal, cliSession, "test query"));
+         assertEquals("     field     \n---------------\nfoo            \n<flush/>", testTerminal.toString());
+-        verify(client, times(1)).queryInit(eq("test query"), eq(10));
++        verify(client, times(1)).basicQuery(eq("test query"), eq(10));
+         verifyNoMoreInteractions(client);
+     }
+ 
+@@ -57,14 +57,14 @@ public void testThreePageQuery() throws Exception {
+         HttpClient client = mock(HttpClient.class);
+         CliSession cliSession = new CliSession(client);
+         cliSession.setFetchSize(10);
+-        when(client.queryInit("test query", 10)).thenReturn(fakeResponse("my_cursor1", true, "first"));
++        when(client.basicQuery("test query", 10)).thenReturn(fakeResponse("my_cursor1", true, "first"));
+         when(client.nextPage("my_cursor1")).thenReturn(fakeResponse("my_cursor2", false, "second"));
+         when(client.nextPage("my_cursor2")).thenReturn(fakeResponse("", false, "third"));
+         ServerQueryCliCommand cliCommand = new ServerQueryCliCommand();
+         assertTrue(cliCommand.handle(testTerminal, cliSession, "test query"));
+         assertEquals("     field     \n---------------\nfirst          \nsecond         \nthird          \n<flush/>",
+                 testTerminal.toString());
+-        verify(client, times(1)).queryInit(eq("test query"), eq(10));
++        verify(client, times(1)).basicQuery(eq("test query"), eq(10));
+         verify(client, times(2)).nextPage(any());
+         verifyNoMoreInteractions(client);
+     }
+@@ -76,13 +76,13 @@ public void testTwoPageQueryWithSeparator() throws Exception {
+         cliSession.setFetchSize(15);
+         // Set a separator
+         cliSession.setFetchSeparator("-----");
+-        when(client.queryInit("test query", 15)).thenReturn(fakeResponse("my_cursor1", true, "first"));
++        when(client.basicQuery("test query", 15)).thenReturn(fakeResponse("my_cursor1", true, "first"));
+         when(client.nextPage("my_cursor1")).thenReturn(fakeResponse("", false, "second"));
+         ServerQueryCliCommand cliCommand = new ServerQueryCliCommand();
+         assertTrue(cliCommand.handle(testTerminal, cliSession, "test query"));
+         assertEquals("     field     \n---------------\nfirst          \n-----\nsecond         \n<flush/>",
+                 testTerminal.toString());
+-        verify(client, times(1)).queryInit(eq("test query"), eq(15));
++        verify(client, times(1)).basicQuery(eq("test query"), eq(15));
+         verify(client, times(1)).nextPage(any());
+         verifyNoMoreInteractions(client);
+     }
+@@ -92,14 +92,14 @@ public void testCursorCleanupOnError() throws Exception {
+         HttpClient client = mock(HttpClient.class);
+         CliSession cliSession = new CliSession(client);
+         cliSession.setFetchSize(15);
+-        when(client.queryInit("test query", 15)).thenReturn(fakeResponse("my_cursor1", true, "first"));
++        when(client.basicQuery("test query", 15)).thenReturn(fakeResponse("my_cursor1", true, "first"));
+         when(client.nextPage("my_cursor1")).thenThrow(new SQLException("test exception"));
+         when(client.queryClose("my_cursor1", Mode.CLI)).thenReturn(true);
+         ServerQueryCliCommand cliCommand = new ServerQueryCliCommand();
+         assertTrue(cliCommand.handle(testTerminal, cliSession, "test query"));
+         assertEquals("     field     \n---------------\nfirst          \n" +
+                 "<b>Bad request [</b><i>test exception</i><b>]</b>\n", testTerminal.toString());
+-        verify(client, times(1)).queryInit(eq("test query"), eq(15));
++        verify(client, times(1)).basicQuery(eq("test query"), eq(15));
+         verify(client, times(1)).nextPage(any());
+         verify(client, times(1)).queryClose(eq("my_cursor1"), eq(Mode.CLI));
+         verifyNoMoreInteractions(client);
+diff --git a/x-pack/plugin/sql/sql-client/src/main/java/org/elasticsearch/xpack/sql/client/HttpClient.java b/x-pack/plugin/sql/sql-client/src/main/java/org/elasticsearch/xpack/sql/client/HttpClient.java
+index 7798111da744..24dfcf76ef11 100644
+--- a/x-pack/plugin/sql/sql-client/src/main/java/org/elasticsearch/xpack/sql/client/HttpClient.java
++++ b/x-pack/plugin/sql/sql-client/src/main/java/org/elasticsearch/xpack/sql/client/HttpClient.java
+@@ -32,7 +32,6 @@
+ import java.security.AccessController;
+ import java.security.PrivilegedAction;
+ import java.sql.SQLException;
+-import java.time.ZoneId;
+ import java.util.Collections;
+ import java.util.function.Function;
+ 
+@@ -61,12 +60,18 @@ public MainResponse serverInfo() throws SQLException {
+         return get("/", MainResponse::fromXContent);
+     }
+ 
+-    public SqlQueryResponse queryInit(String query, int fetchSize) throws SQLException {
++    public SqlQueryResponse basicQuery(String query, int fetchSize) throws SQLException {
+         // TODO allow customizing the time zone - this is what session set/reset/get should be about
+         // method called only from CLI
+-        SqlQueryRequest sqlRequest = new SqlQueryRequest(query, Collections.emptyList(), null, ZoneId.of("Z"),
+-            fetchSize, TimeValue.timeValueMillis(cfg.queryTimeout()), TimeValue.timeValueMillis(cfg.pageTimeout()),
+-            false, new RequestInfo(Mode.CLI));
++        SqlQueryRequest sqlRequest = new SqlQueryRequest(query, Collections.emptyList(), Protocol.TIME_ZONE,
++                fetchSize, 
++                TimeValue.timeValueMillis(cfg.queryTimeout()), 
++                TimeValue.timeValueMillis(cfg.pageTimeout()),
++                null,
++                Boolean.FALSE,
++                null,
++                new RequestInfo(Mode.CLI),
++                false);
+         return query(sqlRequest);
+     }
+ 
+diff --git a/x-pack/plugin/sql/sql-proto/src/main/java/org/elasticsearch/xpack/sql/proto/Protocol.java b/x-pack/plugin/sql/sql-proto/src/main/java/org/elasticsearch/xpack/sql/proto/Protocol.java
+index a6af79e0fbae..13471afe2212 100644
+--- a/x-pack/plugin/sql/sql-proto/src/main/java/org/elasticsearch/xpack/sql/proto/Protocol.java
++++ b/x-pack/plugin/sql/sql-proto/src/main/java/org/elasticsearch/xpack/sql/proto/Protocol.java
+@@ -22,6 +22,7 @@
+     public static final int FETCH_SIZE = 1000;
+     public static final TimeValue REQUEST_TIMEOUT = TimeValue.timeValueSeconds(90);
+     public static final TimeValue PAGE_TIMEOUT = TimeValue.timeValueSeconds(45);
++    public static final boolean FIELD_MULTI_VALUE_LENIENCY = false;
+ 
+     /**
+      * SQL-related endpoints
+diff --git a/x-pack/plugin/sql/sql-proto/src/main/java/org/elasticsearch/xpack/sql/proto/SqlQueryRequest.java b/x-pack/plugin/sql/sql-proto/src/main/java/org/elasticsearch/xpack/sql/proto/SqlQueryRequest.java
+index 46f60d15072e..ec027a55a936 100644
+--- a/x-pack/plugin/sql/sql-proto/src/main/java/org/elasticsearch/xpack/sql/proto/SqlQueryRequest.java
++++ b/x-pack/plugin/sql/sql-proto/src/main/java/org/elasticsearch/xpack/sql/proto/SqlQueryRequest.java
+@@ -32,11 +32,13 @@
+     private final ToXContent filter;
+     private final Boolean columnar;
+     private final List<SqlTypedParamValue> params;
++    private final boolean fieldMultiValueLeniency;
+ 
+ 
+     public SqlQueryRequest(String query, List<SqlTypedParamValue> params, ZoneId zoneId, int fetchSize,
+                            TimeValue requestTimeout, TimeValue pageTimeout, ToXContent filter, Boolean columnar,
+-                           String cursor, RequestInfo requestInfo) {
++                           String cursor, RequestInfo requestInfo,
++                           boolean fieldMultiValueLeniency) {
+         super(requestInfo);
+         this.query = query;
+         this.params = params;
+@@ -47,16 +49,12 @@ public SqlQueryRequest(String query, List<SqlTypedParamValue> params, ZoneId zon
+         this.filter = filter;
+         this.columnar = columnar;
+         this.cursor = cursor;
+-    }
+-
+-    public SqlQueryRequest(String query, List<SqlTypedParamValue> params, ToXContent filter, ZoneId zoneId,
+-                           int fetchSize, TimeValue requestTimeout, TimeValue pageTimeout, boolean columnar, RequestInfo requestInfo) {
+-        this(query, params, zoneId, fetchSize, requestTimeout, pageTimeout, filter, columnar, null, requestInfo);
++        this.fieldMultiValueLeniency = fieldMultiValueLeniency;
+     }
+ 
+     public SqlQueryRequest(String cursor, TimeValue requestTimeout, TimeValue pageTimeout, RequestInfo requestInfo) {
+         this("", Collections.emptyList(), Protocol.TIME_ZONE, Protocol.FETCH_SIZE, requestTimeout, pageTimeout,
+-             null, false, cursor, requestInfo);
++             null, false, cursor, requestInfo, Protocol.FIELD_MULTI_VALUE_LENIENCY);
+     }
+ 
+     /**
+@@ -125,6 +123,10 @@ public Boolean columnar() {
+         return columnar;
+     }
+ 
++    public boolean fieldMultiValueLeniency() {
++        return fieldMultiValueLeniency;
++    }
++    
+     @Override
+     public boolean equals(Object o) {
+         if (this == o) {
+@@ -145,12 +147,14 @@ public boolean equals(Object o) {
+             Objects.equals(pageTimeout, that.pageTimeout) &&
+             Objects.equals(filter, that.filter) &&
+             Objects.equals(columnar,  that.columnar) &&
+-            Objects.equals(cursor, that.cursor);
++            Objects.equals(cursor, that.cursor) &&
++            fieldMultiValueLeniency == that.fieldMultiValueLeniency;
+     }
+ 
+     @Override
+     public int hashCode() {
+-        return Objects.hash(super.hashCode(), query, zoneId, fetchSize, requestTimeout, pageTimeout, filter, columnar, cursor);
++        return Objects.hash(super.hashCode(), query, zoneId, fetchSize, requestTimeout, pageTimeout,
++                filter, columnar, cursor, fieldMultiValueLeniency);
+     }
+ 
+     @Override
+@@ -188,6 +192,9 @@ public XContentBuilder toXContent(XContentBuilder builder, Params params) throws
+         if (columnar != null) {
+             builder.field("columnar", columnar);
+         }
++        if (fieldMultiValueLeniency) {
++            builder.field("field_multi_value_leniency", fieldMultiValueLeniency);
++        }
+         if (cursor != null) {
+             builder.field("cursor", cursor);
+         }
+diff --git a/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/execution/search/Querier.java b/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/execution/search/Querier.java
+index 4975910b1b28..d75c9f228c1c 100644
+--- a/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/execution/search/Querier.java
++++ b/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/execution/search/Querier.java
+@@ -118,13 +118,13 @@ public void query(List<Attribute> output, QueryContainer query, String index, Ac
+ 
+         if (query.isAggsOnly()) {
+             if (query.aggs().useImplicitGroupBy()) {
+-                l = new ImplicitGroupActionListener(listener, client, timeout, output, query, search);
++                l = new ImplicitGroupActionListener(listener, client, cfg, output, query, search);
+             } else {
+-                l = new CompositeActionListener(listener, client, timeout, output, query, search);
++                l = new CompositeActionListener(listener, client, cfg, output, query, search);
+             }
+         } else {
+             search.scroll(keepAlive);
+-            l = new ScrollActionListener(listener, client, timeout, output, query);
++            l = new ScrollActionListener(listener, client, cfg, output, query);
+         }
+ 
+         client.search(search, l);
+@@ -309,9 +309,9 @@ public Aggregations getAggregations() {
+             }
+         });
+ 
+-        ImplicitGroupActionListener(ActionListener<SchemaRowSet> listener, Client client, TimeValue keepAlive, List<Attribute> output,
++        ImplicitGroupActionListener(ActionListener<SchemaRowSet> listener, Client client, Configuration cfg, List<Attribute> output,
+                 QueryContainer query, SearchRequest request) {
+-            super(listener, client, keepAlive, output, query, request);
++            super(listener, client, cfg, output, query, request);
+         }
+ 
+         @Override
+@@ -360,9 +360,9 @@ private void handleBuckets(List<? extends Bucket> buckets, SearchResponse respon
+      */
+     static class CompositeActionListener extends BaseAggActionListener {
+ 
+-        CompositeActionListener(ActionListener<SchemaRowSet> listener, Client client, TimeValue keepAlive,
++        CompositeActionListener(ActionListener<SchemaRowSet> listener, Client client, Configuration cfg,
+                 List<Attribute> output, QueryContainer query, SearchRequest request) {
+-            super(listener, client, keepAlive, output, query, request);
++            super(listener, client, cfg, output, query, request);
+         }
+ 
+ 
+@@ -404,9 +404,9 @@ protected void handleResponse(SearchResponse response, ActionListener<SchemaRowS
+         final SearchRequest request;
+         final BitSet mask;
+ 
+-        BaseAggActionListener(ActionListener<SchemaRowSet> listener, Client client, TimeValue keepAlive, List<Attribute> output,
++        BaseAggActionListener(ActionListener<SchemaRowSet> listener, Client client, Configuration cfg, List<Attribute> output,
+                 QueryContainer query, SearchRequest request) {
+-            super(listener, client, keepAlive, output);
++            super(listener, client, cfg, output);
+ 
+             this.query = query;
+             this.request = request;
+@@ -467,12 +467,14 @@ private BucketExtractor createExtractor(FieldExtraction ref, BucketExtractor tot
+     static class ScrollActionListener extends BaseActionListener {
+         private final QueryContainer query;
+         private final BitSet mask;
++        private final boolean multiValueFieldLeniency;
+ 
+-        ScrollActionListener(ActionListener<SchemaRowSet> listener, Client client, TimeValue keepAlive,
++        ScrollActionListener(ActionListener<SchemaRowSet> listener, Client client, Configuration cfg,
+                 List<Attribute> output, QueryContainer query) {
+-            super(listener, client, keepAlive, output);
++            super(listener, client, cfg, output);
+             this.query = query;
+             this.mask = query.columnMask(output);
++            this.multiValueFieldLeniency = cfg.multiValueFieldLeniency();
+         }
+ 
+         @Override
+@@ -516,12 +518,12 @@ protected void handleResponse(SearchResponse response, ActionListener<SchemaRowS
+         private HitExtractor createExtractor(FieldExtraction ref) {
+             if (ref instanceof SearchHitFieldRef) {
+                 SearchHitFieldRef f = (SearchHitFieldRef) ref;
+-                return new FieldHitExtractor(f.name(), f.getDataType(), f.useDocValue(), f.hitName());
++                return new FieldHitExtractor(f.name(), f.getDataType(), f.useDocValue(), f.hitName(), multiValueFieldLeniency);
+             }
+ 
+             if (ref instanceof ScriptFieldRef) {
+                 ScriptFieldRef f = (ScriptFieldRef) ref;
+-                return new FieldHitExtractor(f.name(), null, true);
++                return new FieldHitExtractor(f.name(), null, true, multiValueFieldLeniency);
+             }
+ 
+             if (ref instanceof ComputedRef) {
+@@ -558,14 +560,16 @@ private HitExtractor createExtractor(FieldExtraction ref) {
+         final ActionListener<SchemaRowSet> listener;
+ 
+         final Client client;
++        final Configuration cfg;
+         final TimeValue keepAlive;
+         final Schema schema;
+ 
+-        BaseActionListener(ActionListener<SchemaRowSet> listener, Client client, TimeValue keepAlive, List<Attribute> output) {
++        BaseActionListener(ActionListener<SchemaRowSet> listener, Client client, Configuration cfg, List<Attribute> output) {
+             this.listener = listener;
+ 
+             this.client = client;
+-            this.keepAlive = keepAlive;
++            this.cfg = cfg;
++            this.keepAlive = cfg.requestTimeout();
+             this.schema = Rows.schema(output);
+         }
+ 
+diff --git a/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/execution/search/extractor/FieldHitExtractor.java b/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/execution/search/extractor/FieldHitExtractor.java
+index eba70df3a3c5..7905074dc108 100644
+--- a/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/execution/search/extractor/FieldHitExtractor.java
++++ b/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/execution/search/extractor/FieldHitExtractor.java
+@@ -29,8 +29,6 @@
+  */
+ public class FieldHitExtractor implements HitExtractor {
+ 
+-    private static final boolean ARRAYS_LENIENCY = false;
+-
+     /**
+      * Stands for {@code field}. We try to use short names for {@link HitExtractor}s
+      * to save a few bytes when when we send them back to the user.
+@@ -48,16 +46,22 @@
+     private final String fieldName, hitName;
+     private final DataType dataType;
+     private final boolean useDocValue;
++    private final boolean arrayLeniency;
+     private final String[] path;
+ 
+     public FieldHitExtractor(String name, DataType dataType, boolean useDocValue) {
+-        this(name, dataType, useDocValue, null);
++        this(name, dataType, useDocValue, null, false);
++    }
++
++    public FieldHitExtractor(String name, DataType dataType, boolean useDocValue, boolean arrayLeniency) {
++        this(name, dataType, useDocValue, null, arrayLeniency);
+     }
+ 
+-    public FieldHitExtractor(String name, DataType dataType, boolean useDocValue, String hitName) {
++    public FieldHitExtractor(String name, DataType dataType, boolean useDocValue, String hitName, boolean arrayLeniency) {
+         this.fieldName = name;
+         this.dataType = dataType;
+         this.useDocValue = useDocValue;
++        this.arrayLeniency = arrayLeniency;
+         this.hitName = hitName;
+ 
+         if (hitName != null) {
+@@ -75,6 +79,7 @@ public FieldHitExtractor(String name, DataType dataType, boolean useDocValue, St
+         dataType = esType != null ? DataType.fromTypeName(esType) : null;
+         useDocValue = in.readBoolean();
+         hitName = in.readOptionalString();
++        arrayLeniency = in.readBoolean();
+         path = sourcePath(fieldName, useDocValue, hitName);
+     }
+ 
+@@ -89,6 +94,7 @@ public void writeTo(StreamOutput out) throws IOException {
+         out.writeOptionalString(dataType == null ? null : dataType.typeName);
+         out.writeBoolean(useDocValue);
+         out.writeOptionalString(hitName);
++        out.writeBoolean(arrayLeniency);
+     }
+ 
+     @Override
+@@ -117,7 +123,7 @@ private Object unwrapMultiValue(Object values) {
+             if (list.isEmpty()) {
+                 return null;
+             } else {
+-                if (ARRAYS_LENIENCY || list.size() == 1) {
++                if (arrayLeniency || list.size() == 1) {
+                     return unwrapMultiValue(list.get(0));
+                 } else {
+                     throw new SqlIllegalArgumentException("Arrays (returned by [{}]) are not supported", fieldName);
+@@ -222,11 +228,12 @@ public boolean equals(Object obj) {
+         FieldHitExtractor other = (FieldHitExtractor) obj;
+         return fieldName.equals(other.fieldName)
+                 && hitName.equals(other.hitName)
+-                && useDocValue == other.useDocValue;
++                && useDocValue == other.useDocValue
++                && arrayLeniency == other.arrayLeniency;
+     }
+ 
+     @Override
+     public int hashCode() {
+-        return Objects.hash(fieldName, useDocValue, hitName);
++        return Objects.hash(fieldName, useDocValue, hitName, arrayLeniency);
+     }
+ }
+diff --git a/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/plugin/TransportSqlClearCursorAction.java b/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/plugin/TransportSqlClearCursorAction.java
+index 8bfe08e07847..d0c67f193b71 100644
+--- a/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/plugin/TransportSqlClearCursorAction.java
++++ b/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/plugin/TransportSqlClearCursorAction.java
+@@ -47,7 +47,7 @@ public static void operation(PlanExecutor planExecutor, SqlClearCursorRequest re
+         Cursor cursor = Cursors.decodeFromString(request.getCursor());
+         planExecutor.cleanCursor(
+                 new Configuration(DateUtils.UTC, Protocol.FETCH_SIZE, Protocol.REQUEST_TIMEOUT, Protocol.PAGE_TIMEOUT, null,
+-                        request.mode(), StringUtils.EMPTY, StringUtils.EMPTY, StringUtils.EMPTY),
++                        request.mode(), StringUtils.EMPTY, StringUtils.EMPTY, StringUtils.EMPTY, Protocol.FIELD_MULTI_VALUE_LENIENCY),
+                 cursor, ActionListener.wrap(
+                 success -> listener.onResponse(new SqlClearCursorResponse(success)), listener::onFailure));
+     }
+diff --git a/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/plugin/TransportSqlQueryAction.java b/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/plugin/TransportSqlQueryAction.java
+index e875bb37e9d9..44695f950224 100644
+--- a/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/plugin/TransportSqlQueryAction.java
++++ b/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/plugin/TransportSqlQueryAction.java
+@@ -72,7 +72,7 @@ public static void operation(PlanExecutor planExecutor, SqlQueryRequest request,
+         // The configuration is always created however when dealing with the next page, only the timeouts are relevant
+         // the rest having default values (since the query is already created)
+         Configuration cfg = new Configuration(request.zoneId(), request.fetchSize(), request.requestTimeout(), request.pageTimeout(),
+-                request.filter(), request.mode(), request.clientId(), username, clusterName);
++                request.filter(), request.mode(), request.clientId(), username, clusterName, request.fieldMultiValueLeniency());
+ 
+         if (Strings.hasText(request.cursor()) == false) {
+             planExecutor.sql(cfg, request.query(), request.params(),
+diff --git a/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/plugin/TransportSqlTranslateAction.java b/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/plugin/TransportSqlTranslateAction.java
+index 0bda71911158..0b9132df2902 100644
+--- a/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/plugin/TransportSqlTranslateAction.java
++++ b/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/plugin/TransportSqlTranslateAction.java
+@@ -21,6 +21,7 @@
+ import org.elasticsearch.xpack.sql.action.SqlTranslateRequest;
+ import org.elasticsearch.xpack.sql.action.SqlTranslateResponse;
+ import org.elasticsearch.xpack.sql.execution.PlanExecutor;
++import org.elasticsearch.xpack.sql.proto.Protocol;
+ import org.elasticsearch.xpack.sql.session.Configuration;
+ 
+ import static org.elasticsearch.xpack.sql.plugin.Transports.clusterName;
+@@ -53,9 +54,9 @@ protected void doExecute(Task task, SqlTranslateRequest request, ActionListener<
+         sqlLicenseChecker.checkIfSqlAllowed(request.mode());
+ 
+         Configuration cfg = new Configuration(request.zoneId(), request.fetchSize(),
+-                request.requestTimeout(), request.pageTimeout(), request.filter(), 
++                request.requestTimeout(), request.pageTimeout(), request.filter(),
+                 request.mode(), request.clientId(),
+-                username(securityContext), clusterName(clusterService));
++                username(securityContext), clusterName(clusterService), Protocol.FIELD_MULTI_VALUE_LENIENCY);
+ 
+         planExecutor.searchSource(cfg, request.query(), request.params(), ActionListener.wrap(
+                 searchSourceBuilder -> listener.onResponse(new SqlTranslateResponse(searchSourceBuilder)), listener::onFailure));
+diff --git a/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/session/Configuration.java b/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/session/Configuration.java
+index e386cbb3b320..d03ac08305e3 100644
+--- a/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/session/Configuration.java
++++ b/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/session/Configuration.java
+@@ -23,6 +23,7 @@
+     private final String clientId;
+     private final String username;
+     private final String clusterName;
++    private final boolean multiValueFieldLeniency;
+     private final ZonedDateTime now;
+ 
+     @Nullable
+@@ -30,7 +31,8 @@
+ 
+     public Configuration(ZoneId zi, int pageSize, TimeValue requestTimeout, TimeValue pageTimeout, QueryBuilder filter,
+                          Mode mode, String clientId,
+-                         String username, String clusterName) {
++                         String username, String clusterName,
++                         boolean multiValueFieldLeniency) {
+         this.zoneId = zi.normalized();
+         this.pageSize = pageSize;
+         this.requestTimeout = requestTimeout;
+@@ -40,6 +42,7 @@ public Configuration(ZoneId zi, int pageSize, TimeValue requestTimeout, TimeValu
+         this.clientId = clientId;
+         this.username = username;
+         this.clusterName = clusterName;
++        this.multiValueFieldLeniency = multiValueFieldLeniency;
+         this.now = ZonedDateTime.now(zoneId);
+     }
+ 
+@@ -77,8 +80,12 @@ public String username() {
+     public String clusterName() {
+         return clusterName;
+     }
+-
++    
+     public ZonedDateTime now() {
+         return now;
+     }
++    
++    public boolean multiValueFieldLeniency() {
++        return multiValueFieldLeniency;
++    }
+ }
+\ No newline at end of file
+diff --git a/x-pack/plugin/sql/src/test/java/org/elasticsearch/xpack/sql/TestUtils.java b/x-pack/plugin/sql/src/test/java/org/elasticsearch/xpack/sql/TestUtils.java
+index 835e8d4db189..afec8063edab 100644
+--- a/x-pack/plugin/sql/src/test/java/org/elasticsearch/xpack/sql/TestUtils.java
++++ b/x-pack/plugin/sql/src/test/java/org/elasticsearch/xpack/sql/TestUtils.java
+@@ -27,7 +27,7 @@ private TestUtils() {}
+ 
+     public static final Configuration TEST_CFG = new Configuration(DateUtils.UTC, Protocol.FETCH_SIZE,
+             Protocol.REQUEST_TIMEOUT, Protocol.PAGE_TIMEOUT, null, Mode.PLAIN,
+-            null, null, null);
++            null, null, null, false);
+ 
+     public static Configuration randomConfiguration() {
+         return new Configuration(randomZone(),
+@@ -38,7 +38,8 @@ public static Configuration randomConfiguration() {
+                 randomFrom(Mode.values()),
+                 randomAlphaOfLength(10),
+                 randomAlphaOfLength(10),
+-                randomAlphaOfLength(10));
++                randomAlphaOfLength(10),
++                false);
+     }
+ 
+     public static Configuration randomConfiguration(ZoneId providedZoneId) {
+@@ -50,7 +51,8 @@ public static Configuration randomConfiguration(ZoneId providedZoneId) {
+                 randomFrom(Mode.values()),
+                 randomAlphaOfLength(10),
+                 randomAlphaOfLength(10),
+-                randomAlphaOfLength(10));
++                randomAlphaOfLength(10),
++                false);
+     }
+ 
+ }
+diff --git a/x-pack/plugin/sql/src/test/java/org/elasticsearch/xpack/sql/execution/search/extractor/FieldHitExtractorTests.java b/x-pack/plugin/sql/src/test/java/org/elasticsearch/xpack/sql/execution/search/extractor/FieldHitExtractorTests.java
+index 25333848c246..55de64c84cd6 100644
+--- a/x-pack/plugin/sql/src/test/java/org/elasticsearch/xpack/sql/execution/search/extractor/FieldHitExtractorTests.java
++++ b/x-pack/plugin/sql/src/test/java/org/elasticsearch/xpack/sql/execution/search/extractor/FieldHitExtractorTests.java
+@@ -36,7 +36,7 @@
+     public static FieldHitExtractor randomFieldHitExtractor() {
+         String hitName = randomAlphaOfLength(5);
+         String name = randomAlphaOfLength(5) + "." + hitName;
+-        return new FieldHitExtractor(name, null, randomBoolean(), hitName);
++        return new FieldHitExtractor(name, null, randomBoolean(), hitName, false);
+     }
+ 
+     @Override
+@@ -51,7 +51,7 @@ protected FieldHitExtractor createTestInstance() {
+ 
+     @Override
+     protected FieldHitExtractor mutateInstance(FieldHitExtractor instance) {
+-        return new FieldHitExtractor(instance.fieldName() + "mutated", null, true, instance.hitName());
++        return new FieldHitExtractor(instance.fieldName() + "mutated", null, true, instance.hitName(), false);
+     }
+ 
+     public void testGetDottedValueWithDocValues() {
+@@ -174,7 +174,7 @@ public void testGetSource() throws IOException {
+     }
+ 
+     public void testToString() {
+-        assertEquals("hit.field@hit", new FieldHitExtractor("hit.field", null, true, "hit").toString());
++        assertEquals("hit.field@hit", new FieldHitExtractor("hit.field", null, true, "hit", false).toString());
+     }
+ 
+     public void testMultiValuedDocValue() {
+@@ -240,6 +240,14 @@ public void testMultiValuedSource() {
+         assertThat(ex.getMessage(), is("Arrays (returned by [a]) are not supported"));
+     }
+ 
++    public void testMultiValuedSourceAllowed() {
++        FieldHitExtractor fe = new FieldHitExtractor("a", null, false, true);
++        Object valueA = randomValue();
++        Object valueB = randomValue();
++        Map<String, Object> map = singletonMap("a", asList(valueA, valueB));
++        assertEquals(valueA, fe.extractFromSource(map));
++    }
++
+     public void testFieldWithDots() {
+         FieldHitExtractor fe = new FieldHitExtractor("a.b", null, false);
+         Object value = randomValue();
+diff --git a/x-pack/plugin/sql/src/test/java/org/elasticsearch/xpack/sql/expression/function/scalar/DatabaseFunctionTests.java b/x-pack/plugin/sql/src/test/java/org/elasticsearch/xpack/sql/expression/function/scalar/DatabaseFunctionTests.java
+index 86e4baf9fdc0..6581781c7007 100644
+--- a/x-pack/plugin/sql/src/test/java/org/elasticsearch/xpack/sql/expression/function/scalar/DatabaseFunctionTests.java
++++ b/x-pack/plugin/sql/src/test/java/org/elasticsearch/xpack/sql/expression/function/scalar/DatabaseFunctionTests.java
+@@ -31,7 +31,7 @@ public void testDatabaseFunctionOutput() {
+                 new Configuration(DateUtils.UTC, Protocol.FETCH_SIZE, Protocol.REQUEST_TIMEOUT,
+                                   Protocol.PAGE_TIMEOUT, null, 
+                                   randomFrom(Mode.values()), randomAlphaOfLength(10),
+-                                  null, clusterName),
++                                  null, clusterName, randomBoolean()),
+                 new FunctionRegistry(),
+                 IndexResolution.valid(test),
+                 new Verifier(new Metrics())
+diff --git a/x-pack/plugin/sql/src/test/java/org/elasticsearch/xpack/sql/expression/function/scalar/UserFunctionTests.java b/x-pack/plugin/sql/src/test/java/org/elasticsearch/xpack/sql/expression/function/scalar/UserFunctionTests.java
+index f4f48cb73504..190bc273d7a5 100644
+--- a/x-pack/plugin/sql/src/test/java/org/elasticsearch/xpack/sql/expression/function/scalar/UserFunctionTests.java
++++ b/x-pack/plugin/sql/src/test/java/org/elasticsearch/xpack/sql/expression/function/scalar/UserFunctionTests.java
+@@ -30,7 +30,7 @@ public void testNoUsernameFunctionOutput() {
+                 new Configuration(DateUtils.UTC, Protocol.FETCH_SIZE, Protocol.REQUEST_TIMEOUT,
+                                   Protocol.PAGE_TIMEOUT, null, 
+                                   randomFrom(Mode.values()), randomAlphaOfLength(10), 
+-                                  null, randomAlphaOfLengthBetween(1, 15)),
++                                  null, randomAlphaOfLengthBetween(1, 15), randomBoolean()),
+                 new FunctionRegistry(),
+                 IndexResolution.valid(test),
+                 new Verifier(new Metrics())

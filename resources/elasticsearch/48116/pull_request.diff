@@ -1,0 +1,129 @@
+diff --git a/x-pack/plugin/data-frame/src/main/java/org/elasticsearch/xpack/dataframe/transforms/DataFrameTransformPersistentTasksExecutor.java b/x-pack/plugin/data-frame/src/main/java/org/elasticsearch/xpack/dataframe/transforms/DataFrameTransformPersistentTasksExecutor.java
+index 6c13da4a1b0d..f0a3fc798833 100644
+--- a/x-pack/plugin/data-frame/src/main/java/org/elasticsearch/xpack/dataframe/transforms/DataFrameTransformPersistentTasksExecutor.java
++++ b/x-pack/plugin/data-frame/src/main/java/org/elasticsearch/xpack/dataframe/transforms/DataFrameTransformPersistentTasksExecutor.java
+@@ -10,6 +10,7 @@
+ import org.apache.logging.log4j.Logger;
+ import org.apache.lucene.util.SetOnce;
+ import org.elasticsearch.ResourceNotFoundException;
++import org.elasticsearch.Version;
+ import org.elasticsearch.action.ActionListener;
+ import org.elasticsearch.action.LatchedActionListener;
+ import org.elasticsearch.action.support.IndicesOptions;
+@@ -96,8 +97,18 @@ public DataFrameTransformPersistentTasksExecutor(Client client,
+             logger.debug(reason);
+             return new PersistentTasksCustomMetaData.Assignment(null, reason);
+         }
++
++        // see gh#48019 disable assignment if any node is using 7.2 or 7.3
++        if (clusterState.getNodes().getMinNodeVersion().before(Version.V_7_4_0)) {
++            String reason = "Not starting transform [" + params.getId() + "], " +
++                "because cluster contains nodes with version older than 7.4.0";
++            logger.debug(reason);
++            return new PersistentTasksCustomMetaData.Assignment(null, reason);
++        }
++
+         DiscoveryNode discoveryNode = selectLeastLoadedNode(clusterState, (node) ->
+-            node.isDataNode() && node.getVersion().onOrAfter(params.getVersion())
++            node.isDataNode() &&
++            node.getVersion().onOrAfter(params.getVersion())
+         );
+         return discoveryNode == null ? NO_NODE_FOUND : new PersistentTasksCustomMetaData.Assignment(discoveryNode.getId(), "");
+     }
+diff --git a/x-pack/plugin/data-frame/src/test/java/org/elasticsearch/xpack/dataframe/transforms/DataFrameTransformPersistentTasksExecutorTests.java b/x-pack/plugin/data-frame/src/test/java/org/elasticsearch/xpack/dataframe/transforms/DataFrameTransformPersistentTasksExecutorTests.java
+index 40ef9feffb0d..702a1d584190 100644
+--- a/x-pack/plugin/data-frame/src/test/java/org/elasticsearch/xpack/dataframe/transforms/DataFrameTransformPersistentTasksExecutorTests.java
++++ b/x-pack/plugin/data-frame/src/test/java/org/elasticsearch/xpack/dataframe/transforms/DataFrameTransformPersistentTasksExecutorTests.java
+@@ -76,7 +76,7 @@ public void testNodeVersionAssignment() {
+                 buildNewFakeTransportAddress(),
+                 Collections.emptyMap(),
+                 new HashSet<>(Arrays.asList(DiscoveryNodeRole.DATA_ROLE, DiscoveryNodeRole.MASTER_ROLE)),
+-                Version.V_7_2_0))
++                Version.V_7_4_0))
+             .add(new DiscoveryNode("current-data-node-with-2-tasks",
+                 buildNewFakeTransportAddress(),
+                 Collections.emptyMap(),
+@@ -123,6 +123,83 @@ public void testNodeVersionAssignment() {
+             equalTo("past-data-node-1"));
+     }
+ 
++    public void testDoNotSelectOldNodes() {
++        MetaData.Builder metaData = MetaData.builder();
++        RoutingTable.Builder routingTable = RoutingTable.builder();
++        addIndices(metaData, routingTable);
++        PersistentTasksCustomMetaData.Builder pTasksBuilder = PersistentTasksCustomMetaData.builder()
++            .addTask("transform-task-1",
++                DataFrameTransform.NAME,
++                new DataFrameTransform("transform-task-1", Version.CURRENT, null),
++                new PersistentTasksCustomMetaData.Assignment("current-data-node-with-1-task", ""));
++
++        PersistentTasksCustomMetaData pTasks = pTasksBuilder.build();
++
++        metaData.putCustom(PersistentTasksCustomMetaData.TYPE, pTasks);
++
++        DiscoveryNodes.Builder nodes = DiscoveryNodes.builder()
++            .add(new DiscoveryNode("old-data-node-1",
++                buildNewFakeTransportAddress(),
++                Collections.emptyMap(),
++                new HashSet<>(Arrays.asList(DiscoveryNodeRole.DATA_ROLE, DiscoveryNodeRole.MASTER_ROLE)),
++                Version.V_7_2_0))
++            .add(new DiscoveryNode("current-data-node-with-1-task",
++                buildNewFakeTransportAddress(),
++                Collections.emptyMap(),
++                new HashSet<>(Arrays.asList(DiscoveryNodeRole.DATA_ROLE, DiscoveryNodeRole.MASTER_ROLE)),
++                Version.CURRENT))
++            .add(new DiscoveryNode("non-data-node-1",
++                buildNewFakeTransportAddress(),
++                Collections.emptyMap(),
++                Collections.singleton(DiscoveryNodeRole.MASTER_ROLE),
++                Version.CURRENT));
++
++        ClusterState.Builder csBuilder = ClusterState.builder(new ClusterName("_name"))
++            .nodes(nodes);
++        csBuilder.routingTable(routingTable.build());
++        csBuilder.metaData(metaData);
++
++        ClusterState cs = csBuilder.build();
++        Client client = mock(Client.class);
++        DataFrameAuditor mockAuditor = mock(DataFrameAuditor.class);
++        DataFrameTransformsConfigManager transformsConfigManager = new DataFrameTransformsConfigManager(client, xContentRegistry());
++        DataFrameTransformsCheckpointService transformCheckpointService = new DataFrameTransformsCheckpointService(client,
++            transformsConfigManager, mockAuditor);
++        ClusterSettings cSettings = new ClusterSettings(Settings.EMPTY,
++            Collections.singleton(DataFrameTransformTask.NUM_FAILURE_RETRIES_SETTING));
++        ClusterService clusterService = mock(ClusterService.class);
++        when(clusterService.getClusterSettings()).thenReturn(cSettings);
++        when(clusterService.state()).thenReturn(DataFrameInternalIndexTests.STATE_WITH_LATEST_VERSIONED_INDEX_TEMPLATE);
++        DataFrameTransformPersistentTasksExecutor executor = new DataFrameTransformPersistentTasksExecutor(client,
++            transformsConfigManager,
++            transformCheckpointService, mock(SchedulerEngine.class),
++            new DataFrameAuditor(client, ""),
++            mock(ThreadPool.class),
++            clusterService,
++            Settings.EMPTY);
++
++        // old-data-node-1 prevents assignment
++        assertNull(executor.getAssignment(new DataFrameTransform("new-task-id", Version.CURRENT, null), cs).getExecutorNode());
++
++        // remove the old 7.2 node
++        nodes = DiscoveryNodes.builder()
++            .add(new DiscoveryNode("current-data-node-with-1-task",
++                buildNewFakeTransportAddress(),
++                Collections.emptyMap(),
++                new HashSet<>(Arrays.asList(DiscoveryNodeRole.DATA_ROLE, DiscoveryNodeRole.MASTER_ROLE)),
++                Version.CURRENT))
++            .add(new DiscoveryNode("non-data-node-1",
++                buildNewFakeTransportAddress(),
++                Collections.emptyMap(),
++                Collections.singleton(DiscoveryNodeRole.MASTER_ROLE),
++                Version.CURRENT));
++        csBuilder.nodes(nodes);
++        cs = csBuilder.build();
++
++        assertThat(executor.getAssignment(new DataFrameTransform("new-old-task-id", Version.V_7_2_0, null), cs).getExecutorNode(),
++            equalTo("current-data-node-with-1-task"));
++    }
++
+     public void testVerifyIndicesPrimaryShardsAreActive() {
+         MetaData.Builder metaData = MetaData.builder();
+         RoutingTable.Builder routingTable = RoutingTable.builder();

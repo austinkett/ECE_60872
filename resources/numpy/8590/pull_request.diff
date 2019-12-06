@@ -1,0 +1,375 @@
+diff --git a/doc/release/1.13.0-notes.rst b/doc/release/1.13.0-notes.rst
+index 049653ea4b1..49fd6735dda 100644
+--- a/doc/release/1.13.0-notes.rst
++++ b/doc/release/1.13.0-notes.rst
+@@ -179,6 +179,15 @@ Better default repr for ``ndarray`` subclasses
+ Subclasses of ndarray with no ``repr`` specialization now correctly indent
+ their data and type lines.
+ 
++More reliable comparisons of masked arrays
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++Comparisons of masked arrays were buggy for masked scalars and failed for
++structured arrays with dimension higher than one. Both problems are now
++solved. In the process, it was ensured that in getting the result for a
++structured array, masked fields are properly ignored, i.e., the result is equal
++if all fields that are non-masked in both are equal, thus making the behaviour
++identical to what one gets by comparing an unstructured masked array and then
++doing ``.all()`` over some axis.
+ 
+ Changes
+ =======
+diff --git a/numpy/ma/core.py b/numpy/ma/core.py
+index 3b2b39b1851..af8a523ab80 100644
+--- a/numpy/ma/core.py
++++ b/numpy/ma/core.py
+@@ -23,6 +23,7 @@
+ from __future__ import division, absolute_import, print_function
+ 
+ import sys
++import operator
+ import warnings
+ from functools import reduce
+ 
+@@ -1602,21 +1603,11 @@ def make_mask(m, copy=False, shrink=True, dtype=MaskType):
+     """
+     if m is nomask:
+         return nomask
+-    elif isinstance(m, ndarray):
+-        # We won't return after this point to make sure we can shrink the mask
+-        # Fill the mask in case there are missing data
+-        m = filled(m, True)
+-        # Make sure the input dtype is valid
+-        dtype = make_mask_descr(dtype)
+-        if m.dtype == dtype:
+-            if copy:
+-                result = m.copy()
+-            else:
+-                result = m
+-        else:
+-            result = np.array(m, dtype=dtype, copy=copy)
+-    else:
+-        result = np.array(filled(m, True), dtype=MaskType)
++
++    # Make sure the input dtype is valid.
++    dtype = make_mask_descr(dtype)
++    # Fill the mask in case there are missing data; turn it into an ndarray.
++    result = np.array(filled(m, True), copy=copy, dtype=dtype, subok=True)
+     # Bas les masques !
+     if shrink and (not result.dtype.names) and (not result.any()):
+         return nomask
+@@ -1733,7 +1724,8 @@ def _recursive_mask_or(m1, m2, newmask):
+     if (dtype1 != dtype2):
+         raise ValueError("Incompatible dtypes '%s'<>'%s'" % (dtype1, dtype2))
+     if dtype1.names:
+-        newmask = np.empty_like(m1)
++        # Allocate an output mask array with the properly broadcast shape.
++        newmask = np.empty(np.broadcast(m1, m2).shape, dtype1)
+         _recursive_mask_or(m1, m2, newmask)
+         return newmask
+     return make_mask(umath.logical_or(m1, m2), copy=copy, shrink=shrink)
+@@ -3873,81 +3865,84 @@ def _delegate_binop(self, other):
+                 return True
+         return False
+ 
+-    def __eq__(self, other):
+-        """
+-        Check whether other equals self elementwise.
++    def _comparison(self, other, compare):
++        """Compare self with other using operator.eq or operator.ne.
++
++        When either of the elements is masked, the result is masked as well,
++        but the underlying boolean data are still set, with self and other
++        considered equal if both are masked, and unequal otherwise.
+ 
++        For structured arrays, all fields are combined, with masked values
++        ignored. The result is masked if all fields were masked, with self
++        and other considered equal only if both were fully masked.
+         """
+-        if self is masked:
+-            return masked
+         omask = getmask(other)
+-        if omask is nomask:
+-            check = self.filled(0).__eq__(other)
+-            try:
+-                check = check.view(type(self))
+-                check._mask = self._mask
+-            except AttributeError:
+-                # Dang, we have a bool instead of an array: return the bool
+-                return check
++        smask = self.mask
++        mask = mask_or(smask, omask, copy=True)
++
++        odata = getdata(other)
++        if mask.dtype.names:
++            # For possibly masked structured arrays we need to be careful,
++            # since the standard structured array comparison will use all
++            # fields, masked or not. To avoid masked fields influencing the
++            # outcome, we set all masked fields in self to other, so they'll
++            # count as equal.  To prepare, we ensure we have the right shape.
++            broadcast_shape = np.broadcast(self, odata).shape
++            sbroadcast = np.broadcast_to(self, broadcast_shape, subok=True)
++            sbroadcast._mask = mask
++            sdata = sbroadcast.filled(odata)
++            # Now take care of the mask; the merged mask should have an item
++            # masked if all fields were masked (in one and/or other).
++            mask = (mask == np.ones((), mask.dtype))
++
+         else:
+-            odata = filled(other, 0)
+-            check = self.filled(0).__eq__(odata).view(type(self))
+-            if self._mask is nomask:
+-                check._mask = omask
+-            else:
+-                mask = mask_or(self._mask, omask)
+-                if mask.dtype.names:
+-                    if mask.size > 1:
+-                        axis = 1
+-                    else:
+-                        axis = None
+-                    try:
+-                        mask = mask.view((bool_, len(self.dtype))).all(axis)
+-                    except (ValueError, np.AxisError):
+-                        # TODO: what error are we trying to catch here?
+-                        #       invalid axis, or invalid view?
+-                        mask = np.all([[f[n].all() for n in mask.dtype.names]
+-                                       for f in mask], axis=axis)
+-                check._mask = mask
++            # For regular arrays, just use the data as they come.
++            sdata = self.data
++
++        check = compare(sdata, odata)
++
++        if isinstance(check, (np.bool_, bool)):
++            return masked if mask else check
++
++        if mask is not nomask:
++            # Adjust elements that were masked, which should be treated
++            # as equal if masked in both, unequal if masked in one.
++            # Note that this works automatically for structured arrays too.
++            check = np.where(mask, compare(smask, omask), check)
++            if mask.shape != check.shape:
++                # Guarantee consistency of the shape, making a copy since the
++                # the mask may need to get written to later.
++                mask = np.broadcast_to(mask, check.shape).copy()
++
++        check = check.view(type(self))
++        check._mask = mask
+         return check
+ 
+-    def __ne__(self, other):
++    def __eq__(self, other):
++        """Check whether other equals self elementwise.
++
++        When either of the elements is masked, the result is masked as well,
++        but the underlying boolean data are still set, with self and other
++        considered equal if both are masked, and unequal otherwise.
++
++        For structured arrays, all fields are combined, with masked values
++        ignored. The result is masked if all fields were masked, with self
++        and other considered equal only if both were fully masked.
+         """
+-        Check whether other doesn't equal self elementwise
++        return self._comparison(other, operator.eq)
+ 
++    def __ne__(self, other):
++        """Check whether other does not equal self elementwise.
++
++        When either of the elements is masked, the result is masked as well,
++        but the underlying boolean data are still set, with self and other
++        considered equal if both are masked, and unequal otherwise.
++
++        For structured arrays, all fields are combined, with masked values
++        ignored. The result is masked if all fields were masked, with self
++        and other considered equal only if both were fully masked.
+         """
+-        if self is masked:
+-            return masked
+-        omask = getmask(other)
+-        if omask is nomask:
+-            check = self.filled(0).__ne__(other)
+-            try:
+-                check = check.view(type(self))
+-                check._mask = self._mask
+-            except AttributeError:
+-                # In case check is a boolean (or a numpy.bool)
+-                return check
+-        else:
+-            odata = filled(other, 0)
+-            check = self.filled(0).__ne__(odata).view(type(self))
+-            if self._mask is nomask:
+-                check._mask = omask
+-            else:
+-                mask = mask_or(self._mask, omask)
+-                if mask.dtype.names:
+-                    if mask.size > 1:
+-                        axis = 1
+-                    else:
+-                        axis = None
+-                    try:
+-                        mask = mask.view((bool_, len(self.dtype))).all(axis)
+-                    except (ValueError, np.AxisError):
+-                        # TODO: what error are we trying to catch here?
+-                        #       invalid axis, or invalid view?
+-                        mask = np.all([[f[n].all() for n in mask.dtype.names]
+-                                       for f in mask], axis=axis)
+-                check._mask = mask
+-        return check
++        return self._comparison(other, operator.ne)
+ 
+     def __add__(self, other):
+         """
+diff --git a/numpy/ma/tests/test_core.py b/numpy/ma/tests/test_core.py
+index f9d032f097c..ca1ef16c4f0 100644
+--- a/numpy/ma/tests/test_core.py
++++ b/numpy/ma/tests/test_core.py
+@@ -1335,32 +1335,96 @@ def test_eq_on_structured(self):
+         ndtype = [('A', int), ('B', int)]
+         a = array([(1, 1), (2, 2)], mask=[(0, 1), (0, 0)], dtype=ndtype)
+         test = (a == a)
+-        assert_equal(test, [True, True])
++        assert_equal(test.data, [True, True])
++        assert_equal(test.mask, [False, False])
++        test = (a == a[0])
++        assert_equal(test.data, [True, False])
+         assert_equal(test.mask, [False, False])
+         b = array([(1, 1), (2, 2)], mask=[(1, 0), (0, 0)], dtype=ndtype)
+         test = (a == b)
+-        assert_equal(test, [False, True])
++        assert_equal(test.data, [False, True])
++        assert_equal(test.mask, [True, False])
++        test = (a[0] == b)
++        assert_equal(test.data, [False, False])
+         assert_equal(test.mask, [True, False])
+         b = array([(1, 1), (2, 2)], mask=[(0, 1), (1, 0)], dtype=ndtype)
+         test = (a == b)
+-        assert_equal(test, [True, False])
++        assert_equal(test.data, [True, True])
+         assert_equal(test.mask, [False, False])
++        # complicated dtype, 2-dimensional array.
++        ndtype = [('A', int), ('B', [('BA', int), ('BB', int)])]
++        a = array([[(1, (1, 1)), (2, (2, 2))],
++                   [(3, (3, 3)), (4, (4, 4))]],
++                  mask=[[(0, (1, 0)), (0, (0, 1))],
++                        [(1, (0, 0)), (1, (1, 1))]], dtype=ndtype)
++        test = (a[0, 0] == a)
++        assert_equal(test.data, [[True, False], [False, False]])
++        assert_equal(test.mask, [[False, False], [False, True]])
+ 
+     def test_ne_on_structured(self):
+         # Test the equality of structured arrays
+         ndtype = [('A', int), ('B', int)]
+         a = array([(1, 1), (2, 2)], mask=[(0, 1), (0, 0)], dtype=ndtype)
+         test = (a != a)
+-        assert_equal(test, [False, False])
++        assert_equal(test.data, [False, False])
++        assert_equal(test.mask, [False, False])
++        test = (a != a[0])
++        assert_equal(test.data, [False, True])
+         assert_equal(test.mask, [False, False])
+         b = array([(1, 1), (2, 2)], mask=[(1, 0), (0, 0)], dtype=ndtype)
+         test = (a != b)
+-        assert_equal(test, [True, False])
++        assert_equal(test.data, [True, False])
++        assert_equal(test.mask, [True, False])
++        test = (a[0] != b)
++        assert_equal(test.data, [True, True])
+         assert_equal(test.mask, [True, False])
+         b = array([(1, 1), (2, 2)], mask=[(0, 1), (1, 0)], dtype=ndtype)
+         test = (a != b)
+-        assert_equal(test, [False, True])
++        assert_equal(test.data, [False, False])
+         assert_equal(test.mask, [False, False])
++        # complicated dtype, 2-dimensional array.
++        ndtype = [('A', int), ('B', [('BA', int), ('BB', int)])]
++        a = array([[(1, (1, 1)), (2, (2, 2))],
++                   [(3, (3, 3)), (4, (4, 4))]],
++                  mask=[[(0, (1, 0)), (0, (0, 1))],
++                        [(1, (0, 0)), (1, (1, 1))]], dtype=ndtype)
++        test = (a[0, 0] != a)
++        assert_equal(test.data, [[False, True], [True, True]])
++        assert_equal(test.mask, [[False, False], [False, True]])
++
++    def test_eq_ne_structured_extra(self):
++        # ensure simple examples are symmetric and make sense.
++        # from https://github.com/numpy/numpy/pull/8590#discussion_r101126465
++        dt = np.dtype('i4,i4')
++        for m1 in (mvoid((1, 2), mask=(0, 0), dtype=dt),
++                   mvoid((1, 2), mask=(0, 1), dtype=dt),
++                   mvoid((1, 2), mask=(1, 0), dtype=dt),
++                   mvoid((1, 2), mask=(1, 1), dtype=dt)):
++            ma1 = m1.view(MaskedArray)
++            r1 = ma1.view('2i4')
++            for m2 in (np.array((1, 1), dtype=dt),
++                       mvoid((1, 1), dtype=dt),
++                       mvoid((1, 0), mask=(0, 1), dtype=dt),
++                       mvoid((3, 2), mask=(0, 1), dtype=dt)):
++                ma2 = m2.view(MaskedArray)
++                r2 = ma2.view('2i4')
++                eq_expected = (r1 == r2).all()
++                assert_equal(m1 == m2, eq_expected)
++                assert_equal(m2 == m1, eq_expected)
++                assert_equal(ma1 == m2, eq_expected)
++                assert_equal(m1 == ma2, eq_expected)
++                assert_equal(ma1 == ma2, eq_expected)
++                # Also check it is the same if we do it element by element.
++                el_by_el = [m1[name] == m2[name] for name in dt.names]
++                assert_equal(array(el_by_el, dtype=bool).all(), eq_expected)
++                ne_expected = (r1 != r2).any()
++                assert_equal(m1 != m2, ne_expected)
++                assert_equal(m2 != m1, ne_expected)
++                assert_equal(ma1 != m2, ne_expected)
++                assert_equal(m1 != ma2, ne_expected)
++                assert_equal(ma1 != ma2, ne_expected)
++                el_by_el = [m1[name] != m2[name] for name in dt.names]
++                assert_equal(array(el_by_el, dtype=bool).any(), ne_expected)
+ 
+     def test_eq_with_None(self):
+         # Really, comparisons with None should not be done, but check them
+@@ -1393,6 +1457,22 @@ def test_eq_with_scalar(self):
+         assert_equal(a == 0, False)
+         assert_equal(a != 1, False)
+         assert_equal(a != 0, True)
++        b = array(1, mask=True)
++        assert_equal(b == 0, masked)
++        assert_equal(b == 1, masked)
++        assert_equal(b != 0, masked)
++        assert_equal(b != 1, masked)
++
++    def test_eq_different_dimensions(self):
++        m1 = array([1, 1], mask=[0, 1])
++        # test comparison with both masked and regular arrays.
++        for m2 in (array([[0, 1], [1, 2]]),
++                   np.array([[0, 1], [1, 2]])):
++            test = (m1 == m2)
++            assert_equal(test.data, [[False, False],
++                                     [True, False]])
++            assert_equal(test.mask, [[False, True],
++                                     [False, True]])
+ 
+     def test_numpyarithmetics(self):
+         # Check that the mask is not back-propagated when using numpy functions
+@@ -3978,7 +4058,15 @@ def test_make_mask(self):
+         test = make_mask(mask, dtype=mask.dtype)
+         assert_equal(test.dtype, bdtype)
+         assert_equal(test, np.array([(0, 0), (0, 1)], dtype=bdtype))
+-
++        # Ensure this also works for void
++        mask = np.array((False, True), dtype='?,?')[()]
++        assert_(isinstance(mask, np.void))
++        test = make_mask(mask, dtype=mask.dtype)
++        assert_equal(test, mask)
++        assert_(test is not mask)
++        mask = np.array((0, 1), dtype='i4,i4')[()]
++        test2 = make_mask(mask, dtype=mask.dtype)
++        assert_equal(test2, test)
+         # test that nomask is returned when m is nomask.
+         bools = [True, False]
+         dtypes = [MaskType, np.float]
+@@ -3987,7 +4075,6 @@ def test_make_mask(self):
+             res = make_mask(nomask, copy=cpy, shrink=shr, dtype=dt)
+             assert_(res is nomask, msgformat % (cpy, shr, dt))
+ 
+-
+     def test_mask_or(self):
+         # Initialize
+         mtype = [('a', np.bool), ('b', np.bool)]

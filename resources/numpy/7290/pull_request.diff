@@ -1,0 +1,161 @@
+diff --git a/doc/release/1.11.0-notes.rst b/doc/release/1.11.0-notes.rst
+index 6e486d5a024..c8cc2d9c1b1 100644
+--- a/doc/release/1.11.0-notes.rst
++++ b/doc/release/1.11.0-notes.rst
+@@ -152,6 +152,15 @@ to preserve struct layout). These were never used for anything, so
+ it's unlikely that any third-party code is using them either, but we
+ mention it here for completeness.
+ 
++object dtype detection for old-style classes
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++In python 2, objects which are instances of old-style user-defined classes no
++longer automatically count as 'object' type in the dtype-detection handler.
++Instead, as in python 3, they may potentially count as sequences, but only if
++they define both a `__len__` and a `__getitem__` method. This fixes a segfault
++and inconsistency between python 2 and 3.
++
+ New Features
+ ============
+ 
+diff --git a/numpy/core/src/multiarray/common.c b/numpy/core/src/multiarray/common.c
+index 1948b8b61f4..c216daa957b 100644
+--- a/numpy/core/src/multiarray/common.c
++++ b/numpy/core/src/multiarray/common.c
+@@ -128,30 +128,6 @@ _array_find_python_scalar_type(PyObject *op)
+     return NULL;
+ }
+ 
+-#if !defined(NPY_PY3K)
+-static PyArray_Descr *
+-_use_default_type(PyObject *op)
+-{
+-    int typenum, l;
+-    PyObject *type;
+-
+-    typenum = -1;
+-    l = 0;
+-    type = (PyObject *)Py_TYPE(op);
+-    while (l < NPY_NUMUSERTYPES) {
+-        if (type == (PyObject *)(userdescrs[l]->typeobj)) {
+-            typenum = l + NPY_USERDEF;
+-            break;
+-        }
+-        l++;
+-    }
+-    if (typenum == -1) {
+-        typenum = NPY_OBJECT;
+-    }
+-    return PyArray_DescrFromType(typenum);
+-}
+-#endif
+-
+ /*
+  * These constants are used to signal that the recursive dtype determination in
+  * PyArray_DTypeFromObject encountered a string type, and that the recursive
+@@ -490,24 +466,16 @@ PyArray_DTypeFromObjectHelper(PyObject *obj, int maxdims,
+         }
+     }
+ 
+-    /* Not exactly sure what this is about... */
+-#if !defined(NPY_PY3K)
+-    if (PyInstance_Check(obj)) {
+-        dtype = _use_default_type(obj);
+-        if (dtype == NULL) {
+-            goto fail;
+-        }
+-        else {
+-            goto promote_types;
+-        }
+-    }
+-#endif
+-
+     /*
+      * If we reached the maximum recursion depth without hitting one
+-     * of the above cases, the output dtype should be OBJECT
++     * of the above cases, and obj isn't a sequence-like object, the output
++     * dtype should be either OBJECT or a user-defined type.
++     *
++     * Note that some libraries define sequence-like classes but want them to
++     * be treated as objects, and they expect numpy to treat it as an object if
++     * __len__ is not defined.
+      */
+-    if (maxdims == 0 || !PySequence_Check(obj)) {
++    if (maxdims == 0 || !PySequence_Check(obj) || PySequence_Size(obj) < 0) {
+         if (*out_dtype == NULL || (*out_dtype)->type_num != NPY_OBJECT) {
+             Py_XDECREF(*out_dtype);
+             *out_dtype = PyArray_DescrFromType(NPY_OBJECT);
+@@ -518,20 +486,12 @@ PyArray_DTypeFromObjectHelper(PyObject *obj, int maxdims,
+         return 0;
+     }
+ 
+-    /*
+-     * fails if convertable to list but no len is defined which some libraries
+-     * require to get object arrays
+-     */
+-    size = PySequence_Size(obj);
+-    if (size < 0) {
+-        goto fail;
+-    }
+-
+     /* Recursive case, first check the sequence contains only one type */
+     seq = PySequence_Fast(obj, "Could not convert object to sequence");
+     if (seq == NULL) {
+         goto fail;
+     }
++    size = PySequence_Fast_GET_SIZE(seq);
+     objects = PySequence_Fast_ITEMS(seq);
+     common_type = size > 0 ? Py_TYPE(objects[0]) : NULL;
+     for (i = 1; i < size; ++i) {
+diff --git a/numpy/core/src/multiarray/ctors.c b/numpy/core/src/multiarray/ctors.c
+index 7fb86a18e28..46753acdc38 100644
+--- a/numpy/core/src/multiarray/ctors.c
++++ b/numpy/core/src/multiarray/ctors.c
+@@ -695,11 +695,6 @@ discover_dimensions(PyObject *obj, int *maxndim, npy_intp *d, int check_it,
+ 
+     /* obj is not a Sequence */
+     if (!PySequence_Check(obj) ||
+-#if defined(NPY_PY3K)
+-        /* FIXME: XXX -- what is the correct thing to do here? */
+-#else
+-            PyInstance_Check(obj) ||
+-#endif
+             PySequence_Length(obj) < 0) {
+         *maxndim = 0;
+         PyErr_Clear();
+diff --git a/numpy/core/tests/test_dtype.py b/numpy/core/tests/test_dtype.py
+index 6d898eaa1f6..a6cb66b7d50 100644
+--- a/numpy/core/tests/test_dtype.py
++++ b/numpy/core/tests/test_dtype.py
+@@ -590,6 +590,10 @@ def test_rational_dtype():
+     a = np.array([1111], dtype=rational).astype
+     assert_raises(OverflowError, a, 'int8')
+ 
++    # test that dtype detection finds user-defined types
++    x = rational(1)
++    assert_equal(np.array([x,x]).dtype, np.dtype(rational))
++
+ 
+ if __name__ == "__main__":
+     run_module_suite()
+diff --git a/numpy/core/tests/test_multiarray.py b/numpy/core/tests/test_multiarray.py
+index d57e7c10675..f16c742587f 100644
+--- a/numpy/core/tests/test_multiarray.py
++++ b/numpy/core/tests/test_multiarray.py
+@@ -702,6 +702,16 @@ def __getitem__(self, ind):
+         d = np.array([Point2(), Point2(), Point2()])
+         assert_equal(d.dtype, np.dtype(object))
+ 
++    def test_false_len_sequence(self):
++        # gh-7264, segfault for this example
++        class C:
++            def __getitem__(self, i):
++                raise IndexError
++            def __len__(self):
++                return 42
++
++        assert_raises(ValueError, np.array, C()) # segfault?
++
+ 
+ class TestStructured(TestCase):
+     def test_subarray_field_access(self):

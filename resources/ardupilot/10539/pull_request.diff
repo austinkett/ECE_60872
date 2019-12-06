@@ -1,0 +1,810 @@
+diff --git a/libraries/AP_NavEKF2/AP_NavEKF2.cpp b/libraries/AP_NavEKF2/AP_NavEKF2.cpp
+index 3facb6d44883..93aefac0c2ed 100644
+--- a/libraries/AP_NavEKF2/AP_NavEKF2.cpp
++++ b/libraries/AP_NavEKF2/AP_NavEKF2.cpp
+@@ -35,6 +35,7 @@
+ #define FLOW_M_NSE_DEFAULT      0.25f
+ #define FLOW_I_GATE_DEFAULT     300
+ #define CHECK_SCALER_DEFAULT    100
++#define FLOW_USE_DEFAULT        1
+ 
+ #elif APM_BUILD_TYPE(APM_BUILD_APMrover2)
+ // rover defaults
+@@ -60,6 +61,7 @@
+ #define FLOW_M_NSE_DEFAULT      0.25f
+ #define FLOW_I_GATE_DEFAULT     300
+ #define CHECK_SCALER_DEFAULT    100
++#define FLOW_USE_DEFAULT        1
+ 
+ #elif APM_BUILD_TYPE(APM_BUILD_ArduPlane)
+ // plane defaults
+@@ -82,9 +84,10 @@
+ #define MAG_CAL_DEFAULT         0
+ #define GLITCH_RADIUS_DEFAULT   25
+ #define FLOW_MEAS_DELAY         10
+-#define FLOW_M_NSE_DEFAULT      0.25f
+-#define FLOW_I_GATE_DEFAULT     300
++#define FLOW_M_NSE_DEFAULT      0.15f
++#define FLOW_I_GATE_DEFAULT     500
+ #define CHECK_SCALER_DEFAULT    150
++#define FLOW_USE_DEFAULT        2
+ 
+ #else
+ // build type not specified, use copter defaults
+@@ -110,6 +113,7 @@
+ #define FLOW_M_NSE_DEFAULT      0.25f
+ #define FLOW_I_GATE_DEFAULT     300
+ #define CHECK_SCALER_DEFAULT    100
++#define FLOW_USE_DEFAULT        1
+ 
+ #endif // APM_BUILD_DIRECTORY
+ 
+@@ -485,7 +489,7 @@ const AP_Param::GroupInfo NavEKF2::var_info[] = {
+ 
+     // @Param: TERR_GRAD
+     // @DisplayName: Maximum terrain gradient
+-    // @Description: Specifies the maximum gradient of the terrain below the vehicle when it is using range finder as a height reference
++    // @Description: Specifies the maximum gradient of the terrain below the vehicle assumed when it is fusing range finder or optical flow to estimate terrain height.
+     // @Range: 0 0.2
+     // @Increment: 0.01
+     // @User: Advanced
+@@ -553,6 +557,14 @@ const AP_Param::GroupInfo NavEKF2::var_info[] = {
+     // @RebootRequired: True
+     AP_GROUPINFO("EXTNAV_DELAY", 50, NavEKF2, _extnavDelay_ms, 10),
+ 
++    // @Param: FLOW_USE
++    // @DisplayName: Optical flow use bitmask
++    // @Description: Controls if the optical flow data is fused into the 24-state navigation estimator OR the 1-state terrain height estimator.
++    // @User: Advanced
++    // @Values: 0:None,1:Navigation,2:Terrain
++    // @RebootRequired: True
++    AP_GROUPINFO("FLOW_USE", 51, NavEKF2, _flowUse, FLOW_USE_DEFAULT),
++
+     AP_GROUPEND
+ };
+ 
+diff --git a/libraries/AP_NavEKF2/AP_NavEKF2.h b/libraries/AP_NavEKF2/AP_NavEKF2.h
+index 47b02a6297c1..068973bb3b07 100644
+--- a/libraries/AP_NavEKF2/AP_NavEKF2.h
++++ b/libraries/AP_NavEKF2/AP_NavEKF2.h
+@@ -396,6 +396,12 @@ class NavEKF2 {
+     AP_Int8 _magMask;               // Bitmask forcng specific EKF core instances to use simple heading magnetometer fusion.
+     AP_Int8 _originHgtMode;         // Bitmask controlling post alignment correction and reporting of the EKF origin height.
+     AP_Int8 _extnavDelay_ms;        // effective average delay of external nav system measurements relative to inertial measurements (msec)
++    AP_Int8 _flowUse;               // Controls if the optical flow data is fused into the main navigation estimator and/or the terrain estimator.
++
++// Possible values for _flowUse
++#define FLOW_USE_NONE    0
++#define FLOW_USE_NAV     1
++#define FLOW_USE_TERRAIN 2
+ 
+     // Tuning parameters
+     const float gpsNEVelVarAccScale = 0.05f;       // Scale factor applied to NE velocity measurement variance due to manoeuvre acceleration
+@@ -422,7 +428,6 @@ class NavEKF2 {
+     const uint8_t flowIntervalMax_ms = 100;       // maximum allowable time between flow fusion events
+     const uint16_t gndEffectTimeout_ms = 1000;     // time in msec that ground effect mode is active after being activated
+     const float gndEffectBaroScaler = 4.0f;        // scaler applied to the barometer observation variance when ground effect mode is active
+-    const uint8_t gndGradientSigma = 50;           // RMS terrain gradient percentage assumed by the terrain height estimation
+     const uint8_t fusionTimeStep_ms = 10;          // The minimum time interval between covariance predictions and measurement fusions in msec
+ 
+     struct {
+diff --git a/libraries/AP_NavEKF2/AP_NavEKF2_Control.cpp b/libraries/AP_NavEKF2/AP_NavEKF2_Control.cpp
+index 2e3c82a5b2c4..41e4a793823a 100644
+--- a/libraries/AP_NavEKF2/AP_NavEKF2_Control.cpp
++++ b/libraries/AP_NavEKF2/AP_NavEKF2_Control.cpp
+@@ -170,7 +170,7 @@ void NavEKF2_core::setAidingMode()
+         bool canUseExtNav = readyToUseExtNav();
+         if(canUseGPS || canUseRangeBeacon || canUseExtNav) {
+             PV_AidingMode = AID_ABSOLUTE;
+-        } else if (optFlowDataPresent() && filterIsStable) {
++        } else if (optFlowDataPresent() && (frontend->_flowUse == FLOW_USE_NAV) && filterIsStable) {
+             PV_AidingMode = AID_RELATIVE;
+         }
+         }
+diff --git a/libraries/AP_NavEKF2/AP_NavEKF2_OptFlowFusion.cpp b/libraries/AP_NavEKF2/AP_NavEKF2_OptFlowFusion.cpp
+index a7ae4456ea0e..aa13ad939ec5 100644
+--- a/libraries/AP_NavEKF2/AP_NavEKF2_OptFlowFusion.cpp
++++ b/libraries/AP_NavEKF2/AP_NavEKF2_OptFlowFusion.cpp
+@@ -48,22 +48,20 @@ void NavEKF2_core::SelectFlowFusion()
+         flowDataValid = true;
+     }
+ 
+-    // if we do have valid flow measurements, fuse data into a 1-state EKF to estimate terrain height
+-    // we don't do terrain height estimation in optical flow only mode as the ground becomes our zero height reference
+-    if ((flowDataToFuse || rangeDataToFuse) && tiltOK) {
+-        // fuse optical flow data into the terrain estimator if available and if there is no range data (range data is better)
+-        fuseOptFlowData = (flowDataToFuse && !rangeDataToFuse);
++    // if have valid flow or range measurements, fuse data into a 1-state EKF to estimate terrain height
++    if (((flowDataToFuse && (frontend->_flowUse == FLOW_USE_TERRAIN)) || rangeDataToFuse) && tiltOK) {
+         // Estimate the terrain offset (runs a one state EKF)
+         EstimateTerrainOffset();
+     }
+ 
+     // Fuse optical flow data into the main filter
+-    if (flowDataToFuse && tiltOK)
+-    {
+-        // Set the flow noise used by the fusion processes
+-        R_LOS = sq(MAX(frontend->_flowNoise, 0.05f));
+-        // Fuse the optical flow X and Y axis data into the main filter sequentially
+-        FuseOptFlow();
++    if (flowDataToFuse && tiltOK) {
++        if (frontend->_flowUse == FLOW_USE_NAV) {
++            // Set the flow noise used by the fusion processes
++            R_LOS = sq(MAX(frontend->_flowNoise, 0.05f));
++            // Fuse the optical flow X and Y axis data into the main filter sequentially
++            FuseOptFlow();
++        }
+         // reset flag to indicate that no new flow data is available for fusion
+         flowDataToFuse = false;
+     }
+@@ -75,23 +73,25 @@ void NavEKF2_core::SelectFlowFusion()
+ /*
+ Estimation of terrain offset using a single state EKF
+ The filter can fuse motion compensated optical flow rates and range finder measurements
++Equations generated using https://github.com/PX4/ecl/tree/master/EKF/matlab/scripts/Terrain%20Estimator
+ */
+ void NavEKF2_core::EstimateTerrainOffset()
+ {
+     // start performance timer
+     hal.util->perf_begin(_perf_TerrainOffset);
+ 
+-    // constrain height above ground to be above range measured on ground
+-    float heightAboveGndEst = MAX((terrainState - stateStruct.position.z), rngOnGnd);
+-
+-    // calculate a predicted LOS rate squared
++    // horizontal velocity squared
+     float velHorizSq = sq(stateStruct.velocity.x) + sq(stateStruct.velocity.y);
+-    float losRateSq = velHorizSq / sq(heightAboveGndEst);
+ 
+-    // don't update terrain offset state if there is no range finder
+-    // don't update terrain state if not generating enough LOS rate, or without GPS, as it is poorly observable
+-    // don't update terrain state if we are using it as a height reference in the main filter
+-    bool cantFuseFlowData = (gpsNotAvailable || PV_AidingMode == AID_RELATIVE || velHorizSq < 25.0f || losRateSq < 0.01f);
++    // don't fuse flow data if LOS rate is misaligned, without GPS, or insufficient velocity, as it is poorly observable
++    // don't fuse flow data if it exceeds validity limits
++    // don't update terrain offset if grpund is being used as the zero height datum in the main filter
++    bool cantFuseFlowData = ((frontend->_flowUse != FLOW_USE_TERRAIN)
++    || gpsNotAvailable 
++    || PV_AidingMode == AID_RELATIVE 
++    || velHorizSq < 25.0f 
++    || (MAX(ofDataDelayed.flowRadXY[0],ofDataDelayed.flowRadXY[1]) > frontend->_maxFlowRate));
++
+     if ((!rangeDataToFuse && cantFuseFlowData) || (activeHgtSource == HGT_SOURCE_RNG)) {
+         // skip update
+         inhibitGndState = true;
+@@ -109,7 +109,7 @@ void NavEKF2_core::EstimateTerrainOffset()
+ 
+         // in addition to a terrain gradient error model, we also have the growth in uncertainty due to the copters vertical velocity
+         float timeLapsed = MIN(0.001f * (imuSampleTime_ms - timeAtLastAuxEKF_ms), 1.0f);
+-        float Pincrement = (distanceTravelledSq * sq(0.01f*float(frontend->gndGradientSigma))) + sq(timeLapsed)*P[5][5];
++        float Pincrement = (distanceTravelledSq * sq(frontend->_terrGradMax)) + sq(timeLapsed)*P[5][5];
+         Popt += Pincrement;
+         timeAtLastAuxEKF_ms = imuSampleTime_ms;
+ 
+@@ -160,90 +160,111 @@ void NavEKF2_core::EstimateTerrainOffset()
+             }
+         }
+ 
+-        if (fuseOptFlowData && !cantFuseFlowData) {
++        if (!cantFuseFlowData) {
+ 
+-            Vector3f relVelSensor; // velocity of sensor relative to ground in sensor axes
+-            float losPred; // predicted optical flow angular rate measurement
++            Vector3f relVelSensor;          // velocity of sensor relative to ground in sensor axes
++            Vector2f losPred;               // predicted optical flow angular rate measurement
+             float q0 = stateStruct.quat[0]; // quaternion at optical flow measurement time
+             float q1 = stateStruct.quat[1]; // quaternion at optical flow measurement time
+             float q2 = stateStruct.quat[2]; // quaternion at optical flow measurement time
+             float q3 = stateStruct.quat[3]; // quaternion at optical flow measurement time
+             float K_OPT;
+             float H_OPT;
++            Vector2f auxFlowObsInnovVar;
+ 
+             // predict range to centre of image
+-            float flowRngPred = MAX((terrainState - stateStruct.position[2]),rngOnGnd) / prevTnb.c.z;
++            float flowRngPred = MAX((terrainState - stateStruct.position.z),rngOnGnd) / prevTnb.c.z;
+ 
+             // constrain terrain height to be below the vehicle
+-            terrainState = MAX(terrainState, stateStruct.position[2] + rngOnGnd);
++            terrainState = MAX(terrainState, stateStruct.position.z + rngOnGnd);
+ 
+             // calculate relative velocity in sensor frame
+             relVelSensor = prevTnb*stateStruct.velocity;
+ 
+             // divide velocity by range, subtract body rates and apply scale factor to
+             // get predicted sensed angular optical rates relative to X and Y sensor axes
+-            losPred =   norm(relVelSensor.x, relVelSensor.y)/flowRngPred;
++            losPred.x =   relVelSensor.y / flowRngPred;
++            losPred.y = - relVelSensor.x / flowRngPred;
+ 
+             // calculate innovations
+-            auxFlowObsInnov = losPred - norm(ofDataDelayed.flowRadXYcomp.x, ofDataDelayed.flowRadXYcomp.y);
++            auxFlowObsInnov = losPred - ofDataDelayed.flowRadXYcomp;
+ 
+-            // calculate observation jacobian
+-            float t3 = sq(q0);
+-            float t4 = sq(q1);
+-            float t5 = sq(q2);
+-            float t6 = sq(q3);
+-            float t10 = q0*q3*2.0f;
+-            float t11 = q1*q2*2.0f;
+-            float t14 = t3+t4-t5-t6;
+-            float t15 = t14*stateStruct.velocity.x;
+-            float t16 = t10+t11;
+-            float t17 = t16*stateStruct.velocity.y;
+-            float t18 = q0*q2*2.0f;
+-            float t19 = q1*q3*2.0f;
+-            float t20 = t18-t19;
+-            float t21 = t20*stateStruct.velocity.z;
+-            float t2 = t15+t17-t21;
+-            float t7 = t3-t4-t5+t6;
+-            float t8 = stateStruct.position[2]-terrainState;
+-            float t9 = 1.0f/sq(t8);
+-            float t24 = t3-t4+t5-t6;
+-            float t25 = t24*stateStruct.velocity.y;
+-            float t26 = t10-t11;
+-            float t27 = t26*stateStruct.velocity.x;
+-            float t28 = q0*q1*2.0f;
+-            float t29 = q2*q3*2.0f;
+-            float t30 = t28+t29;
+-            float t31 = t30*stateStruct.velocity.z;
+-            float t12 = t25-t27+t31;
+-            float t13 = sq(t7);
+-            float t22 = sq(t2);
+-            float t23 = 1.0f/(t8*t8*t8);
+-            float t32 = sq(t12);
+-            H_OPT = 0.5f*(t13*t22*t23*2.0f+t13*t23*t32*2.0f)/sqrtf(t9*t13*t22+t9*t13*t32);
++            // calculate observation jacobians 
++            float t2 = q0*q0;
++            float t3 = q1*q1;
++            float t4 = q2*q2;
++            float t5 = q3*q3;
++            float t6 = stateStruct.position.z - terrainState;
++            float t7 = 1.0f / (t6*t6);
++            float t8 = q0*q3*2.0f;
++            float t9 = t2-t3-t4+t5;
++
++            // prevent the state variances from becoming badly conditioned
++            Popt = MAX(Popt,1E-6f);
++
++            // calculate observation noise variance from parameter
++            float flow_noise_variance = sq(MAX(frontend->_flowNoise, 0.05f));
++
++            // Fuse Y axis data
++
++            // Calculate observation partial derivative
++            H_OPT = t7*t9*(-stateStruct.velocity.z*(q0*q2*2.0-q1*q3*2.0)+stateStruct.velocity.x*(t2+t3-t4-t5)+stateStruct.velocity.y*(t8+q1*q2*2.0));
++
++            // calculate innovation variance
++            auxFlowObsInnovVar.y = H_OPT * Popt * H_OPT + flow_noise_variance;
++
++            // calculate Kalman gain
++            K_OPT = Popt * H_OPT / auxFlowObsInnovVar.y;
++
++            // calculate the innovation consistency test ratio
++            auxFlowTestRatio.y = sq(auxFlowObsInnov.y) / (sq(MAX(0.01f * (float)frontend->_flowInnovGate, 1.0f)) * auxFlowObsInnovVar.y);
++
++            // don't fuse if optical flow data is outside valid range
++            if (auxFlowTestRatio.y < 1.0f) {
++
++                // correct the state
++                terrainState -= K_OPT * auxFlowObsInnov.y;
++
++                // constrain the state
++                terrainState = MAX(terrainState, stateStruct.position.z + rngOnGnd);
++
++                // update intermediate variables used when fusing the X axis
++                t6 = stateStruct.position.z - terrainState;
++                t7 = 1.0f / (t6*t6);
++
++                // correct the covariance
++                Popt = Popt - K_OPT * H_OPT * Popt;
++
++                // prevent the state variances from becoming badly conditioned
++                Popt = MAX(Popt,1E-6f);
++            }
++
++            // fuse X axis data
++            H_OPT = -t7*t9*(stateStruct.velocity.z*(q0*q1*2.0+q2*q3*2.0)+stateStruct.velocity.y*(t2-t3+t4-t5)-stateStruct.velocity.x*(t8-q1*q2*2.0));
+ 
+             // calculate innovation variances
+-            auxFlowObsInnovVar = H_OPT*Popt*H_OPT + R_LOS;
++            auxFlowObsInnovVar.x = H_OPT * Popt * H_OPT + flow_noise_variance;
+ 
+             // calculate Kalman gain
+-            K_OPT = Popt*H_OPT/auxFlowObsInnovVar;
++            K_OPT = Popt * H_OPT / auxFlowObsInnovVar.x;
+ 
+             // calculate the innovation consistency test ratio
+-            auxFlowTestRatio = sq(auxFlowObsInnov) / (sq(MAX(0.01f * (float)frontend->_flowInnovGate, 1.0f)) * auxFlowObsInnovVar);
++            auxFlowTestRatio.x = sq(auxFlowObsInnov.x) / (sq(MAX(0.01f * (float)frontend->_flowInnovGate, 1.0f)) * auxFlowObsInnovVar.x);
+ 
+             // don't fuse if optical flow data is outside valid range
+-            if (MAX(ofDataDelayed.flowRadXY[0],ofDataDelayed.flowRadXY[1]) < frontend->_maxFlowRate) {
++            if (auxFlowTestRatio.x < 1.0f) {
+ 
+                 // correct the state
+-                terrainState -= K_OPT * auxFlowObsInnov;
++                terrainState -= K_OPT * auxFlowObsInnov.x;
+ 
+                 // constrain the state
+-                terrainState = MAX(terrainState, stateStruct.position[2] + rngOnGnd);
++                terrainState = MAX(terrainState, stateStruct.position.z + rngOnGnd);
+ 
+                 // correct the covariance
+                 Popt = Popt - K_OPT * H_OPT * Popt;
+ 
+-                // prevent the state variances from becoming negative
+-                Popt = MAX(Popt,0.0f);
++                // prevent the state variances from becoming badly conditioned
++                Popt = MAX(Popt,1E-6f);
+             }
+         }
+     }
+diff --git a/libraries/AP_NavEKF2/AP_NavEKF2_Outputs.cpp b/libraries/AP_NavEKF2/AP_NavEKF2_Outputs.cpp
+index 048832c23072..b81deba87e34 100644
+--- a/libraries/AP_NavEKF2/AP_NavEKF2_Outputs.cpp
++++ b/libraries/AP_NavEKF2/AP_NavEKF2_Outputs.cpp
+@@ -61,7 +61,7 @@ void NavEKF2_core::getFlowDebug(float &varFlow, float &gndOffset, float &flowInn
+     gndOffset = terrainState;
+     flowInnovX = innovOptFlow[0];
+     flowInnovY = innovOptFlow[1];
+-    auxInnov = auxFlowObsInnov;
++    auxInnov = norm(auxFlowObsInnov.x,auxFlowObsInnov.y);
+     HAGL = terrainState - stateStruct.position.z;
+     rngInnov = innovRng;
+     range = rangeDataDelayed.rng;
+diff --git a/libraries/AP_NavEKF2/AP_NavEKF2_core.cpp b/libraries/AP_NavEKF2/AP_NavEKF2_core.cpp
+index 23649054481c..887a86a61e5d 100644
+--- a/libraries/AP_NavEKF2/AP_NavEKF2_core.cpp
++++ b/libraries/AP_NavEKF2/AP_NavEKF2_core.cpp
+@@ -156,7 +156,6 @@ void NavEKF2_core::InitialiseVariables()
+     memset(&processNoise[0], 0, sizeof(processNoise));
+     flowDataValid = false;
+     rangeDataToFuse  = false;
+-    fuseOptFlowData = false;
+     Popt = 0.0f;
+     terrainState = 0.0f;
+     prevPosN = stateStruct.position.x;
+diff --git a/libraries/AP_NavEKF2/AP_NavEKF2_core.h b/libraries/AP_NavEKF2/AP_NavEKF2_core.h
+index 21a4821a28d3..c90f475d763d 100644
+--- a/libraries/AP_NavEKF2/AP_NavEKF2_core.h
++++ b/libraries/AP_NavEKF2/AP_NavEKF2_core.h
+@@ -965,9 +965,7 @@ class NavEKF2_core
+     uint8_t ofStoreIndex;           // OF data storage index
+     bool flowDataToFuse;            // true when optical flow data is ready for fusion
+     bool flowDataValid;             // true while optical flow data is still fresh
+-    bool fuseOptFlowData;           // this boolean causes the last optical flow measurement to be fused
+-    float auxFlowObsInnov;          // optical flow rate innovation from 1-state terrain offset estimator
+-    float auxFlowObsInnovVar;       // innovation variance for optical flow observations from 1-state terrain offset estimator
++    Vector2f auxFlowObsInnov;       // optical flow rate innovation from 1-state terrain offset estimator
+     uint32_t flowValidMeaTime_ms;   // time stamp from latest valid flow measurement (msec)
+     uint32_t rngValidMeaTime_ms;    // time stamp from latest valid range measurement (msec)
+     uint32_t flowMeaTime_ms;        // time stamp from latest flow measurement (msec)
+@@ -985,7 +983,7 @@ class NavEKF2_core
+     bool inhibitGndState;           // true when the terrain position state is to remain constant
+     uint32_t prevFlowFuseTime_ms;   // time both flow measurement components passed their innovation consistency checks
+     Vector2 flowTestRatio;          // square of optical flow innovations divided by fail threshold used by main filter where >1.0 is a fail
+-    float auxFlowTestRatio;         // sum of squares of optical flow innovation divided by fail threshold used by 1-state terrain offset estimator
++    Vector2f auxFlowTestRatio;      // sum of squares of optical flow innovation divided by fail threshold used by 1-state terrain offset estimator
+     float R_LOS;                    // variance of optical flow rate measurements (rad/sec)^2
+     float auxRngTestRatio;          // square of range finder innovations divided by fail threshold used by main filter where >1.0 is a fail
+     Vector2f flowGyroBias;          // bias error of optical flow sensor gyro output
+diff --git a/libraries/AP_NavEKF3/AP_NavEKF3.cpp b/libraries/AP_NavEKF3/AP_NavEKF3.cpp
+index 66a7cd87b35a..71cad8962f3c 100644
+--- a/libraries/AP_NavEKF3/AP_NavEKF3.cpp
++++ b/libraries/AP_NavEKF3/AP_NavEKF3.cpp
+@@ -34,6 +34,7 @@
+ #define FLOW_M_NSE_DEFAULT      0.25f
+ #define FLOW_I_GATE_DEFAULT     300
+ #define CHECK_SCALER_DEFAULT    100
++#define FLOW_USE_DEFAULT        1
+ 
+ #elif APM_BUILD_TYPE(APM_BUILD_APMrover2)
+ // rover defaults
+@@ -58,6 +59,7 @@
+ #define FLOW_M_NSE_DEFAULT      0.25f
+ #define FLOW_I_GATE_DEFAULT     300
+ #define CHECK_SCALER_DEFAULT    100
++#define FLOW_USE_DEFAULT        1
+ 
+ #elif APM_BUILD_TYPE(APM_BUILD_ArduPlane)
+ // plane defaults
+@@ -79,9 +81,10 @@
+ #define MAG_CAL_DEFAULT         0
+ #define GLITCH_RADIUS_DEFAULT   25
+ #define FLOW_MEAS_DELAY         10
+-#define FLOW_M_NSE_DEFAULT      0.25f
+-#define FLOW_I_GATE_DEFAULT     300
++#define FLOW_M_NSE_DEFAULT      0.15f
++#define FLOW_I_GATE_DEFAULT     500
+ #define CHECK_SCALER_DEFAULT    100
++#define FLOW_USE_DEFAULT        2
+ 
+ #else
+ // build type not specified, use copter defaults
+@@ -106,6 +109,7 @@
+ #define FLOW_M_NSE_DEFAULT      0.25f
+ #define FLOW_I_GATE_DEFAULT     300
+ #define CHECK_SCALER_DEFAULT    100
++#define FLOW_USE_DEFAULT        1
+ 
+ #endif // APM_BUILD_DIRECTORY
+ 
+@@ -575,6 +579,14 @@ const AP_Param::GroupInfo NavEKF3::var_info[] = {
+     // @Units: m/s
+     AP_GROUPINFO("WENC_VERR", 53, NavEKF3, _wencOdmVelErr, 0.1f),
+ 
++    // @Param: FLOW_USE
++    // @DisplayName: Optical flow use bitmask
++    // @Description: Controls if the optical flow data is fused into the 24-state navigation estimator OR the 1-state terrain height estimator.
++    // @User: Advanced
++    // @Values: 0:None,1:Navigation,2:Terrain
++    // @RebootRequired: True
++    AP_GROUPINFO("FLOW_USE", 54, NavEKF3, _flowUse, FLOW_USE_DEFAULT),
++
+     AP_GROUPEND
+ };
+ 
+diff --git a/libraries/AP_NavEKF3/AP_NavEKF3.h b/libraries/AP_NavEKF3/AP_NavEKF3.h
+index 0461173f58fc..3da77257f4de 100644
+--- a/libraries/AP_NavEKF3/AP_NavEKF3.h
++++ b/libraries/AP_NavEKF3/AP_NavEKF3.h
+@@ -416,7 +416,12 @@ class NavEKF3 {
+     AP_Float _visOdmVelErrMax;      // Observation 1-STD velocity error assumed for visual odometry sensor at lowest reported quality (m/s)
+     AP_Float _visOdmVelErrMin;      // Observation 1-STD velocity error assumed for visual odometry sensor at highest reported quality (m/s)
+     AP_Float _wencOdmVelErr;        // Observation 1-STD velocity error assumed for wheel odometry sensor (m/s)
++    AP_Int8  _flowUse;              // Controls if the optical flow data is fused into the main navigation estimator and/or the terrain estimator.
+ 
++// Possible values for _flowUse
++#define FLOW_USE_NONE    0
++#define FLOW_USE_NAV     1
++#define FLOW_USE_TERRAIN 2
+ 
+     // Tuning parameters
+     const float gpsNEVelVarAccScale = 0.05f;       // Scale factor applied to NE velocity measurement variance due to manoeuvre acceleration
+diff --git a/libraries/AP_NavEKF3/AP_NavEKF3_Control.cpp b/libraries/AP_NavEKF3/AP_NavEKF3_Control.cpp
+index f84e4e767bca..0b9800ad02c8 100644
+--- a/libraries/AP_NavEKF3/AP_NavEKF3_Control.cpp
++++ b/libraries/AP_NavEKF3/AP_NavEKF3_Control.cpp
+@@ -209,7 +209,7 @@ void NavEKF3_core::setAidingMode()
+             // GPS aiding is the preferred option unless excluded by the user
+             if(readyToUseGPS() || readyToUseRangeBeacon()) {
+                 PV_AidingMode = AID_ABSOLUTE;
+-            } else if (readyToUseOptFlow() || readyToUseBodyOdm()) {
++            } else if ((readyToUseOptFlow()  && (frontend->_flowUse == FLOW_USE_NAV)) || readyToUseBodyOdm()) {
+                 PV_AidingMode = AID_RELATIVE;
+             }
+             break;
+diff --git a/libraries/AP_NavEKF3/AP_NavEKF3_OptFlowFusion.cpp b/libraries/AP_NavEKF3/AP_NavEKF3_OptFlowFusion.cpp
+index 6552f39b8c50..de1acdc7b256 100644
+--- a/libraries/AP_NavEKF3/AP_NavEKF3_OptFlowFusion.cpp
++++ b/libraries/AP_NavEKF3/AP_NavEKF3_OptFlowFusion.cpp
+@@ -51,22 +51,20 @@ void NavEKF3_core::SelectFlowFusion()
+         flowDataValid = true;
+     }
+ 
+-    // if we do have valid flow measurements, fuse data into a 1-state EKF to estimate terrain height
+-    // we don't do terrain height estimation in optical flow only mode as the ground becomes our zero height reference
+-    if ((flowDataToFuse || rangeDataToFuse) && tiltOK) {
+-        // fuse optical flow data into the terrain estimator if available and if there is no range data (range data is better)
+-        fuseOptFlowData = (flowDataToFuse && !rangeDataToFuse);
++    // if have valid flow or range measurements, fuse data into a 1-state EKF to estimate terrain height
++    if (((flowDataToFuse && (frontend->_flowUse == FLOW_USE_TERRAIN)) || rangeDataToFuse) && tiltOK) {
+         // Estimate the terrain offset (runs a one state EKF)
+         EstimateTerrainOffset();
+     }
+ 
+     // Fuse optical flow data into the main filter
+-    if (flowDataToFuse && tiltOK)
+-    {
+-        // Set the flow noise used by the fusion processes
+-        R_LOS = sq(MAX(frontend->_flowNoise, 0.05f));
+-        // Fuse the optical flow X and Y axis data into the main filter sequentially
+-        FuseOptFlow();
++    if (flowDataToFuse && tiltOK) {
++        if (frontend->_flowUse == FLOW_USE_NAV) {
++            // Set the flow noise used by the fusion processes
++            R_LOS = sq(MAX(frontend->_flowNoise, 0.05f));
++            // Fuse the optical flow X and Y axis data into the main filter sequentially
++            FuseOptFlow();
++        }
+         // reset flag to indicate that no new flow data is available for fusion
+         flowDataToFuse = false;
+     }
+@@ -78,23 +76,25 @@ void NavEKF3_core::SelectFlowFusion()
+ /*
+ Estimation of terrain offset using a single state EKF
+ The filter can fuse motion compensated optical flow rates and range finder measurements
++Equations generated using https://github.com/PX4/ecl/tree/master/EKF/matlab/scripts/Terrain%20Estimator
+ */
+ void NavEKF3_core::EstimateTerrainOffset()
+ {
+     // start performance timer
+     hal.util->perf_begin(_perf_TerrainOffset);
+ 
+-    // constrain height above ground to be above range measured on ground
+-    float heightAboveGndEst = MAX((terrainState - stateStruct.position.z), rngOnGnd);
+-
+-    // calculate a predicted LOS rate squared
++    // horizontal velocity squared
+     float velHorizSq = sq(stateStruct.velocity.x) + sq(stateStruct.velocity.y);
+-    float losRateSq = velHorizSq / sq(heightAboveGndEst);
+ 
+-    // don't update terrain offset state if there is no range finder
+-    // don't update terrain state if not generating enough LOS rate, or without GPS, as it is poorly observable
+-    // don't update terrain state if we are using it as a height reference in the main filter
+-    bool cantFuseFlowData = (gpsNotAvailable || PV_AidingMode == AID_RELATIVE || velHorizSq < 25.0f || losRateSq < 0.01f);
++    // don't fuse flow data if LOS rate is misaligned, without GPS, or insufficient velocity, as it is poorly observable
++    // don't fuse flow data if it exceeds validity limits
++    // don't update terrain offset if ground is being used as the zero height datum in the main filter
++    bool cantFuseFlowData = ((frontend->_flowUse != FLOW_USE_TERRAIN)
++    || gpsNotAvailable 
++    || PV_AidingMode == AID_RELATIVE 
++    || velHorizSq < 25.0f 
++    || (MAX(ofDataDelayed.flowRadXY[0],ofDataDelayed.flowRadXY[1]) > frontend->_maxFlowRate));
++
+     if ((!rangeDataToFuse && cantFuseFlowData) || (activeHgtSource == HGT_SOURCE_RNG)) {
+         // skip update
+         inhibitGndState = true;
+@@ -112,7 +112,7 @@ void NavEKF3_core::EstimateTerrainOffset()
+ 
+         // in addition to a terrain gradient error model, we also have the growth in uncertainty due to the copters vertical velocity
+         float timeLapsed = MIN(0.001f * (imuSampleTime_ms - timeAtLastAuxEKF_ms), 1.0f);
+-        float Pincrement = (distanceTravelledSq * sq(0.01f*float(frontend->gndGradientSigma))) + sq(timeLapsed)*P[6][6];
++        float Pincrement = (distanceTravelledSq * sq(frontend->_terrGradMax)) + sq(timeLapsed)*P[6][6];
+         Popt += Pincrement;
+         timeAtLastAuxEKF_ms = imuSampleTime_ms;
+ 
+@@ -163,90 +163,111 @@ void NavEKF3_core::EstimateTerrainOffset()
+             }
+         }
+ 
+-        if (fuseOptFlowData && !cantFuseFlowData) {
++        if (!cantFuseFlowData) {
+ 
+-            Vector3f relVelSensor; // velocity of sensor relative to ground in sensor axes
+-            float losPred; // predicted optical flow angular rate measurement
++            Vector3f relVelSensor;          // velocity of sensor relative to ground in sensor axes
++            Vector2f losPred;               // predicted optical flow angular rate measurement
+             float q0 = stateStruct.quat[0]; // quaternion at optical flow measurement time
+             float q1 = stateStruct.quat[1]; // quaternion at optical flow measurement time
+             float q2 = stateStruct.quat[2]; // quaternion at optical flow measurement time
+             float q3 = stateStruct.quat[3]; // quaternion at optical flow measurement time
+             float K_OPT;
+             float H_OPT;
++            Vector2f auxFlowObsInnovVar;
+ 
+             // predict range to centre of image
+-            float flowRngPred = MAX((terrainState - stateStruct.position[2]),rngOnGnd) / prevTnb.c.z;
++            float flowRngPred = MAX((terrainState - stateStruct.position.z),rngOnGnd) / prevTnb.c.z;
+ 
+             // constrain terrain height to be below the vehicle
+-            terrainState = MAX(terrainState, stateStruct.position[2] + rngOnGnd);
++            terrainState = MAX(terrainState, stateStruct.position.z + rngOnGnd);
+ 
+             // calculate relative velocity in sensor frame
+             relVelSensor = prevTnb*stateStruct.velocity;
+ 
+             // divide velocity by range, subtract body rates and apply scale factor to
+             // get predicted sensed angular optical rates relative to X and Y sensor axes
+-            losPred =   norm(relVelSensor.x, relVelSensor.y)/flowRngPred;
++            losPred.x =   relVelSensor.y / flowRngPred;
++            losPred.y = - relVelSensor.x / flowRngPred;
+ 
+             // calculate innovations
+-            auxFlowObsInnov = losPred - norm(ofDataDelayed.flowRadXYcomp.x, ofDataDelayed.flowRadXYcomp.y);
+-
+-            // calculate observation jacobian
+-            float t3 = sq(q0);
+-            float t4 = sq(q1);
+-            float t5 = sq(q2);
+-            float t6 = sq(q3);
+-            float t10 = q0*q3*2.0f;
+-            float t11 = q1*q2*2.0f;
+-            float t14 = t3+t4-t5-t6;
+-            float t15 = t14*stateStruct.velocity.x;
+-            float t16 = t10+t11;
+-            float t17 = t16*stateStruct.velocity.y;
+-            float t18 = q0*q2*2.0f;
+-            float t19 = q1*q3*2.0f;
+-            float t20 = t18-t19;
+-            float t21 = t20*stateStruct.velocity.z;
+-            float t2 = t15+t17-t21;
+-            float t7 = t3-t4-t5+t6;
+-            float t8 = stateStruct.position[2]-terrainState;
+-            float t9 = 1.0f/sq(t8);
+-            float t24 = t3-t4+t5-t6;
+-            float t25 = t24*stateStruct.velocity.y;
+-            float t26 = t10-t11;
+-            float t27 = t26*stateStruct.velocity.x;
+-            float t28 = q0*q1*2.0f;
+-            float t29 = q2*q3*2.0f;
+-            float t30 = t28+t29;
+-            float t31 = t30*stateStruct.velocity.z;
+-            float t12 = t25-t27+t31;
+-            float t13 = sq(t7);
+-            float t22 = sq(t2);
+-            float t23 = 1.0f/(t8*t8*t8);
+-            float t32 = sq(t12);
+-            H_OPT = 0.5f*(t13*t22*t23*2.0f+t13*t23*t32*2.0f)/sqrtf(t9*t13*t22+t9*t13*t32);
++            auxFlowObsInnov = losPred - ofDataDelayed.flowRadXYcomp;
++
++            // calculate observation jacobians 
++            float t2 = q0*q0;
++            float t3 = q1*q1;
++            float t4 = q2*q2;
++            float t5 = q3*q3;
++            float t6 = stateStruct.position.z - terrainState;
++            float t7 = 1.0f / (t6*t6);
++            float t8 = q0*q3*2.0f;
++            float t9 = t2-t3-t4+t5;
++
++            // prevent the state variances from becoming badly conditioned
++            Popt = MAX(Popt,1E-6f);
++
++            // calculate observation noise variance from parameter
++            float flow_noise_variance = sq(MAX(frontend->_flowNoise, 0.05f));
++
++            // Fuse Y axis data
++
++            // Calculate observation partial derivative
++            H_OPT = t7*t9*(-stateStruct.velocity.z*(q0*q2*2.0-q1*q3*2.0)+stateStruct.velocity.x*(t2+t3-t4-t5)+stateStruct.velocity.y*(t8+q1*q2*2.0));
++
++            // calculate innovation variance
++            auxFlowObsInnovVar.y = H_OPT * Popt * H_OPT + flow_noise_variance;
++
++            // calculate Kalman gain
++            K_OPT = Popt * H_OPT / auxFlowObsInnovVar.y;
++
++            // calculate the innovation consistency test ratio
++            auxFlowTestRatio.y = sq(auxFlowObsInnov.y) / (sq(MAX(0.01f * (float)frontend->_flowInnovGate, 1.0f)) * auxFlowObsInnovVar.y);
++
++            // don't fuse if optical flow data is outside valid range
++            if (auxFlowTestRatio.y < 1.0f) {
++
++                // correct the state
++                terrainState -= K_OPT * auxFlowObsInnov.y;
++
++                // constrain the state
++                terrainState = MAX(terrainState, stateStruct.position.z + rngOnGnd);
++
++                // update intermediate variables used when fusing the X axis
++                t6 = stateStruct.position.z - terrainState;
++                t7 = 1.0f / (t6*t6);
++
++                // correct the covariance
++                Popt = Popt - K_OPT * H_OPT * Popt;
++
++                // prevent the state variances from becoming badly conditioned
++                Popt = MAX(Popt,1E-6f);
++            }
++
++            // fuse X axis data
++            H_OPT = -t7*t9*(stateStruct.velocity.z*(q0*q1*2.0+q2*q3*2.0)+stateStruct.velocity.y*(t2-t3+t4-t5)-stateStruct.velocity.x*(t8-q1*q2*2.0));
+ 
+             // calculate innovation variances
+-            auxFlowObsInnovVar = H_OPT*Popt*H_OPT + R_LOS;
++            auxFlowObsInnovVar.x = H_OPT * Popt * H_OPT + flow_noise_variance;
+ 
+             // calculate Kalman gain
+-            K_OPT = Popt*H_OPT/auxFlowObsInnovVar;
++            K_OPT = Popt * H_OPT / auxFlowObsInnovVar.x;
+ 
+             // calculate the innovation consistency test ratio
+-            auxFlowTestRatio = sq(auxFlowObsInnov) / (sq(MAX(0.01f * (float)frontend->_flowInnovGate, 1.0f)) * auxFlowObsInnovVar);
++            auxFlowTestRatio.x = sq(auxFlowObsInnov.x) / (sq(MAX(0.01f * (float)frontend->_flowInnovGate, 1.0f)) * auxFlowObsInnovVar.x);
+ 
+             // don't fuse if optical flow data is outside valid range
+-            if (MAX(ofDataDelayed.flowRadXY[0],ofDataDelayed.flowRadXY[1]) < frontend->_maxFlowRate) {
++            if (auxFlowTestRatio.x < 1.0f) {
+ 
+                 // correct the state
+-                terrainState -= K_OPT * auxFlowObsInnov;
++                terrainState -= K_OPT * auxFlowObsInnov.x;
+ 
+                 // constrain the state
+-                terrainState = MAX(terrainState, stateStruct.position[2] + rngOnGnd);
++                terrainState = MAX(terrainState, stateStruct.position.z + rngOnGnd);
+ 
+                 // correct the covariance
+                 Popt = Popt - K_OPT * H_OPT * Popt;
+ 
+-                // prevent the state variances from becoming negative
+-                Popt = MAX(Popt,0.0f);
++                // prevent the state variances from becoming badly conditioned
++                Popt = MAX(Popt,1E-6f);
+             }
+         }
+     }
+diff --git a/libraries/AP_NavEKF3/AP_NavEKF3_Outputs.cpp b/libraries/AP_NavEKF3/AP_NavEKF3_Outputs.cpp
+index 63e9473fa5f3..8429408351fb 100644
+--- a/libraries/AP_NavEKF3/AP_NavEKF3_Outputs.cpp
++++ b/libraries/AP_NavEKF3/AP_NavEKF3_Outputs.cpp
+@@ -56,7 +56,7 @@ void NavEKF3_core::getFlowDebug(float &varFlow, float &gndOffset, float &flowInn
+     gndOffset = terrainState;
+     flowInnovX = innovOptFlow[0];
+     flowInnovY = innovOptFlow[1];
+-    auxInnov = auxFlowObsInnov;
++    auxInnov = norm(auxFlowObsInnov.x,auxFlowObsInnov.y);
+     HAGL = terrainState - stateStruct.position.z;
+     rngInnov = innovRng;
+     range = rangeDataDelayed.rng;
+diff --git a/libraries/AP_NavEKF3/AP_NavEKF3_core.cpp b/libraries/AP_NavEKF3/AP_NavEKF3_core.cpp
+index 2adfa8991ceb..b6701d2b1634 100644
+--- a/libraries/AP_NavEKF3/AP_NavEKF3_core.cpp
++++ b/libraries/AP_NavEKF3/AP_NavEKF3_core.cpp
+@@ -201,7 +201,6 @@ void NavEKF3_core::InitialiseVariables()
+     memset(&nextP[0][0], 0, sizeof(nextP));
+     flowDataValid = false;
+     rangeDataToFuse  = false;
+-    fuseOptFlowData = false;
+     Popt = 0.0f;
+     terrainState = 0.0f;
+     prevPosN = stateStruct.position.x;
+diff --git a/libraries/AP_NavEKF3/AP_NavEKF3_core.h b/libraries/AP_NavEKF3/AP_NavEKF3_core.h
+index f7017a0fe737..ed2f42b00b49 100644
+--- a/libraries/AP_NavEKF3/AP_NavEKF3_core.h
++++ b/libraries/AP_NavEKF3/AP_NavEKF3_core.h
+@@ -1016,9 +1016,7 @@ class NavEKF3_core
+     uint8_t ofStoreIndex;           // OF data storage index
+     bool flowDataToFuse;            // true when optical flow data has is ready for fusion
+     bool flowDataValid;             // true while optical flow data is still fresh
+-    bool fuseOptFlowData;           // this boolean causes the last optical flow measurement to be fused
+-    float auxFlowObsInnov;          // optical flow rate innovation from 1-state terrain offset estimator
+-    float auxFlowObsInnovVar;       // innovation variance for optical flow observations from 1-state terrain offset estimator
++    Vector2f auxFlowObsInnov;       // optical flow rate innovation from 1-state terrain offset estimator
+     uint32_t flowValidMeaTime_ms;   // time stamp from latest valid flow measurement (msec)
+     uint32_t rngValidMeaTime_ms;    // time stamp from latest valid range measurement (msec)
+     uint32_t flowMeaTime_ms;        // time stamp from latest flow measurement (msec)
+@@ -1036,7 +1034,7 @@ class NavEKF3_core
+     bool inhibitGndState;           // true when the terrain position state is to remain constant
+     uint32_t prevFlowFuseTime_ms;   // time both flow measurement components passed their innovation consistency checks
+     Vector2 flowTestRatio;          // square of optical flow innovations divided by fail threshold used by main filter where >1.0 is a fail
+-    float auxFlowTestRatio;         // sum of squares of optical flow innovation divided by fail threshold used by 1-state terrain offset estimator
++    Vector2f auxFlowTestRatio;      // sum of squares of optical flow innovation divided by fail threshold used by 1-state terrain offset estimator
+     float R_LOS;                    // variance of optical flow rate measurements (rad/sec)^2
+     float auxRngTestRatio;          // square of range finder innovations divided by fail threshold used by main filter where >1.0 is a fail
+     Vector2f flowGyroBias;          // bias error of optical flow sensor gyro output
+diff --git a/libraries/AP_OpticalFlow/AP_OpticalFlow_SITL.cpp b/libraries/AP_OpticalFlow/AP_OpticalFlow_SITL.cpp
+index e0737213504b..1121a94688a2 100644
+--- a/libraries/AP_OpticalFlow/AP_OpticalFlow_SITL.cpp
++++ b/libraries/AP_OpticalFlow/AP_OpticalFlow_SITL.cpp
+@@ -91,8 +91,8 @@ void AP_OpticalFlow_SITL::update(void)
+     // optical rates relative to X and Y sensor axes assuming no misalignment or scale
+     // factor error. Note - these are instantaneous values. The sensor sums these values across the interval from the last
+     // poll to provide a delta angle across the interface
+-    state.flowRate.x =  -relVelSensor.y/range + gyro.x;
+-    state.flowRate.y =   relVelSensor.x/range + gyro.y;
++    state.flowRate.x =  -relVelSensor.y/range + gyro.x + _sitl->flow_noise * rand_float();
++    state.flowRate.y =   relVelSensor.x/range + gyro.y + _sitl->flow_noise * rand_float();
+ 
+     // The flow sensors body rates are assumed to be the same as the vehicle body rates (ie no misalignment)
+     // Note - these are instantaneous values. The sensor sums these values across the interval from the last
+diff --git a/libraries/SITL/SITL.cpp b/libraries/SITL/SITL.cpp
+index c17e8ffa9a94..2864a92c158c 100644
+--- a/libraries/SITL/SITL.cpp
++++ b/libraries/SITL/SITL.cpp
+@@ -152,6 +152,10 @@ const AP_Param::GroupInfo SITL::var_info2[] = {
+     AP_GROUPINFO("SHOVE_Y",     31, SITL,  shove.y, 0),
+     AP_GROUPINFO("SHOVE_Z",     32, SITL,  shove.z, 0),
+     AP_GROUPINFO("SHOVE_TIME",  33, SITL,  shove.t, 0),
++    
++    // optical flow sensor measurement noise in rad/sec
++    AP_GROUPINFO("FLOW_RND",   34, SITL,  flow_noise,  0.05f),
++
+     AP_GROUPEND
+ };
+     
+diff --git a/libraries/SITL/SITL.h b/libraries/SITL/SITL.h
+index 4011b0f1a17a..1ab54eb95a0c 100644
+--- a/libraries/SITL/SITL.h
++++ b/libraries/SITL/SITL.h
+@@ -175,6 +175,7 @@ class SITL {
+     AP_Float speedup; // simulation speedup
+     AP_Int8  odom_enable; // enable visual odomotry data
+     AP_Int8  telem_baudlimit_enable; // enable baudrate limiting on links
++    AP_Float flow_noise; // optical flow measurement noise (rad/sec)
+ 
+     // wind control
+     enum WindType {

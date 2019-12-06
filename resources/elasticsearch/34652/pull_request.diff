@@ -1,0 +1,154 @@
+diff --git a/server/src/main/java/org/elasticsearch/index/query/NestedQueryBuilder.java b/server/src/main/java/org/elasticsearch/index/query/NestedQueryBuilder.java
+index 889f41a037f8..a9083090353c 100644
+--- a/server/src/main/java/org/elasticsearch/index/query/NestedQueryBuilder.java
++++ b/server/src/main/java/org/elasticsearch/index/query/NestedQueryBuilder.java
+@@ -282,6 +282,16 @@ protected Query doToQuery(QueryShardContext context) throws IOException {
+         if (!nestedObjectMapper.nested().isNested()) {
+             throw new IllegalStateException("[" + NAME + "] nested object under path [" + path + "] is not of nested type");
+         }
++        if (innerHitBuilder != null &&
++            innerHitBuilder.getStoredFieldsContext() != null &&
++            innerHitBuilder.getStoredFieldsContext().fetchFields() == false &&
++                context.getMapperService().types().size() > 1) {
++
++            // for multi types indices we need to retrieve the _uid to extract the type of the document
++            // so it is not allowed to disable stored fields
++            throw new IllegalArgumentException("It is not allowed to disable stored fields [_none_] inside [inner_hits] on an index with" +
++                "multiple types.");
++        }
+         final BitSetProducer parentFilter;
+         Query innerQuery;
+         ObjectMapper objectMapper = context.nestedScope().getObjectMapper();
+diff --git a/server/src/main/java/org/elasticsearch/search/fetch/FetchPhase.java b/server/src/main/java/org/elasticsearch/search/fetch/FetchPhase.java
+index 0f957cd8d578..bffc4fa8f39f 100644
+--- a/server/src/main/java/org/elasticsearch/search/fetch/FetchPhase.java
++++ b/server/src/main/java/org/elasticsearch/search/fetch/FetchPhase.java
+@@ -277,7 +277,16 @@ private SearchHit createNestedSearchHit(SearchContext context,
+                 storedToRequestedFields, subReaderContext);
+         }
+ 
+-        DocumentMapper documentMapper = context.mapperService().documentMapper(uid.type());
++        final String typeText;
++        if (uid != null && uid.type() != null) {
++            typeText = uid.type();
++        } else {
++            // stored fields are disabled but it is not allowed to disable them on inner hits
++            // if the index has multiple types so we can assume that the index has a single type.
++            assert context.mapperService().types().size() == 1;
++            typeText = context.mapperService().types().iterator().next();
++        }
++        DocumentMapper documentMapper = context.mapperService().documentMapper(typeText);
+         SourceLookup sourceLookup = context.lookup().source();
+         sourceLookup.setSegmentAndDocument(subReaderContext, nestedSubDocId);
+ 
+diff --git a/server/src/test/java/org/elasticsearch/search/aggregations/metrics/TopHitsIT.java b/server/src/test/java/org/elasticsearch/search/aggregations/metrics/TopHitsIT.java
+index 66b84a445ff6..ed72a77d2d6b 100644
+--- a/server/src/test/java/org/elasticsearch/search/aggregations/metrics/TopHitsIT.java
++++ b/server/src/test/java/org/elasticsearch/search/aggregations/metrics/TopHitsIT.java
+@@ -1052,7 +1052,7 @@ public void testNoStoredFields() throws Exception {
+             for (SearchHit hit : hits) {
+                 assertThat(hit.getSourceAsMap(), nullValue());
+                 assertThat(hit.getId(), nullValue());
+-                assertThat(hit.getType(), nullValue());
++                assertThat(hit.getType(), equalTo(null));
+             }
+         }
+     }
+diff --git a/server/src/test/java/org/elasticsearch/search/source/MetadataFetchingIT.java b/server/src/test/java/org/elasticsearch/search/source/MetadataFetchingIT.java
+index 460fd11fbd9f..57edb67c64a9 100644
+--- a/server/src/test/java/org/elasticsearch/search/source/MetadataFetchingIT.java
++++ b/server/src/test/java/org/elasticsearch/search/source/MetadataFetchingIT.java
+@@ -18,17 +18,36 @@
+  */
+ package org.elasticsearch.search.source;
+ 
++import org.apache.lucene.search.join.ScoreMode;
++import org.elasticsearch.ElasticsearchException;
+ import org.elasticsearch.ExceptionsHelper;
++import org.elasticsearch.Version;
+ import org.elasticsearch.action.search.SearchPhaseExecutionException;
+ import org.elasticsearch.action.search.SearchResponse;
++import org.elasticsearch.cluster.metadata.IndexMetaData;
++import org.elasticsearch.common.settings.Settings;
++import org.elasticsearch.index.query.InnerHitBuilder;
++import org.elasticsearch.index.query.NestedQueryBuilder;
++import org.elasticsearch.index.query.TermQueryBuilder;
+ import org.elasticsearch.search.SearchContextException;
++import org.elasticsearch.search.SearchHits;
++import org.elasticsearch.search.fetch.subphase.FetchSourceContext;
+ import org.elasticsearch.test.ESIntegTestCase;
+ 
++import java.util.Collections;
++
+ import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;
++import static org.hamcrest.Matchers.containsString;
+ import static org.hamcrest.Matchers.equalTo;
+ import static org.hamcrest.Matchers.nullValue;
+ 
+ public class MetadataFetchingIT extends ESIntegTestCase {
++    @Override
++    protected boolean forbidPrivateIndexSettings() {
++        // needed to create an index with multiple types
++        return false;
++    }
++
+     public void testSimple() {
+         assertAcked(prepareCreate("test"));
+         ensureGreen();
+@@ -54,6 +73,56 @@ public void testSimple() {
+         assertThat(response.getHits().getAt(0).getSourceAsString(), nullValue());
+     }
+ 
++    public void testInnerHits() {
++        assertAcked(prepareCreate("test_with_types")
++            .addMapping("type1", "nested", "type=nested")
++            .addMapping("type2", "nested", "type=nested")
++            .setSettings(Settings.builder().put(IndexMetaData.SETTING_VERSION_CREATED, Version.CURRENT.minimumCompatibilityVersion())));
++        assertAcked(prepareCreate("test").addMapping("_doc", "nested", "type=nested"));
++        ensureGreen();
++        client().prepareIndex("test", "_doc", "1")
++            .setSource("field", "value", "nested", Collections.singletonMap("title", "foo")).execute().actionGet();
++        client().prepareIndex("test_with_types", "type1", "1")
++            .setSource("field", "value", "nested", Collections.singletonMap("title", "foo")).execute().actionGet();
++        refresh();
++
++        SearchResponse response = client()
++            .prepareSearch("test")
++            .storedFields("_none_")
++            .setFetchSource(false)
++            .setQuery(
++                new NestedQueryBuilder("nested", new TermQueryBuilder("nested.title", "foo"), ScoreMode.Total)
++                    .innerHit(new InnerHitBuilder()
++                        .setStoredFieldNames(Collections.singletonList("_none_"))
++                        .setFetchSourceContext(new FetchSourceContext(false)))
++            )
++            .get();
++        assertThat(response.getHits().totalHits, equalTo(1L));
++        assertThat(response.getHits().getAt(0).getId(), nullValue());
++        assertThat(response.getHits().getAt(0).getType(), equalTo(null));
++        assertThat(response.getHits().getAt(0).getSourceAsString(), nullValue());
++        assertThat(response.getHits().getAt(0).getInnerHits().size(), equalTo(1));
++        SearchHits hits = response.getHits().getAt(0).getInnerHits().get("nested");
++        assertThat(hits.totalHits, equalTo(1L));
++        assertThat(hits.getAt(0).getId(), nullValue());
++        assertThat(hits.getAt(0).getType(), equalTo("_doc"));
++        assertThat(hits.getAt(0).getSourceAsString(), nullValue());
++
++        ElasticsearchException exc = expectThrows(ElasticsearchException.class, () -> client()
++            .prepareSearch("test_with_types")
++            .storedFields("_none_")
++            .setFetchSource(false)
++            .setAllowPartialSearchResults(false)
++            .setQuery(
++                new NestedQueryBuilder("nested", new TermQueryBuilder("nested.title", "foo"), ScoreMode.Total)
++                    .innerHit(new InnerHitBuilder()
++                        .setStoredFieldNames(Collections.singletonList("_none_"))
++                        .setFetchSourceContext(new FetchSourceContext(false)))
++            )
++            .get());
++        assertThat(exc.getDetailedMessage(), containsString("It is not allowed to disable stored fields"));
++    }
++
+     public void testWithRouting() {
+         assertAcked(prepareCreate("test"));
+         ensureGreen();

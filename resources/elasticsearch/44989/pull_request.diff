@@ -1,0 +1,143 @@
+diff --git a/server/src/main/java/org/elasticsearch/index/engine/InternalEngine.java b/server/src/main/java/org/elasticsearch/index/engine/InternalEngine.java
+index be015f53a351..8662de260d06 100644
+--- a/server/src/main/java/org/elasticsearch/index/engine/InternalEngine.java
++++ b/server/src/main/java/org/elasticsearch/index/engine/InternalEngine.java
+@@ -1089,6 +1089,7 @@ private IndexResult indexIntoLucene(Index index, IndexingStrategy plan)
+     private boolean treatDocumentFailureAsTragicError(Index index) {
+         // TODO: can we enable this check for all origins except primary on the leader?
+         return index.origin() == Operation.Origin.REPLICA
++            || index.origin() == Operation.Origin.PEER_RECOVERY
+             || index.origin() == Operation.Origin.LOCAL_RESET;
+     }
+ 
+diff --git a/server/src/test/java/org/elasticsearch/index/engine/InternalEngineTests.java b/server/src/test/java/org/elasticsearch/index/engine/InternalEngineTests.java
+index fe0ad110598e..af322fba3f85 100644
+--- a/server/src/test/java/org/elasticsearch/index/engine/InternalEngineTests.java
++++ b/server/src/test/java/org/elasticsearch/index/engine/InternalEngineTests.java
+@@ -5922,7 +5922,7 @@ public long addDocument(Iterable<? extends IndexableField> doc) throws IOExcepti
+         try (Store store = createStore();
+              InternalEngine engine = createEngine(defaultSettings, store, createTempDir(), NoMergePolicy.INSTANCE, indexWriterFactory)) {
+             final ParsedDocument doc = testParsedDocument("1", null, testDocumentWithTextField(), SOURCE, null);
+-            Engine.Operation.Origin origin = randomFrom(REPLICA, LOCAL_RESET);
++            Engine.Operation.Origin origin = randomFrom(REPLICA, LOCAL_RESET, PEER_RECOVERY);
+             Engine.Index index = new Engine.Index(newUid(doc), doc, randomNonNegativeLong(), primaryTerm.get(),
+                 randomNonNegativeLong(), null, origin, System.nanoTime(), -1, false, UNASSIGNED_SEQ_NO, UNASSIGNED_PRIMARY_TERM);
+             addDocException.set(new IOException("simulated"));
+diff --git a/server/src/test/java/org/elasticsearch/indices/recovery/RecoveryTests.java b/server/src/test/java/org/elasticsearch/indices/recovery/RecoveryTests.java
+index 28e84c1210a2..cecd7dcd80a4 100644
+--- a/server/src/test/java/org/elasticsearch/indices/recovery/RecoveryTests.java
++++ b/server/src/test/java/org/elasticsearch/indices/recovery/RecoveryTests.java
+@@ -24,11 +24,15 @@
+ import org.apache.lucene.index.IndexCommit;
+ import org.apache.lucene.index.IndexWriter;
+ import org.apache.lucene.index.IndexWriterConfig;
++import org.apache.lucene.index.IndexableField;
+ import org.apache.lucene.index.NoMergePolicy;
++import org.apache.lucene.store.AlreadyClosedException;
++import org.elasticsearch.ExceptionsHelper;
+ import org.elasticsearch.action.ActionListener;
+ import org.elasticsearch.action.admin.indices.flush.FlushRequest;
+ import org.elasticsearch.action.index.IndexRequest;
+ import org.elasticsearch.cluster.metadata.IndexMetaData;
++import org.elasticsearch.cluster.routing.ShardRouting;
+ import org.elasticsearch.common.UUIDs;
+ import org.elasticsearch.common.bytes.BytesArray;
+ import org.elasticsearch.common.lucene.uid.Versions;
+@@ -38,6 +42,9 @@
+ import org.elasticsearch.index.MergePolicyConfig;
+ import org.elasticsearch.index.VersionType;
+ import org.elasticsearch.index.engine.Engine;
++import org.elasticsearch.index.engine.EngineFactory;
++import org.elasticsearch.index.engine.InternalEngineFactory;
++import org.elasticsearch.index.engine.InternalEngineTests;
+ import org.elasticsearch.index.mapper.SourceToParse;
+ import org.elasticsearch.index.replication.ESIndexLevelReplicationTestCase;
+ import org.elasticsearch.index.replication.RecoveryDuringReplicationTests;
+@@ -47,11 +54,13 @@
+ import org.elasticsearch.index.translog.SnapshotMatchers;
+ import org.elasticsearch.index.translog.Translog;
+ 
++import java.io.IOException;
+ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.Future;
++import java.util.concurrent.atomic.AtomicReference;
+ 
+ import static org.hamcrest.Matchers.empty;
+ import static org.hamcrest.Matchers.equalTo;
+@@ -405,4 +414,48 @@ public void testShouldFlushAfterPeerRecovery() throws Exception {
+             shards.assertAllEqual(numDocs);
+         }
+     }
++
++    public void testFailsToIndexDuringPeerRecovery() throws Exception {
++        AtomicReference<IOException> throwExceptionDuringIndexing = new AtomicReference<>(new IOException("simulated"));
++        try (ReplicationGroup group = new ReplicationGroup(buildIndexMetaData(0)) {
++            @Override
++            protected EngineFactory getEngineFactory(ShardRouting routing) {
++                if (routing.primary()) {
++                    return new InternalEngineFactory();
++                } else {
++                    return config -> InternalEngineTests.createInternalEngine((dir, iwc) -> new IndexWriter(dir, iwc) {
++                        @Override
++                        public long addDocument(Iterable<? extends IndexableField> doc) throws IOException {
++                            final IOException error = throwExceptionDuringIndexing.getAndSet(null);
++                            if (error != null) {
++                                throw error;
++                            }
++                            return super.addDocument(doc);
++                        }
++                    }, null, null, config);
++                }
++            }
++        }) {
++            group.startAll();
++            group.indexDocs(randomIntBetween(1, 10));
++            allowShardFailures();
++            IndexShard replica = group.addReplica();
++            expectThrows(Exception.class, () -> group.recoverReplica(replica,
++                (shard, sourceNode) -> new RecoveryTarget(shard, sourceNode, new PeerRecoveryTargetService.RecoveryListener() {
++                    @Override
++                    public void onRecoveryDone(RecoveryState state) {
++                        throw new AssertionError("recovery must fail");
++                    }
++
++                    @Override
++                    public void onRecoveryFailure(RecoveryState state, RecoveryFailedException e, boolean sendShardFailure) {
++                        assertThat(ExceptionsHelper.unwrap(e, IOException.class).getMessage(), equalTo("simulated"));
++                    }
++                })));
++            expectThrows(AlreadyClosedException.class, () -> replica.refresh("test"));
++            group.removeReplica(replica);
++            replica.store().close();
++            closeShards(replica);
++        }
++    }
+ }
+diff --git a/test/framework/src/main/java/org/elasticsearch/index/shard/IndexShardTestCase.java b/test/framework/src/main/java/org/elasticsearch/index/shard/IndexShardTestCase.java
+index d7c69d69595a..a349f985b4e9 100644
+--- a/test/framework/src/main/java/org/elasticsearch/index/shard/IndexShardTestCase.java
++++ b/test/framework/src/main/java/org/elasticsearch/index/shard/IndexShardTestCase.java
+@@ -640,11 +640,15 @@ protected final void recoverUnstartedReplica(final IndexShard replica,
+             request, Math.toIntExact(ByteSizeUnit.MB.toBytes(1)), between(1, 8));
+         primary.updateShardState(primary.routingEntry(), primary.getPendingPrimaryTerm(), null,
+             currentClusterStateVersion.incrementAndGet(), inSyncIds, routingTable);
+-
+-        PlainActionFuture<RecoveryResponse> future = new PlainActionFuture<>();
+-        recovery.recoverToTarget(future);
+-        future.actionGet();
+-        recoveryTarget.markAsDone();
++        try {
++            PlainActionFuture<RecoveryResponse> future = new PlainActionFuture<>();
++            recovery.recoverToTarget(future);
++            future.actionGet();
++            recoveryTarget.markAsDone();
++        } catch (Exception e) {
++            recoveryTarget.fail(new RecoveryFailedException(request, e), false);
++            throw e;
++        }
+     }
+ 
+     protected void startReplicaAfterRecovery(IndexShard replica, IndexShard primary, Set<String> inSyncIds,

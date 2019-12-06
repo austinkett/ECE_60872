@@ -1,0 +1,398 @@
+diff --git a/server/src/main/java/org/elasticsearch/index/get/GetResult.java b/server/src/main/java/org/elasticsearch/index/get/GetResult.java
+index a3f83609037e..ba5c4cd929fd 100644
+--- a/server/src/main/java/org/elasticsearch/index/get/GetResult.java
++++ b/server/src/main/java/org/elasticsearch/index/get/GetResult.java
+@@ -20,6 +20,7 @@
+ package org.elasticsearch.index.get;
+ 
+ import org.elasticsearch.ElasticsearchParseException;
++import org.elasticsearch.common.Strings;
+ import org.elasticsearch.common.bytes.BytesReference;
+ import org.elasticsearch.common.compress.CompressorFactory;
+ import org.elasticsearch.common.document.DocumentField;
+@@ -30,6 +31,7 @@
+ import org.elasticsearch.common.xcontent.XContentBuilder;
+ import org.elasticsearch.common.xcontent.XContentHelper;
+ import org.elasticsearch.common.xcontent.XContentParser;
++import org.elasticsearch.index.mapper.IgnoredFieldMapper;
+ import org.elasticsearch.index.mapper.SourceFieldMapper;
+ import org.elasticsearch.search.lookup.SourceLookup;
+ 
+@@ -225,10 +227,13 @@ public XContentBuilder toXContentEmbedded(XContentBuilder builder, Params params
+                 }
+             }
+         }
+-
+         for (DocumentField field : metaFields) {
+-            Object value = field.getValue();
+-            builder.field(field.getName(), value);
++            // TODO: can we avoid having an exception here?
++            if (field.getName().equals(IgnoredFieldMapper.NAME)) {
++                builder.field(field.getName(), field.getValues());
++            } else {
++                builder.field(field.getName(), field.<Object>getValue());
++            }
+         }
+ 
+         builder.field(FOUND, exists);
+@@ -316,7 +321,11 @@ public static GetResult fromXContentEmbedded(XContentParser parser, String index
+                     parser.skipChildren(); // skip potential inner objects for forward compatibility
+                 }
+             } else if (token == XContentParser.Token.START_ARRAY) {
+-                parser.skipChildren(); // skip potential inner arrays for forward compatibility
++                if (IgnoredFieldMapper.NAME.equals(currentFieldName)) {
++                    fields.put(currentFieldName, new DocumentField(currentFieldName, parser.list()));
++                } else {
++                    parser.skipChildren(); // skip potential inner arrays for forward compatibility
++                }
+             }
+         }
+         return new GetResult(index, type, id, version, found, source, fields);
+@@ -400,7 +409,12 @@ public boolean equals(Object o) {
+ 
+     @Override
+     public int hashCode() {
+-        return Objects.hash(index, type, id, version, exists, fields, sourceAsMap());
++        return Objects.hash(version, exists, index, type, id, fields, sourceAsMap());
++    }
++
++    @Override
++    public String toString() {
++        return Strings.toString(this, true, true);
+     }
+ }
+ 
+diff --git a/server/src/main/java/org/elasticsearch/search/SearchHit.java b/server/src/main/java/org/elasticsearch/search/SearchHit.java
+index 8c688cbf4466..66999c7e3899 100644
+--- a/server/src/main/java/org/elasticsearch/search/SearchHit.java
++++ b/server/src/main/java/org/elasticsearch/search/SearchHit.java
+@@ -602,16 +602,24 @@ private static void declareMetaDataFields(ObjectParser<Map<String, Object>, Void
+         for (String metadatafield : MapperService.getAllMetaFields()) {
+             if (metadatafield.equals(Fields._ID) == false && metadatafield.equals(Fields._INDEX) == false
+                     && metadatafield.equals(Fields._TYPE) == false) {
+-                parser.declareField((map, field) -> {
+-                    @SuppressWarnings("unchecked")
+-                    Map<String, DocumentField> fieldMap = (Map<String, DocumentField>) map.computeIfAbsent(Fields.FIELDS,
+-                            v -> new HashMap<String, DocumentField>());
+-                    fieldMap.put(field.getName(), field);
+-                }, (p, c) -> {
+-                    List<Object> values = new ArrayList<>();
+-                    values.add(parseFieldsValue(p));
+-                    return new DocumentField(metadatafield, values);
+-                }, new ParseField(metadatafield), ValueType.VALUE);
++                if (metadatafield.equals(IgnoredFieldMapper.NAME)) {
++                    parser.declareObjectArray((map, list) -> {
++                            @SuppressWarnings("unchecked")
++                            Map<String, DocumentField> fieldMap = (Map<String, DocumentField>) map.computeIfAbsent(Fields.FIELDS,
++                                v -> new HashMap<String, DocumentField>());
++                            DocumentField field = new DocumentField(metadatafield, list);
++                            fieldMap.put(field.getName(), field);
++                        }, (p, c) -> parseFieldsValue(p),
++                        new ParseField(metadatafield));
++                } else {
++                    parser.declareField((map, field) -> {
++                            @SuppressWarnings("unchecked")
++                            Map<String, DocumentField> fieldMap = (Map<String, DocumentField>) map.computeIfAbsent(Fields.FIELDS,
++                                v -> new HashMap<String, DocumentField>());
++                            fieldMap.put(field.getName(), field);
++                        }, (p, c) -> new DocumentField(metadatafield, Collections.singletonList(parseFieldsValue(p))),
++                        new ParseField(metadatafield), ValueType.VALUE);
++                }
+             }
+         }
+     }
+@@ -958,4 +966,9 @@ public int hashCode() {
+             return Objects.hash(field, offset, child);
+         }
+     }
++
++    @Override
++    public String toString() {
++        return Strings.toString(this, true, true);
++    }
+ }
+diff --git a/server/src/test/java/org/elasticsearch/index/get/DocumentFieldTests.java b/server/src/test/java/org/elasticsearch/index/get/DocumentFieldTests.java
+index 830e41996e9b..e2e3d4df67cf 100644
+--- a/server/src/test/java/org/elasticsearch/index/get/DocumentFieldTests.java
++++ b/server/src/test/java/org/elasticsearch/index/get/DocumentFieldTests.java
+@@ -26,7 +26,11 @@
+ import org.elasticsearch.common.xcontent.ToXContent;
+ import org.elasticsearch.common.xcontent.XContentParser;
+ import org.elasticsearch.common.xcontent.XContentType;
+-import org.elasticsearch.index.mapper.RoutingFieldMapper;
++import org.elasticsearch.index.mapper.IdFieldMapper;
++import org.elasticsearch.index.mapper.IgnoredFieldMapper;
++import org.elasticsearch.index.mapper.IndexFieldMapper;
++import org.elasticsearch.index.mapper.MapperService;
++import org.elasticsearch.index.mapper.TypeFieldMapper;
+ import org.elasticsearch.test.ESTestCase;
+ import org.elasticsearch.test.RandomObjects;
+ 
+@@ -98,14 +102,28 @@ private static DocumentField mutateDocumentField(DocumentField documentField) {
+ 
+     public static Tuple<DocumentField, DocumentField> randomDocumentField(XContentType xContentType) {
+         if (randomBoolean()) {
+-            String fieldName = randomFrom(RoutingFieldMapper.NAME);
+-            DocumentField documentField = new DocumentField(fieldName, Collections.singletonList(randomAlphaOfLengthBetween(3, 10)));
++            String metaField = randomValueOtherThanMany(field -> field.equals(TypeFieldMapper.NAME)
++                    || field.equals(IndexFieldMapper.NAME) || field.equals(IdFieldMapper.NAME),
++                () -> randomFrom(MapperService.getAllMetaFields()));
++            DocumentField documentField;
++            if (metaField.equals(IgnoredFieldMapper.NAME)) {
++                int numValues = randomIntBetween(1, 3);
++                List<Object> ignoredFields = new ArrayList<>(numValues);
++                for (int i = 0; i < numValues; i++) {
++                    ignoredFields.add(randomAlphaOfLengthBetween(3, 10));
++                }
++                documentField = new DocumentField(metaField, ignoredFields);
++            } else {
++                //meta fields are single value only, besides _ignored
++                documentField = new DocumentField(metaField, Collections.singletonList(randomAlphaOfLengthBetween(3, 10)));
++            }
+             return Tuple.tuple(documentField, documentField);
++        } else {
++            String fieldName = randomAlphaOfLengthBetween(3, 10);
++            Tuple<List<Object>, List<Object>> tuple = RandomObjects.randomStoredFieldValues(random(), xContentType);
++            DocumentField input = new DocumentField(fieldName, tuple.v1());
++            DocumentField expected = new DocumentField(fieldName, tuple.v2());
++            return Tuple.tuple(input, expected);
+         }
+-        String fieldName = randomAlphaOfLengthBetween(3, 10);
+-        Tuple<List<Object>, List<Object>> tuple = RandomObjects.randomStoredFieldValues(random(), xContentType);
+-        DocumentField input = new DocumentField(fieldName, tuple.v1());
+-        DocumentField expected = new DocumentField(fieldName, tuple.v2());
+-        return Tuple.tuple(input, expected);
+     }
+ }
+diff --git a/server/src/test/java/org/elasticsearch/index/get/GetResultTests.java b/server/src/test/java/org/elasticsearch/index/get/GetResultTests.java
+index a38d183299cd..1cc2612041f4 100644
+--- a/server/src/test/java/org/elasticsearch/index/get/GetResultTests.java
++++ b/server/src/test/java/org/elasticsearch/index/get/GetResultTests.java
+@@ -90,7 +90,6 @@ public void testToAndFromXContentEmbedded() throws Exception {
+         XContentType xContentType = randomFrom(XContentType.values());
+         Tuple<GetResult, GetResult> tuple = randomGetResult(xContentType);
+         GetResult getResult = tuple.v1();
+-
+         // We don't expect to retrieve the index/type/id of the GetResult because they are not rendered
+         // by the toXContentEmbedded method.
+         GetResult expectedGetResult = new GetResult(null, null, null, -1,
+@@ -106,7 +105,6 @@ public void testToAndFromXContentEmbedded() throws Exception {
+             parsedEmbeddedGetResult = GetResult.fromXContentEmbedded(parser);
+             assertNull(parser.nextToken());
+         }
+-
+         assertEquals(expectedGetResult, parsedEmbeddedGetResult);
+         //print the parsed object out and test that the output is the same as the original output
+         BytesReference finalBytes = toXContentEmbedded(parsedEmbeddedGetResult, xContentType, humanReadable);
+@@ -203,16 +201,17 @@ public static GetResult mutateGetResult(GetResult getResult) {
+         return Tuple.tuple(getResult, expectedGetResult);
+     }
+ 
+-    private static Tuple<Map<String, DocumentField>,Map<String, DocumentField>> randomDocumentFields(XContentType xContentType) {
++    public static Tuple<Map<String, DocumentField>,Map<String, DocumentField>> randomDocumentFields(XContentType xContentType) {
+         int numFields = randomIntBetween(2, 10);
+         Map<String, DocumentField> fields = new HashMap<>(numFields);
+         Map<String, DocumentField> expectedFields = new HashMap<>(numFields);
+-        for (int i = 0; i < numFields; i++) {
++        while (fields.size() < numFields) {
+             Tuple<DocumentField, DocumentField> tuple = randomDocumentField(xContentType);
+             DocumentField getField = tuple.v1();
+             DocumentField expectedGetField = tuple.v2();
+-            fields.put(getField.getName(), getField);
+-            expectedFields.put(expectedGetField.getName(), expectedGetField);
++            if (fields.putIfAbsent(getField.getName(), getField) == null) {
++                assertNull(expectedFields.putIfAbsent(expectedGetField.getName(), expectedGetField));
++            }
+         }
+         return Tuple.tuple(fields, expectedFields);
+     }
+diff --git a/server/src/test/java/org/elasticsearch/search/SearchHitTests.java b/server/src/test/java/org/elasticsearch/search/SearchHitTests.java
+index 97dfad464544..87b8ba2dc59b 100644
+--- a/server/src/test/java/org/elasticsearch/search/SearchHitTests.java
++++ b/server/src/test/java/org/elasticsearch/search/SearchHitTests.java
+@@ -19,23 +19,31 @@
+ 
+ package org.elasticsearch.search;
+ 
++import java.io.IOException;
++import java.io.InputStream;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.function.Predicate;
++
+ import org.apache.lucene.search.Explanation;
+ import org.elasticsearch.action.OriginalIndices;
+ import org.elasticsearch.common.Strings;
+ import org.elasticsearch.common.bytes.BytesArray;
+ import org.elasticsearch.common.bytes.BytesReference;
+-import org.elasticsearch.common.collect.Tuple;
+ import org.elasticsearch.common.document.DocumentField;
+ import org.elasticsearch.common.io.stream.BytesStreamOutput;
+ import org.elasticsearch.common.io.stream.InputStreamStreamInput;
+ import org.elasticsearch.common.text.Text;
+-import org.elasticsearch.common.util.set.Sets;
+ import org.elasticsearch.common.xcontent.ToXContent;
+ import org.elasticsearch.common.xcontent.XContentBuilder;
+ import org.elasticsearch.common.xcontent.XContentParser;
+ import org.elasticsearch.common.xcontent.XContentType;
+ import org.elasticsearch.common.xcontent.json.JsonXContent;
+ import org.elasticsearch.index.Index;
++import org.elasticsearch.index.get.GetResultTests;
+ import org.elasticsearch.index.shard.ShardId;
+ import org.elasticsearch.search.SearchHit.NestedIdentity;
+ import org.elasticsearch.search.fetch.subphase.highlight.HighlightField;
+@@ -43,16 +51,6 @@
+ import org.elasticsearch.test.ESTestCase;
+ import org.elasticsearch.test.RandomObjects;
+ 
+-import java.io.IOException;
+-import java.io.InputStream;
+-import java.util.ArrayList;
+-import java.util.Collections;
+-import java.util.HashMap;
+-import java.util.List;
+-import java.util.Map;
+-import java.util.Set;
+-import java.util.function.Predicate;
+-
+ import static org.elasticsearch.common.xcontent.XContentHelper.toXContent;
+ import static org.elasticsearch.test.XContentTestUtils.insertRandomFields;
+ import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertToXContentEquivalent;
+@@ -63,8 +61,6 @@
+ 
+ public class SearchHitTests extends ESTestCase {
+ 
+-    private static Set<String> META_FIELDS = Sets.newHashSet("_uid", "_parent", "_routing", "_size", "_timestamp", "_ttl");
+-
+     public static SearchHit createTestItem(boolean withOptionalInnerHits) {
+         int internalId = randomInt();
+         String uid = randomAlphaOfLength(10);
+@@ -75,18 +71,7 @@ public static SearchHit createTestItem(boolean withOptionalInnerHits) {
+         }
+         Map<String, DocumentField> fields = new HashMap<>();
+         if (randomBoolean()) {
+-            int size = randomIntBetween(0, 10);
+-            for (int i = 0; i < size; i++) {
+-                Tuple<List<Object>, List<Object>> values = RandomObjects.randomStoredFieldValues(random(),
+-                        XContentType.JSON);
+-                if (randomBoolean()) {
+-                    String metaField = randomFrom(META_FIELDS);
+-                    fields.put(metaField, new DocumentField(metaField, values.v1()));
+-                } else {
+-                    String fieldName = randomAlphaOfLengthBetween(5, 10);
+-                    fields.put(fieldName, new DocumentField(fieldName, values.v1()));
+-                }
+-            }
++            fields = GetResultTests.randomDocumentFields(XContentType.JSON).v1();
+         }
+         SearchHit hit = new SearchHit(internalId, uid, type, nestedIdentity, fields);
+         if (frequently()) {
+@@ -109,7 +94,8 @@ public static SearchHit createTestItem(boolean withOptionalInnerHits) {
+             int size = randomIntBetween(0, 5);
+             Map<String, HighlightField> highlightFields = new HashMap<>(size);
+             for (int i = 0; i < size; i++) {
+-                highlightFields.put(randomAlphaOfLength(5), HighlightFieldTests.createTestItem());
++                HighlightField testItem = HighlightFieldTests.createTestItem();
++                highlightFields.put(testItem.getName(), testItem);
+             }
+             hit.highlightFields(highlightFields);
+         }
+diff --git a/server/src/test/java/org/elasticsearch/search/SearchSortValuesTests.java b/server/src/test/java/org/elasticsearch/search/SearchSortValuesTests.java
+index d1a9a15a3937..d69039b72f56 100644
+--- a/server/src/test/java/org/elasticsearch/search/SearchSortValuesTests.java
++++ b/server/src/test/java/org/elasticsearch/search/SearchSortValuesTests.java
+@@ -46,13 +46,13 @@ public static SearchSortValues createTestItem() {
+         List<Supplier<Object>> valueSuppliers = new ArrayList<>();
+         // this should reflect all values that are allowed to go through the transport layer
+         valueSuppliers.add(() -> null);
+-        valueSuppliers.add(() -> randomInt());
+-        valueSuppliers.add(() -> randomLong());
+-        valueSuppliers.add(() -> randomDouble());
+-        valueSuppliers.add(() -> randomFloat());
+-        valueSuppliers.add(() -> randomByte());
+-        valueSuppliers.add(() -> randomShort());
+-        valueSuppliers.add(() -> randomBoolean());
++        valueSuppliers.add(ESTestCase::randomInt);
++        valueSuppliers.add(ESTestCase::randomLong);
++        valueSuppliers.add(ESTestCase::randomDouble);
++        valueSuppliers.add(ESTestCase::randomFloat);
++        valueSuppliers.add(ESTestCase::randomByte);
++        valueSuppliers.add(ESTestCase::randomShort);
++        valueSuppliers.add(ESTestCase::randomBoolean);
+         valueSuppliers.add(() -> frequently() ? randomAlphaOfLengthBetween(1, 30) : randomRealisticUnicodeOfCodepointLength(30));
+ 
+         int size = randomIntBetween(1, 20);
+diff --git a/test/framework/src/main/java/org/elasticsearch/test/RandomObjects.java b/test/framework/src/main/java/org/elasticsearch/test/RandomObjects.java
+index 06eefb7ccba1..68434f0f29ec 100644
+--- a/test/framework/src/main/java/org/elasticsearch/test/RandomObjects.java
++++ b/test/framework/src/main/java/org/elasticsearch/test/RandomObjects.java
+@@ -48,7 +48,7 @@
+ import java.util.Random;
+ 
+ import static com.carrotsearch.randomizedtesting.generators.RandomNumbers.randomIntBetween;
+-import static com.carrotsearch.randomizedtesting.generators.RandomStrings.randomAsciiOfLength;
++import static com.carrotsearch.randomizedtesting.generators.RandomStrings.randomAsciiLettersOfLength;
+ import static com.carrotsearch.randomizedtesting.generators.RandomStrings.randomUnicodeOfLengthBetween;
+ import static java.util.Collections.singleton;
+ import static org.elasticsearch.cluster.metadata.IndexMetaData.INDEX_UUID_NA_VALUE;
+@@ -122,7 +122,7 @@ private RandomObjects() {
+                     expectedParsedValues.add(randomBoolean);
+                     break;
+                 case 7:
+-                    String randomString = random.nextBoolean() ? RandomStrings.randomAsciiOfLengthBetween(random, 3, 10 ) :
++                    String randomString = random.nextBoolean() ? RandomStrings.randomAsciiLettersOfLengthBetween(random, 3, 10) :
+                             randomUnicodeOfLengthBetween(random, 3, 10);
+                     originalValues.add(randomString);
+                     expectedParsedValues.add(randomString);
+@@ -191,11 +191,11 @@ private static void addFields(Random random, XContentBuilder builder, int minNum
+         for (int i = 0; i < numFields; i++) {
+             if (currentDepth < 5 && random.nextInt(100) >= 70) {
+                 if (random.nextBoolean()) {
+-                    builder.startObject(RandomStrings.randomAsciiOfLengthBetween(random, 6, 10));
++                    builder.startObject(RandomStrings.randomAsciiLettersOfLengthBetween(random, 6, 10));
+                     addFields(random, builder, minNumFields, currentDepth + 1);
+                     builder.endObject();
+                 } else {
+-                    builder.startArray(RandomStrings.randomAsciiOfLengthBetween(random, 6, 10));
++                    builder.startArray(RandomStrings.randomAsciiLettersOfLengthBetween(random, 6, 10));
+                     int numElements = randomIntBetween(random, 1, 5);
+                     boolean object = random.nextBoolean();
+                     int dataType = -1;
+@@ -214,7 +214,7 @@ private static void addFields(Random random, XContentBuilder builder, int minNum
+                     builder.endArray();
+                 }
+             } else {
+-                builder.field(RandomStrings.randomAsciiOfLengthBetween(random, 6, 10),
++                builder.field(RandomStrings.randomAsciiLettersOfLengthBetween(random, 6, 10),
+                         randomFieldValue(random, randomDataType(random)));
+             }
+         }
+@@ -227,9 +227,9 @@ private static int randomDataType(Random random) {
+     private static Object randomFieldValue(Random random, int dataType) {
+         switch(dataType) {
+             case 0:
+-                return RandomStrings.randomAsciiOfLengthBetween(random, 3, 10);
++                return RandomStrings.randomAsciiLettersOfLengthBetween(random, 3, 10);
+             case 1:
+-                return RandomStrings.randomAsciiOfLengthBetween(random, 3, 10);
++                return RandomStrings.randomAsciiLettersOfLengthBetween(random, 3, 10);
+             case 2:
+                 return random.nextLong();
+             case 3:
+@@ -287,10 +287,10 @@ private static Object randomFieldValue(Random random, int dataType) {
+      * @param random Random generator
+      */
+     private static Tuple<Failure, Failure> randomShardInfoFailure(Random random) {
+-        String index = randomAsciiOfLength(random, 5);
+-        String indexUuid = randomAsciiOfLength(random, 5);
++        String index = randomAsciiLettersOfLength(random, 5);
++        String indexUuid = randomAsciiLettersOfLength(random, 5);
+         int shardId = randomIntBetween(random, 1, 10);
+-        String nodeId = randomAsciiOfLength(random, 5);
++        String nodeId = randomAsciiLettersOfLength(random, 5);
+         RestStatus status = randomFrom(random, RestStatus.INTERNAL_SERVER_ERROR, RestStatus.FORBIDDEN, RestStatus.NOT_FOUND);
+         boolean primary = random.nextBoolean();
+         ShardId shard = new ShardId(index, indexUuid, shardId);

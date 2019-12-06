@@ -1,0 +1,518 @@
+diff --git a/x-pack/plugin/watcher/src/main/java/org/elasticsearch/xpack/watcher/notification/NotificationService.java b/x-pack/plugin/watcher/src/main/java/org/elasticsearch/xpack/watcher/notification/NotificationService.java
+index ae96aa4d0cee..f62de14b931c 100644
+--- a/x-pack/plugin/watcher/src/main/java/org/elasticsearch/xpack/watcher/notification/NotificationService.java
++++ b/x-pack/plugin/watcher/src/main/java/org/elasticsearch/xpack/watcher/notification/NotificationService.java
+@@ -5,16 +5,24 @@
+  */
+ package org.elasticsearch.xpack.watcher.notification;
+ 
+-import org.elasticsearch.common.collect.Tuple;
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
++import org.elasticsearch.common.Nullable;
+ import org.elasticsearch.common.settings.ClusterSettings;
++import org.elasticsearch.common.settings.SecureSettings;
++import org.elasticsearch.common.settings.SecureString;
+ import org.elasticsearch.common.settings.Setting;
+ import org.elasticsearch.common.settings.Settings;
+ import org.elasticsearch.common.settings.SettingsException;
+ 
++import java.io.IOException;
++import java.io.InputStream;
++import java.security.GeneralSecurityException;
+ import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Set;
+ import java.util.function.BiFunction;
+ 
+ /**
+@@ -23,25 +31,70 @@
+ public abstract class NotificationService<Account> {
+ 
+     private final String type;
+-    // both are guarded by this
+-    private Map<String, Account> accounts;
+-    private Account defaultAccount;
+-
+-    public NotificationService(String type,
+-                               ClusterSettings clusterSettings, List<Setting<?>> pluginSettings) {
+-        this(type);
+-        clusterSettings.addSettingsUpdateConsumer(this::reload, pluginSettings);
++    private final Logger logger;
++    private final Settings bootSettings;
++    private final List<Setting<?>> pluginSecureSettings;
++    // all are guarded by this
++    private volatile Map<String, Account> accounts;
++    private volatile Account defaultAccount;
++    // cached cluster setting, required when recreating the notification clients
++    // using the new "reloaded" secure settings
++    private volatile Settings cachedClusterSettings;
++    // cached secure settings, required when recreating the notification clients
++    // using the new updated cluster settings
++    private volatile SecureSettings cachedSecureSettings;
++
++    public NotificationService(String type, Settings settings, ClusterSettings clusterSettings, List<Setting<?>> pluginDynamicSettings,
++            List<Setting<?>> pluginSecureSettings) {
++        this(type, settings, pluginSecureSettings);
++        // register a grand updater for the whole group, as settings are usable together
++        clusterSettings.addSettingsUpdateConsumer(this::clusterSettingsConsumer, pluginDynamicSettings);
+     }
+ 
+     // Used for testing only
+-    NotificationService(String type) {
++    NotificationService(String type, Settings settings, List<Setting<?>> pluginSecureSettings) {
+         this.type = type;
++        this.logger = LogManager.getLogger();
++        this.bootSettings = settings;
++        this.pluginSecureSettings = pluginSecureSettings;
++    }
++
++    private synchronized void clusterSettingsConsumer(Settings settings) {
++        // update cached cluster settings
++        this.cachedClusterSettings = settings;
++        // use these new dynamic cluster settings together with the previously cached
++        // secure settings
++        buildAccounts();
+     }
+ 
+     public synchronized void reload(Settings settings) {
+-        Tuple<Map<String, Account>, Account> accounts = buildAccounts(settings, this::createAccount);
+-        this.accounts = Collections.unmodifiableMap(accounts.v1());
+-        this.defaultAccount = accounts.v2();
++        // `SecureSettings` are available here! cache them as they will be needed
++        // whenever dynamic cluster settings change and we have to rebuild the accounts
++        try {
++            this.cachedSecureSettings = extractSecureSettings(settings, pluginSecureSettings);
++        } catch (GeneralSecurityException e) {
++            logger.error("Keystore exception while reloading watcher notification service", e);
++            return;
++        }
++        // use these new secure settings together with the previously cached dynamic
++        // cluster settings
++        buildAccounts();
++    }
++
++    private void buildAccounts() {
++        // build complete settings combining cluster and secure settings
++        final Settings.Builder completeSettingsBuilder = Settings.builder().put(bootSettings, false);
++        if (this.cachedClusterSettings != null) {
++            completeSettingsBuilder.put(this.cachedClusterSettings, false);
++        }
++        if (this.cachedSecureSettings != null) {
++            completeSettingsBuilder.setSecureSettings(this.cachedSecureSettings);
++        }
++        final Settings completeSettings = completeSettingsBuilder.build();
++        // obtain account names and create accounts
++        final Set<String> accountNames = getAccountNames(completeSettings);
++        this.accounts = createAccounts(completeSettings, accountNames, this::createAccount);
++        this.defaultAccount = findDefaultAccountOrNull(completeSettings, this.accounts);
+     }
+ 
+     protected abstract Account createAccount(String name, Settings accountSettings);
+@@ -66,31 +119,100 @@ public Account getAccount(String name) {
+         return theAccount;
+     }
+ 
+-    private <A> Tuple<Map<String, A>, A> buildAccounts(Settings settings, BiFunction<String, Settings, A> accountFactory) {
+-        Settings accountsSettings = settings.getByPrefix("xpack.notification." + type + ".").getAsSettings("account");
+-        Map<String, A> accounts = new HashMap<>();
+-        for (String name : accountsSettings.names()) {
+-            Settings accountSettings = accountsSettings.getAsSettings(name);
+-            A account = accountFactory.apply(name, accountSettings);
+-            accounts.put(name, account);
++    private String getNotificationsAccountPrefix() {
++        return "xpack.notification." + type + ".account.";
++    }
++
++    private Set<String> getAccountNames(Settings settings) {
++        // secure settings are not responsible for the client names
++        final Settings noSecureSettings = Settings.builder().put(settings, false).build();
++        return noSecureSettings.getByPrefix(getNotificationsAccountPrefix()).names();
++    }
++
++    private @Nullable String getDefaultAccountName(Settings settings) {
++        return settings.get("xpack.notification." + type + ".default_account");
++    }
++
++    private Map<String, Account> createAccounts(Settings settings, Set<String> accountNames,
++            BiFunction<String, Settings, Account> accountFactory) {
++        final Map<String, Account> accounts = new HashMap<>();
++        for (final String accountName : accountNames) {
++            final Settings accountSettings = settings.getAsSettings(getNotificationsAccountPrefix() + accountName);
++            final Account account = accountFactory.apply(accountName, accountSettings);
++            accounts.put(accountName, account);
+         }
++        return Collections.unmodifiableMap(accounts);
++    }
+ 
+-        final String defaultAccountName = settings.get("xpack.notification." + type + ".default_account");
+-        A defaultAccount;
++    private @Nullable Account findDefaultAccountOrNull(Settings settings, Map<String, Account> accounts) {
++        final String defaultAccountName = getDefaultAccountName(settings);
+         if (defaultAccountName == null) {
+             if (accounts.isEmpty()) {
+-                defaultAccount = null;
++                return null;
+             } else {
+-                A account = accounts.values().iterator().next();
+-                defaultAccount = account;
+-
++                return accounts.values().iterator().next();
+             }
+         } else {
+-            defaultAccount = accounts.get(defaultAccountName);
+-            if (defaultAccount == null) {
++            final Account account = accounts.get(defaultAccountName);
++            if (account == null) {
+                 throw new SettingsException("could not find default account [" + defaultAccountName + "]");
+             }
++            return account;
++        }
++    }
++
++    /**
++     * Extracts the {@link SecureSettings}` out of the passed in {@link Settings} object. The {@code Setting} argument has to have the
++     * {@code SecureSettings} open/available. Normally {@code SecureSettings} are available only under specific callstacks (eg. during node
++     * initialization or during a `reload` call). The returned copy can be reused freely as it will never be closed (this is a bit of
++     * cheating, but it is necessary in this specific circumstance). Only works for secure settings of type string (not file).
++     * 
++     * @param source
++     *            A {@code Settings} object with its {@code SecureSettings} open/available.
++     * @param securePluginSettings
++     *            The list of settings to copy.
++     * @return A copy of the {@code SecureSettings} of the passed in {@code Settings} argument.
++     */
++    private static SecureSettings extractSecureSettings(Settings source, List<Setting<?>> securePluginSettings)
++            throws GeneralSecurityException {
++        // get the secure settings out
++        final SecureSettings sourceSecureSettings = Settings.builder().put(source, true).getSecureSettings();
++        // filter and cache them...
++        final Map<String, SecureString> cache = new HashMap<>();
++        if (sourceSecureSettings != null && securePluginSettings != null) {
++            for (final String settingKey : sourceSecureSettings.getSettingNames()) {
++                for (final Setting<?> secureSetting : securePluginSettings) {
++                    if (secureSetting.match(settingKey)) {
++                        cache.put(settingKey, sourceSecureSettings.getString(settingKey));
++                    }
++                }
++            }
+         }
+-        return new Tuple<>(accounts, defaultAccount);
++        return new SecureSettings() {
++
++            @Override
++            public boolean isLoaded() {
++                return true;
++            }
++
++            @Override
++            public SecureString getString(String setting) throws GeneralSecurityException {
++                return cache.get(setting);
++            }
++
++            @Override
++            public Set<String> getSettingNames() {
++                return cache.keySet();
++            }
++
++            @Override
++            public InputStream getFile(String setting) throws GeneralSecurityException {
++                throw new IllegalStateException("A NotificationService setting cannot be File.");
++            }
++
++            @Override
++            public void close() throws IOException {
++            }
++        };
+     }
+ }
+diff --git a/x-pack/plugin/watcher/src/main/java/org/elasticsearch/xpack/watcher/notification/email/EmailService.java b/x-pack/plugin/watcher/src/main/java/org/elasticsearch/xpack/watcher/notification/email/EmailService.java
+index 6e28475a7af0..0933ba461628 100644
+--- a/x-pack/plugin/watcher/src/main/java/org/elasticsearch/xpack/watcher/notification/email/EmailService.java
++++ b/x-pack/plugin/watcher/src/main/java/org/elasticsearch/xpack/watcher/notification/email/EmailService.java
+@@ -19,6 +19,8 @@
+ import org.elasticsearch.xpack.watcher.notification.NotificationService;
+ 
+ import javax.mail.MessagingException;
++
++import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.List;
+ 
+@@ -108,7 +110,7 @@
+     private final CryptoService cryptoService;
+ 
+     public EmailService(Settings settings, @Nullable CryptoService cryptoService, ClusterSettings clusterSettings) {
+-        super("email", clusterSettings, EmailService.getSettings());
++        super("email", settings, clusterSettings, EmailService.getDynamicSettings(), EmailService.getSecureSettings());
+         this.cryptoService = cryptoService;
+         // ensure logging of setting changes
+         clusterSettings.addSettingsUpdateConsumer(SETTING_DEFAULT_ACCOUNT, (s) -> {});
+@@ -121,7 +123,6 @@ public EmailService(Settings settings, @Nullable CryptoService cryptoService, Cl
+         clusterSettings.addAffixUpdateConsumer(SETTING_SMTP_PORT, (s, o) -> {}, (s, o) -> {});
+         clusterSettings.addAffixUpdateConsumer(SETTING_SMTP_USER, (s, o) -> {}, (s, o) -> {});
+         clusterSettings.addAffixUpdateConsumer(SETTING_SMTP_PASSWORD, (s, o) -> {}, (s, o) -> {});
+-        clusterSettings.addAffixUpdateConsumer(SETTING_SECURE_PASSWORD, (s, o) -> {}, (s, o) -> {});
+         clusterSettings.addAffixUpdateConsumer(SETTING_SMTP_TIMEOUT, (s, o) -> {}, (s, o) -> {});
+         clusterSettings.addAffixUpdateConsumer(SETTING_SMTP_CONNECTION_TIMEOUT, (s, o) -> {}, (s, o) -> {});
+         clusterSettings.addAffixUpdateConsumer(SETTING_SMTP_WRITE_TIMEOUT, (s, o) -> {}, (s, o) -> {});
+@@ -179,12 +180,21 @@ public Email email() {
+         }
+     }
+ 
+-    public static List<Setting<?>> getSettings() {
++    private static List<Setting<?>> getDynamicSettings() {
+         return Arrays.asList(SETTING_DEFAULT_ACCOUNT, SETTING_PROFILE, SETTING_EMAIL_DEFAULTS, SETTING_SMTP_AUTH, SETTING_SMTP_HOST,
+                 SETTING_SMTP_PASSWORD, SETTING_SMTP_PORT, SETTING_SMTP_STARTTLS_ENABLE, SETTING_SMTP_USER, SETTING_SMTP_STARTTLS_REQUIRED,
+                 SETTING_SMTP_TIMEOUT, SETTING_SMTP_CONNECTION_TIMEOUT, SETTING_SMTP_WRITE_TIMEOUT, SETTING_SMTP_LOCAL_ADDRESS,
+-                SETTING_SMTP_LOCAL_PORT, SETTING_SMTP_SEND_PARTIAL, SETTING_SMTP_WAIT_ON_QUIT, SETTING_SMTP_SSL_TRUST_ADDRESS,
+-                SETTING_SECURE_PASSWORD);
++                SETTING_SMTP_LOCAL_PORT, SETTING_SMTP_SEND_PARTIAL, SETTING_SMTP_WAIT_ON_QUIT, SETTING_SMTP_SSL_TRUST_ADDRESS);
++    }
++
++    private static List<Setting<?>> getSecureSettings() {
++        return Arrays.asList(SETTING_SECURE_PASSWORD);
++    }
++
++    public static List<Setting<?>> getSettings() {
++        List<Setting<?>> allSettings = new ArrayList<Setting<?>>(EmailService.getDynamicSettings());
++        allSettings.addAll(EmailService.getSecureSettings());
++        return allSettings;
+     }
+ 
+ }
+diff --git a/x-pack/plugin/watcher/src/main/java/org/elasticsearch/xpack/watcher/notification/hipchat/HipChatService.java b/x-pack/plugin/watcher/src/main/java/org/elasticsearch/xpack/watcher/notification/hipchat/HipChatService.java
+index 30eb9f5d6215..39b1f0cb6170 100644
+--- a/x-pack/plugin/watcher/src/main/java/org/elasticsearch/xpack/watcher/notification/hipchat/HipChatService.java
++++ b/x-pack/plugin/watcher/src/main/java/org/elasticsearch/xpack/watcher/notification/hipchat/HipChatService.java
+@@ -16,6 +16,7 @@
+ import org.elasticsearch.xpack.watcher.common.http.HttpClient;
+ import org.elasticsearch.xpack.watcher.notification.NotificationService;
+ 
++import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.List;
+ 
+@@ -68,20 +69,19 @@
+     private HipChatServer defaultServer;
+ 
+     public HipChatService(Settings settings, HttpClient httpClient, ClusterSettings clusterSettings) {
+-        super("hipchat", clusterSettings, HipChatService.getSettings());
++        super("hipchat", settings, clusterSettings, HipChatService.getDynamicSettings(), HipChatService.getSecureSettings());
+         this.httpClient = httpClient;
+         // ensure logging of setting changes
+         clusterSettings.addSettingsUpdateConsumer(SETTING_DEFAULT_ACCOUNT, (s) -> {});
+         clusterSettings.addSettingsUpdateConsumer(SETTING_DEFAULT_HOST, (s) -> {});
+         clusterSettings.addSettingsUpdateConsumer(SETTING_DEFAULT_PORT, (s) -> {});
+         clusterSettings.addAffixUpdateConsumer(SETTING_AUTH_TOKEN, (s, o) -> {}, (s, o) -> {});
+-        clusterSettings.addAffixUpdateConsumer(SETTING_AUTH_TOKEN_SECURE, (s, o) -> {}, (s, o) -> {});
+         clusterSettings.addAffixUpdateConsumer(SETTING_PROFILE, (s, o) -> {}, (s, o) -> {});
+         clusterSettings.addAffixUpdateConsumer(SETTING_ROOM, (s, o) -> {}, (s, o) -> {});
+         clusterSettings.addAffixUpdateConsumer(SETTING_HOST, (s, o) -> {}, (s, o) -> {});
+         clusterSettings.addAffixUpdateConsumer(SETTING_PORT, (s, o) -> {}, (s, o) -> {});
+         clusterSettings.addAffixUpdateConsumer(SETTING_MESSAGE_DEFAULTS, (s, o) -> {}, (s, o) -> {});
+-
++        // do an initial load
+         reload(settings);
+     }
+ 
+@@ -100,8 +100,18 @@ protected HipChatAccount createAccount(String name, Settings accountSettings) {
+         return profile.createAccount(name, accountSettings, defaultServer, httpClient, logger);
+     }
+ 
++    private static List<Setting<?>> getDynamicSettings() {
++        return Arrays.asList(SETTING_DEFAULT_ACCOUNT, SETTING_AUTH_TOKEN, SETTING_PROFILE, SETTING_ROOM, SETTING_MESSAGE_DEFAULTS,
++                SETTING_DEFAULT_HOST, SETTING_DEFAULT_PORT, SETTING_HOST, SETTING_PORT);
++    }
++
++    private static List<Setting<?>> getSecureSettings() {
++        return Arrays.asList(SETTING_AUTH_TOKEN_SECURE);
++    }
++
+     public static List<Setting<?>> getSettings() {
+-        return Arrays.asList(SETTING_DEFAULT_ACCOUNT, SETTING_AUTH_TOKEN, SETTING_AUTH_TOKEN_SECURE, SETTING_PROFILE, SETTING_ROOM,
+-                SETTING_MESSAGE_DEFAULTS, SETTING_DEFAULT_HOST, SETTING_DEFAULT_PORT, SETTING_HOST, SETTING_PORT);
++        List<Setting<?>> allSettings = new ArrayList<Setting<?>>(getDynamicSettings());
++        allSettings.addAll(getSecureSettings());
++        return allSettings;
+     }
+ }
+diff --git a/x-pack/plugin/watcher/src/main/java/org/elasticsearch/xpack/watcher/notification/jira/JiraService.java b/x-pack/plugin/watcher/src/main/java/org/elasticsearch/xpack/watcher/notification/jira/JiraService.java
+index d7b7fe2003b9..425ef0ee44fd 100644
+--- a/x-pack/plugin/watcher/src/main/java/org/elasticsearch/xpack/watcher/notification/jira/JiraService.java
++++ b/x-pack/plugin/watcher/src/main/java/org/elasticsearch/xpack/watcher/notification/jira/JiraService.java
+@@ -14,6 +14,7 @@
+ import org.elasticsearch.xpack.watcher.common.http.HttpClient;
+ import org.elasticsearch.xpack.watcher.notification.NotificationService;
+ 
++import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.List;
+ 
+@@ -62,7 +63,7 @@
+     private final HttpClient httpClient;
+ 
+     public JiraService(Settings settings, HttpClient httpClient, ClusterSettings clusterSettings) {
+-        super("jira", clusterSettings, JiraService.getSettings());
++        super("jira", settings, clusterSettings, JiraService.getDynamicSettings(), JiraService.getSecureSettings());
+         this.httpClient = httpClient;
+         // ensure logging of setting changes
+         clusterSettings.addSettingsUpdateConsumer(SETTING_DEFAULT_ACCOUNT, (s) -> {});
+@@ -70,9 +71,6 @@ public JiraService(Settings settings, HttpClient httpClient, ClusterSettings clu
+         clusterSettings.addAffixUpdateConsumer(SETTING_URL, (s, o) -> {}, (s, o) -> {});
+         clusterSettings.addAffixUpdateConsumer(SETTING_USER, (s, o) -> {}, (s, o) -> {});
+         clusterSettings.addAffixUpdateConsumer(SETTING_PASSWORD, (s, o) -> {}, (s, o) -> {});
+-        clusterSettings.addAffixUpdateConsumer(SETTING_SECURE_USER, (s, o) -> {}, (s, o) -> {});
+-        clusterSettings.addAffixUpdateConsumer(SETTING_SECURE_URL, (s, o) -> {}, (s, o) -> {});
+-        clusterSettings.addAffixUpdateConsumer(SETTING_SECURE_PASSWORD, (s, o) -> {}, (s, o) -> {});
+         clusterSettings.addAffixUpdateConsumer(SETTING_DEFAULTS, (s, o) -> {}, (s, o) -> {});
+         // do an initial load
+         reload(settings);
+@@ -83,8 +81,17 @@ protected JiraAccount createAccount(String name, Settings settings) {
+         return new JiraAccount(name, settings, httpClient);
+     }
+ 
++    private static List<Setting<?>> getDynamicSettings() {
++        return Arrays.asList(SETTING_DEFAULT_ACCOUNT, SETTING_ALLOW_HTTP, SETTING_URL, SETTING_USER, SETTING_PASSWORD, SETTING_DEFAULTS);
++    }
++
++    private static List<Setting<?>> getSecureSettings() {
++        return Arrays.asList(SETTING_SECURE_USER, SETTING_SECURE_PASSWORD, SETTING_SECURE_URL);
++    }
++
+     public static List<Setting<?>> getSettings() {
+-        return Arrays.asList(SETTING_ALLOW_HTTP, SETTING_URL, SETTING_USER, SETTING_PASSWORD, SETTING_SECURE_USER,
+-                SETTING_SECURE_PASSWORD, SETTING_SECURE_URL, SETTING_DEFAULTS, SETTING_DEFAULT_ACCOUNT);
++        List<Setting<?>> allSettings = new ArrayList<Setting<?>>(getDynamicSettings());
++        allSettings.addAll(getSecureSettings());
++        return allSettings;
+     }
+ }
+diff --git a/x-pack/plugin/watcher/src/main/java/org/elasticsearch/xpack/watcher/notification/pagerduty/PagerDutyService.java b/x-pack/plugin/watcher/src/main/java/org/elasticsearch/xpack/watcher/notification/pagerduty/PagerDutyService.java
+index 6834fcd4e2e1..6a0fa5b5bf45 100644
+--- a/x-pack/plugin/watcher/src/main/java/org/elasticsearch/xpack/watcher/notification/pagerduty/PagerDutyService.java
++++ b/x-pack/plugin/watcher/src/main/java/org/elasticsearch/xpack/watcher/notification/pagerduty/PagerDutyService.java
+@@ -14,6 +14,7 @@
+ import org.elasticsearch.xpack.watcher.common.http.HttpClient;
+ import org.elasticsearch.xpack.watcher.notification.NotificationService;
+ 
++import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.List;
+ 
+@@ -40,12 +41,13 @@
+     private final HttpClient httpClient;
+ 
+     public PagerDutyService(Settings settings, HttpClient httpClient, ClusterSettings clusterSettings) {
+-        super("pagerduty", clusterSettings, PagerDutyService.getSettings());
++        super("pagerduty", settings, clusterSettings, PagerDutyService.getDynamicSettings(), PagerDutyService.getSecureSettings());
+         this.httpClient = httpClient;
++        // ensure logging of setting changes
+         clusterSettings.addSettingsUpdateConsumer(SETTING_DEFAULT_ACCOUNT, (s) -> {});
+         clusterSettings.addAffixUpdateConsumer(SETTING_SERVICE_API_KEY, (s, o) -> {}, (s, o) -> {});
+-        clusterSettings.addAffixUpdateConsumer(SETTING_SECURE_SERVICE_API_KEY, (s, o) -> {}, (s, o) -> {});
+         clusterSettings.addAffixUpdateConsumer(SETTING_DEFAULTS, (s, o) -> {}, (s, o) -> {});
++        // do an initial load
+         reload(settings);
+     }
+ 
+@@ -54,7 +56,17 @@ protected PagerDutyAccount createAccount(String name, Settings accountSettings)
+         return new PagerDutyAccount(name, accountSettings, accountSettings, httpClient);
+     }
+ 
++    private static List<Setting<?>> getDynamicSettings() {
++        return Arrays.asList(SETTING_SERVICE_API_KEY, SETTING_DEFAULTS, SETTING_DEFAULT_ACCOUNT);
++    }
++
++    private static List<Setting<?>> getSecureSettings() {
++        return Arrays.asList(SETTING_SECURE_SERVICE_API_KEY);
++    }
++
+     public static List<Setting<?>> getSettings() {
+-        return Arrays.asList(SETTING_SERVICE_API_KEY, SETTING_SECURE_SERVICE_API_KEY, SETTING_DEFAULTS, SETTING_DEFAULT_ACCOUNT);
++        List<Setting<?>> allSettings = new ArrayList<Setting<?>>(getDynamicSettings());
++        allSettings.addAll(getSecureSettings());
++        return allSettings;
+     }
+ }
+diff --git a/x-pack/plugin/watcher/src/main/java/org/elasticsearch/xpack/watcher/notification/slack/SlackService.java b/x-pack/plugin/watcher/src/main/java/org/elasticsearch/xpack/watcher/notification/slack/SlackService.java
+index 90542f658bc7..0d8d0bc67faf 100644
+--- a/x-pack/plugin/watcher/src/main/java/org/elasticsearch/xpack/watcher/notification/slack/SlackService.java
++++ b/x-pack/plugin/watcher/src/main/java/org/elasticsearch/xpack/watcher/notification/slack/SlackService.java
+@@ -16,6 +16,7 @@
+ import org.elasticsearch.xpack.watcher.common.http.HttpClient;
+ import org.elasticsearch.xpack.watcher.notification.NotificationService;
+ 
++import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.List;
+ 
+@@ -32,8 +33,7 @@
+                     (key) -> Setting.simpleString(key, Property.Dynamic, Property.NodeScope, Property.Filtered, Property.Deprecated));
+ 
+     private static final Setting.AffixSetting<SecureString> SETTING_URL_SECURE =
+-            Setting.affixKeySetting("xpack.notification.slack.account.", "secure_url",
+-                    (key) -> SecureSetting.secureString(key, null));
++            Setting.affixKeySetting("xpack.notification.slack.account.", "secure_url", (key) -> SecureSetting.secureString(key, null));
+ 
+     private static final Setting.AffixSetting<Settings> SETTING_DEFAULTS =
+             Setting.affixKeySetting("xpack.notification.slack.account.", "message_defaults",
+@@ -44,12 +44,13 @@
+     private final HttpClient httpClient;
+ 
+     public SlackService(Settings settings, HttpClient httpClient, ClusterSettings clusterSettings) {
+-        super("slack", clusterSettings, SlackService.getSettings());
++        super("slack", settings, clusterSettings, SlackService.getDynamicSettings(), SlackService.getSecureSettings());
+         this.httpClient = httpClient;
++        // ensure logging of setting changes
+         clusterSettings.addSettingsUpdateConsumer(SETTING_DEFAULT_ACCOUNT, (s) -> {});
+         clusterSettings.addAffixUpdateConsumer(SETTING_URL, (s, o) -> {}, (s, o) -> {});
+-        clusterSettings.addAffixUpdateConsumer(SETTING_URL_SECURE, (s, o) -> {}, (s, o) -> {});
+         clusterSettings.addAffixUpdateConsumer(SETTING_DEFAULTS, (s, o) -> {}, (s, o) -> {});
++        // do an initial load
+         reload(settings);
+     }
+ 
+@@ -58,7 +59,17 @@ protected SlackAccount createAccount(String name, Settings accountSettings) {
+         return new SlackAccount(name, accountSettings, accountSettings, httpClient, logger);
+     }
+ 
++    private static List<Setting<?>> getDynamicSettings() {
++        return Arrays.asList(SETTING_URL, SETTING_DEFAULT_ACCOUNT, SETTING_DEFAULTS);
++    }
++
++    private static List<Setting<?>> getSecureSettings() {
++        return Arrays.asList(SETTING_URL_SECURE);
++    }
++
+     public static List<Setting<?>> getSettings() {
+-        return Arrays.asList(SETTING_URL, SETTING_URL_SECURE, SETTING_DEFAULT_ACCOUNT, SETTING_DEFAULTS);
++        List<Setting<?>> allSettings = new ArrayList<Setting<?>>(getDynamicSettings());
++        allSettings.addAll(getSecureSettings());
++        return allSettings;
+     }
+ }
+diff --git a/x-pack/plugin/watcher/src/test/java/org/elasticsearch/xpack/watcher/notification/NotificationServiceTests.java b/x-pack/plugin/watcher/src/test/java/org/elasticsearch/xpack/watcher/notification/NotificationServiceTests.java
+index ddf45de81636..184ff56c2130 100644
+--- a/x-pack/plugin/watcher/src/test/java/org/elasticsearch/xpack/watcher/notification/NotificationServiceTests.java
++++ b/x-pack/plugin/watcher/src/test/java/org/elasticsearch/xpack/watcher/notification/NotificationServiceTests.java
+@@ -10,6 +10,8 @@
+ import org.elasticsearch.test.ESTestCase;
+ import org.elasticsearch.xpack.watcher.notification.NotificationService;
+ 
++import java.util.Collections;
++
+ import static org.hamcrest.Matchers.anyOf;
+ import static org.hamcrest.Matchers.is;
+ 
+@@ -81,7 +83,7 @@ public void testAccountDoesNotExist() throws Exception{
+     private static class TestNotificationService extends NotificationService<String> {
+ 
+         TestNotificationService(Settings settings) {
+-            super("test");
++            super("test", settings, Collections.emptyList());
+             reload(settings);
+         }
+ 

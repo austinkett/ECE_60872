@@ -1,0 +1,282 @@
+diff --git a/core/src/main/java/org/elasticsearch/common/util/AbstractArray.java b/core/src/main/java/org/elasticsearch/common/util/AbstractArray.java
+index 1187dfef7e5a..913f1ad26a42 100644
+--- a/core/src/main/java/org/elasticsearch/common/util/AbstractArray.java
++++ b/core/src/main/java/org/elasticsearch/common/util/AbstractArray.java
+@@ -23,13 +23,14 @@
+ 
+ import java.util.Collection;
+ import java.util.Collections;
++import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ 
+ abstract class AbstractArray implements BigArray {
+ 
+     private final BigArrays bigArrays;
+     public final boolean clearOnResize;
+-    private boolean released = false;
++    private final AtomicBoolean closed = new AtomicBoolean(false);
+ 
+     AbstractArray(BigArrays bigArrays, boolean clearOnResize) {
+         this.bigArrays = bigArrays;
+@@ -38,10 +39,13 @@
+ 
+     @Override
+     public final void close() {
+-        bigArrays.adjustBreaker(-ramBytesUsed());
+-        assert !released : "double release";
+-        released = true;
+-        doClose();
++        if (closed.compareAndSet(false, true)) {
++            try {
++                bigArrays.adjustBreaker(-ramBytesUsed());
++            } finally {
++                doClose();
++            }
++        }
+     }
+ 
+     protected abstract void doClose();
+diff --git a/core/src/main/java/org/elasticsearch/transport/TcpTransport.java b/core/src/main/java/org/elasticsearch/transport/TcpTransport.java
+index b7a082c30dfb..6837602c567f 100644
+--- a/core/src/main/java/org/elasticsearch/transport/TcpTransport.java
++++ b/core/src/main/java/org/elasticsearch/transport/TcpTransport.java
+@@ -256,7 +256,7 @@ protected void doRunInLifecycle() throws Exception {
+                 NodeChannels channels = entry.getValue();
+                 for (Channel channel : channels.allChannels) {
+                     try {
+-                        sendMessage(channel, pingHeader, successfulPings::inc, false);
++                        sendMessage(channel, pingHeader, successfulPings::inc);
+                     } catch (Exception e) {
+                         if (isOpen(channel)) {
+                             logger.debug(
+@@ -836,7 +836,23 @@ protected void onException(Channel channel, Exception e) throws IOException {
+         } else if (e instanceof TcpTransport.HttpOnTransportException) {
+             // in case we are able to return data, serialize the exception content and sent it back to the client
+             if (isOpen(channel)) {
+-                sendMessage(channel, new BytesArray(e.getMessage().getBytes(StandardCharsets.UTF_8)), () -> {}, true);
++                final Runnable closeChannel = () -> {
++                    try {
++                        closeChannels(Collections.singletonList(channel));
++                    } catch (IOException e1) {
++                        logger.debug("failed to close httpOnTransport channel", e1);
++                    }
++                };
++                boolean success = false;
++                try {
++                    sendMessage(channel, new BytesArray(e.getMessage().getBytes(StandardCharsets.UTF_8)), closeChannel);
++                    success = true;
++                } finally {
++                    if (success == false) {
++                        // it's fine to call this more than once
++                        closeChannel.run();
++                    }
++                }
+             }
+         } else {
+             logger.warn(
+@@ -870,7 +886,7 @@ protected void onException(Channel channel, Exception e) throws IOException {
+     protected abstract NodeChannels connectToChannelsLight(DiscoveryNode node) throws IOException;
+ 
+ 
+-    protected abstract void sendMessage(Channel channel, BytesReference reference, Runnable sendListener, boolean close) throws IOException;
++    protected abstract void sendMessage(Channel channel, BytesReference reference, Runnable sendListener) throws IOException;
+ 
+     /**
+      * Connects to the node in a <tt>heavy</tt> way.
+@@ -943,7 +959,7 @@ public void sendRequest(final DiscoveryNode node, final long requestId, final St
+     private boolean internalSendMessage(Channel targetChannel, BytesReference message, Runnable onRequestSent) throws IOException {
+         boolean success;
+         try {
+-            sendMessage(targetChannel, message, onRequestSent, false);
++            sendMessage(targetChannel, message, onRequestSent);
+             success = true;
+         } catch (IOException ex) {
+             // passing exception handling to deal with this and raise disconnect events and decide the right logging level
+@@ -975,7 +991,7 @@ public void sendErrorResponse(Version nodeVersion, Channel channel, final Except
+             final BytesReference bytes = stream.bytes();
+             final BytesReference header = buildHeader(requestId, status, nodeVersion, bytes.length());
+             Runnable onRequestSent = () -> transportServiceAdapter.onResponseSent(requestId, action, error);
+-            sendMessage(channel, new CompositeBytesReference(header, bytes), onRequestSent, false);
++            sendMessage(channel, new CompositeBytesReference(header, bytes), onRequestSent);
+         }
+     }
+ 
+@@ -1013,10 +1029,14 @@ public void sendResponse(Version nodeVersion, Channel channel, final TransportRe
+             };
+             addedReleaseListener = internalSendMessage(channel, reference, onRequestSent);
+         } finally {
+-            IOUtils.close(stream);
+-            if (!addedReleaseListener) {
+-                Releasables.close(bStream.bytes());
++            try {
++                IOUtils.close(stream);
++            } finally {
++                if (!addedReleaseListener) {
++                    Releasables.close(bStream.bytes());
++                }
+             }
++
+         }
+     }
+ 
+diff --git a/core/src/main/java/org/elasticsearch/transport/TcpTransportChannel.java b/core/src/main/java/org/elasticsearch/transport/TcpTransportChannel.java
+index 1fceb5aa1a31..9b09f7f8ed32 100644
+--- a/core/src/main/java/org/elasticsearch/transport/TcpTransportChannel.java
++++ b/core/src/main/java/org/elasticsearch/transport/TcpTransportChannel.java
+@@ -66,7 +66,7 @@ public void sendResponse(TransportResponse response, TransportResponseOptions op
+         try {
+             transport.sendResponse(version, channel, response, requestId, action, options);
+         } finally {
+-            release();
++            release(false);
+         }
+     }
+ 
+@@ -75,19 +75,20 @@ public void sendResponse(Exception exception) throws IOException {
+         try {
+             transport.sendErrorResponse(version, channel, exception, requestId, action);
+         } finally {
+-            release();
++            release(true);
+         }
+     }
+     private Exception releaseBy;
+ 
+-    private void release() {
+-        // attempt to release once atomically
+-        if (released.compareAndSet(false, true) == false) {
+-            throw new IllegalStateException("reserved bytes are already released", releaseBy);
+-        } else {
++    private void release(boolean isExceptionResponse) {
++        if (released.compareAndSet(false, true)) {
+             assert (releaseBy = new Exception()) != null; // easier to debug if it's already closed
++            transport.getInFlightRequestBreaker().addWithoutBreaking(-reservedBytes);
++        } else if (isExceptionResponse == false) {
++            // only fail if we are not sending an error - we might send the error triggered by the previous
++            // sendResponse call
++            throw new IllegalStateException("reserved bytes are already released", releaseBy);
+         }
+-        transport.getInFlightRequestBreaker().addWithoutBreaking(-reservedBytes);
+     }
+ 
+     @Override
+diff --git a/core/src/test/java/org/elasticsearch/common/util/BigArraysTests.java b/core/src/test/java/org/elasticsearch/common/util/BigArraysTests.java
+index 6fadb6e55066..301f48f9b042 100644
+--- a/core/src/test/java/org/elasticsearch/common/util/BigArraysTests.java
++++ b/core/src/test/java/org/elasticsearch/common/util/BigArraysTests.java
+@@ -27,14 +27,14 @@
+ import org.elasticsearch.common.unit.ByteSizeUnit;
+ import org.elasticsearch.indices.breaker.HierarchyCircuitBreakerService;
+ import org.elasticsearch.indices.breaker.NoneCircuitBreakerService;
+-import org.elasticsearch.test.ESSingleNodeTestCase;
++import org.elasticsearch.test.ESTestCase;
+ import org.junit.Before;
+ 
+ import java.lang.reflect.InvocationTargetException;
+ import java.lang.reflect.Method;
+ import java.util.Arrays;
+ 
+-public class BigArraysTests extends ESSingleNodeTestCase {
++public class BigArraysTests extends ESTestCase {
+ 
+     private BigArrays randombigArrays() {
+         return new MockBigArrays(Settings.EMPTY, new NoneCircuitBreakerService());
+diff --git a/modules/transport-netty3/src/main/java/org/elasticsearch/transport/netty3/Netty3Transport.java b/modules/transport-netty3/src/main/java/org/elasticsearch/transport/netty3/Netty3Transport.java
+index 4531811b983b..eb8d14b08fc5 100644
+--- a/modules/transport-netty3/src/main/java/org/elasticsearch/transport/netty3/Netty3Transport.java
++++ b/modules/transport-netty3/src/main/java/org/elasticsearch/transport/netty3/Netty3Transport.java
+@@ -33,7 +33,6 @@
+ import org.elasticsearch.common.settings.Setting;
+ import org.elasticsearch.common.settings.Setting.Property;
+ import org.elasticsearch.common.settings.Settings;
+-import org.elasticsearch.common.transport.TransportAddress;
+ import org.elasticsearch.common.unit.ByteSizeValue;
+ import org.elasticsearch.common.util.BigArrays;
+ import org.elasticsearch.common.util.concurrent.EsExecutors;
+@@ -491,19 +490,9 @@ public void operationComplete(final ChannelFuture future) throws Exception {
+     }
+ 
+     @Override
+-    protected void sendMessage(Channel channel, BytesReference reference, Runnable sendListener, boolean close) {
++    protected void sendMessage(Channel channel, BytesReference reference, Runnable sendListener) {
+         final ChannelFuture future = channel.write(Netty3Utils.toChannelBuffer(reference));
+-        if (close) {
+-            future.addListener(f -> {
+-                try {
+-                    sendListener.run();
+-                } finally {
+-                    f.getChannel().close();
+-                }
+-            });
+-        } else {
+-            future.addListener(future1 -> sendListener.run());
+-        }
++        future.addListener(future1 -> sendListener.run());
+     }
+ 
+     @Override
+diff --git a/modules/transport-netty4/src/main/java/org/elasticsearch/transport/netty4/Netty4Transport.java b/modules/transport-netty4/src/main/java/org/elasticsearch/transport/netty4/Netty4Transport.java
+index ee43a790d7fb..3787b29ab633 100644
+--- a/modules/transport-netty4/src/main/java/org/elasticsearch/transport/netty4/Netty4Transport.java
++++ b/modules/transport-netty4/src/main/java/org/elasticsearch/transport/netty4/Netty4Transport.java
+@@ -54,7 +54,6 @@
+ import org.elasticsearch.common.settings.Setting;
+ import org.elasticsearch.common.settings.Setting.Property;
+ import org.elasticsearch.common.settings.Settings;
+-import org.elasticsearch.common.transport.TransportAddress;
+ import org.elasticsearch.common.unit.ByteSizeValue;
+ import org.elasticsearch.common.util.BigArrays;
+ import org.elasticsearch.common.util.concurrent.EsExecutors;
+@@ -445,19 +444,9 @@ public void operationComplete(final ChannelFuture future) throws Exception {
+     }
+ 
+     @Override
+-    protected void sendMessage(Channel channel, BytesReference reference, Runnable sendListener, boolean close) {
++    protected void sendMessage(Channel channel, BytesReference reference, Runnable sendListener) {
+         final ChannelFuture future = channel.writeAndFlush(Netty4Utils.toByteBuf(reference));
+-        if (close) {
+-            future.addListener(f -> {
+-                try {
+-                    sendListener.run();
+-                } finally {
+-                    future.channel().close();
+-                }
+-            });
+-        } else {
+-            future.addListener(f -> sendListener.run());
+-        }
++        future.addListener(f -> sendListener.run());
+     }
+ 
+     @Override
+diff --git a/test/framework/src/main/java/org/elasticsearch/transport/MockTcpTransport.java b/test/framework/src/main/java/org/elasticsearch/transport/MockTcpTransport.java
+index 96145fc6fcaa..84d0bed8c040 100644
+--- a/test/framework/src/main/java/org/elasticsearch/transport/MockTcpTransport.java
++++ b/test/framework/src/main/java/org/elasticsearch/transport/MockTcpTransport.java
+@@ -29,7 +29,6 @@
+ import org.elasticsearch.common.io.stream.StreamInput;
+ import org.elasticsearch.common.network.NetworkService;
+ import org.elasticsearch.common.settings.Settings;
+-import org.elasticsearch.common.transport.TransportAddress;
+ import org.elasticsearch.common.unit.ByteSizeValue;
+ import org.elasticsearch.common.util.BigArrays;
+ import org.elasticsearch.common.util.CancellableThreads;
+@@ -226,7 +225,7 @@ protected boolean isOpen(MockChannel mockChannel) {
+     }
+ 
+     @Override
+-    protected void sendMessage(MockChannel mockChannel, BytesReference reference, Runnable sendListener, boolean close) throws IOException {
++    protected void sendMessage(MockChannel mockChannel, BytesReference reference, Runnable sendListener) throws IOException {
+         synchronized (mockChannel) {
+             final Socket socket = mockChannel.activeChannel;
+             OutputStream outputStream = new BufferedOutputStream(socket.getOutputStream());
+@@ -236,9 +235,6 @@ protected void sendMessage(MockChannel mockChannel, BytesReference reference, Ru
+         if (sendListener != null) {
+             sendListener.run();
+         }
+-        if (close) {
+-            IOUtils.closeWhileHandlingException(mockChannel);
+-        }
+     }
+ 
+     @Override

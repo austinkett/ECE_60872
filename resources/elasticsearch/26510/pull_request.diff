@@ -1,0 +1,146 @@
+diff --git a/core/src/main/java/org/elasticsearch/search/DefaultSearchContext.java b/core/src/main/java/org/elasticsearch/search/DefaultSearchContext.java
+index 44940c403c71..2c707a2b9a28 100644
+--- a/core/src/main/java/org/elasticsearch/search/DefaultSearchContext.java
++++ b/core/src/main/java/org/elasticsearch/search/DefaultSearchContext.java
+@@ -212,6 +212,9 @@ public void preProcess(boolean rewrite) {
+                             + IndexSettings.MAX_RESULT_WINDOW_SETTING.getKey() + "] index level setting.");
+         }
+         if (rescore != null) {
++            if (sort != null) {
++                throw new QueryPhaseExecutionException(this, "Cannot use [sort] option in conjunction with [rescore].");
++            }
+             int maxWindow = indexService.getIndexSettings().getMaxRescoreWindow();
+             for (RescoreContext rescoreContext: rescore) {
+                 if (rescoreContext.getWindowSize() > maxWindow) {
+diff --git a/core/src/main/java/org/elasticsearch/search/query/TopDocsCollectorContext.java b/core/src/main/java/org/elasticsearch/search/query/TopDocsCollectorContext.java
+index 31e7d0aed3f6..46b03c61ca0b 100644
+--- a/core/src/main/java/org/elasticsearch/search/query/TopDocsCollectorContext.java
++++ b/core/src/main/java/org/elasticsearch/search/query/TopDocsCollectorContext.java
+@@ -289,8 +289,11 @@ static TopDocsCollectorContext createTopDocsCollectorContext(SearchContext searc
+         } else {
+             int numDocs = Math.min(searchContext.from() + searchContext.size(), totalNumDocs);
+             final boolean rescore = searchContext.rescore().isEmpty() == false;
+-            for (RescoreContext rescoreContext : searchContext.rescore()) {
+-                numDocs = Math.max(numDocs, rescoreContext.getWindowSize());
++            if (rescore) {
++                assert searchContext.sort() == null;
++                for (RescoreContext rescoreContext : searchContext.rescore()) {
++                    numDocs = Math.max(numDocs, rescoreContext.getWindowSize());
++                }
+             }
+             return new SimpleTopDocsCollectorContext(searchContext.sort(),
+                                                      searchContext.searchAfter(),
+diff --git a/core/src/main/java/org/elasticsearch/search/rescore/RescorePhase.java b/core/src/main/java/org/elasticsearch/search/rescore/RescorePhase.java
+index a1d85765fa1a..b8ce8f8118b5 100644
+--- a/core/src/main/java/org/elasticsearch/search/rescore/RescorePhase.java
++++ b/core/src/main/java/org/elasticsearch/search/rescore/RescorePhase.java
+@@ -19,6 +19,9 @@
+ 
+ package org.elasticsearch.search.rescore;
+ 
++import org.apache.lucene.search.ScoreDoc;
++import org.apache.lucene.search.Sort;
++import org.apache.lucene.search.SortField;
+ import org.apache.lucene.search.TopDocs;
+ import org.elasticsearch.ElasticsearchException;
+ import org.elasticsearch.common.component.AbstractComponent;
+@@ -47,10 +50,31 @@ public void execute(SearchContext context) {
+             TopDocs topDocs = context.queryResult().topDocs();
+             for (RescoreContext ctx : context.rescore()) {
+                 topDocs = ctx.rescorer().rescore(topDocs, context.searcher(), ctx);
++                // It is the responsibility of the rescorer to sort the resulted top docs,
++                // here we only assert that this condition is met.
++                assert context.sort() == null && topDocsSortedByScore(topDocs): "topdocs should be sorted after rescore";
+             }
+             context.queryResult().topDocs(topDocs, context.queryResult().sortValueFormats());
+         } catch (IOException e) {
+             throw new ElasticsearchException("Rescore Phase Failed", e);
+         }
+     }
++
++    /**
++     * Returns true if the provided docs are sorted by score.
++     */
++    private boolean topDocsSortedByScore(TopDocs topDocs) {
++        if (topDocs == null || topDocs.scoreDocs == null || topDocs.scoreDocs.length < 2) {
++            return true;
++        }
++        float lastScore = topDocs.scoreDocs[0].score;
++        for (int i = 1; i < topDocs.scoreDocs.length; i++) {
++            ScoreDoc doc = topDocs.scoreDocs[i];
++            if (Float.compare(doc.score, lastScore) > 0) {
++                return false;
++            }
++            lastScore = doc.score;
++        }
++        return true;
++    }
+ }
+diff --git a/core/src/test/java/org/elasticsearch/search/functionscore/QueryRescorerIT.java b/core/src/test/java/org/elasticsearch/search/functionscore/QueryRescorerIT.java
+index 0cb6a52bbefe..ab23dfbe2192 100644
+--- a/core/src/test/java/org/elasticsearch/search/functionscore/QueryRescorerIT.java
++++ b/core/src/test/java/org/elasticsearch/search/functionscore/QueryRescorerIT.java
+@@ -38,6 +38,9 @@
+ import org.elasticsearch.search.SearchHits;
+ import org.elasticsearch.search.rescore.QueryRescoreMode;
+ import org.elasticsearch.search.rescore.QueryRescorerBuilder;
++import org.elasticsearch.search.sort.SortBuilder;
++import org.elasticsearch.search.sort.SortBuilders;
++import org.elasticsearch.search.sort.SortOrder;
+ import org.elasticsearch.test.ESIntegTestCase;
+ 
+ import java.util.Arrays;
+@@ -66,6 +69,7 @@
+ import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertThirdHit;
+ import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.hasId;
+ import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.hasScore;
++import static org.hamcrest.Matchers.containsString;
+ import static org.hamcrest.Matchers.equalTo;
+ import static org.hamcrest.Matchers.greaterThan;
+ import static org.hamcrest.Matchers.lessThanOrEqualTo;
+@@ -705,4 +709,45 @@ public void testFromSize() throws Exception {
+ 
+         assertEquals(4, request.get().getHits().getHits().length);
+     }
++
++    public void testRescorePhaseWithInvalidSort() throws Exception {
++        assertAcked(prepareCreate("test"));
++        for(int i=0;i<5;i++) {
++            client().prepareIndex("test", "type", ""+i).setSource("number", 0).get();
++        }
++        refresh();
++
++        Exception exc = expectThrows(Exception.class,
++            () -> client().prepareSearch()
++                .addSort(SortBuilders.fieldSort("number"))
++                .setTrackScores(true)
++                .addRescorer(new QueryRescorerBuilder(matchAllQuery()), 50)
++                .get()
++        );
++        assertNotNull(exc.getCause());
++        assertThat(exc.getCause().getMessage(),
++            containsString("Cannot use [sort] option in conjunction with [rescore]."));
++
++        exc = expectThrows(Exception.class,
++            () -> client().prepareSearch()
++                .addSort(SortBuilders.fieldSort("number"))
++                .addSort(SortBuilders.scoreSort())
++                .setTrackScores(true)
++                .addRescorer(new QueryRescorerBuilder(matchAllQuery()), 50)
++                .get()
++        );
++        assertNotNull(exc.getCause());
++        assertThat(exc.getCause().getMessage(),
++            containsString("Cannot use [sort] option in conjunction with [rescore]."));
++
++        SearchResponse resp = client().prepareSearch().addSort(SortBuilders.scoreSort())
++            .setTrackScores(true)
++            .addRescorer(new QueryRescorerBuilder(matchAllQuery()).setRescoreQueryWeight(100.0f), 50)
++            .get();
++        assertThat(resp.getHits().totalHits, equalTo(5L));
++        assertThat(resp.getHits().getHits().length, equalTo(5));
++        for (SearchHit hit : resp.getHits().getHits()) {
++            assertThat(hit.getScore(), equalTo(101f));
++        }
++    }
+ }

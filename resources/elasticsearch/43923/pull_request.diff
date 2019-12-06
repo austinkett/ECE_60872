@@ -1,0 +1,133 @@
+diff --git a/x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/action/TransportPutDatafeedAction.java b/x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/action/TransportPutDatafeedAction.java
+index 906ecda3ccae..5b8e91cc6528 100644
+--- a/x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/action/TransportPutDatafeedAction.java
++++ b/x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/action/TransportPutDatafeedAction.java
+@@ -26,6 +26,7 @@
+ import org.elasticsearch.common.xcontent.json.JsonXContent;
+ import org.elasticsearch.index.IndexNotFoundException;
+ import org.elasticsearch.license.LicenseUtils;
++import org.elasticsearch.license.RemoteClusterLicenseChecker;
+ import org.elasticsearch.license.XPackLicenseState;
+ import org.elasticsearch.tasks.Task;
+ import org.elasticsearch.threadpool.ThreadPool;
+@@ -133,12 +134,16 @@ protected void masterOperation(Task task, PutDatafeedAction.Request request, Clu
+                     }
+                 }
+             );
++            if (RemoteClusterLicenseChecker.containsRemoteIndex(request.getDatafeed().getIndices())) {
++                getRollupIndexCapsActionHandler.onResponse(new GetRollupIndexCapsAction.Response());
++            } else {
++                executeAsyncWithOrigin(client,
++                    ML_ORIGIN,
++                    GetRollupIndexCapsAction.INSTANCE,
++                    new GetRollupIndexCapsAction.Request(indices),
++                    getRollupIndexCapsActionHandler);
++            }
+ 
+-            executeAsyncWithOrigin(client,
+-                ML_ORIGIN,
+-                GetRollupIndexCapsAction.INSTANCE,
+-                new GetRollupIndexCapsAction.Request(indices),
+-                getRollupIndexCapsActionHandler);
+         } else {
+             putDatafeed(request, threadPool.getThreadContext().getHeaders(), listener);
+         }
+diff --git a/x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/datafeed/extractor/DataExtractorFactory.java b/x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/datafeed/extractor/DataExtractorFactory.java
+index bca57f7155ae..948cea5de85d 100644
+--- a/x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/datafeed/extractor/DataExtractorFactory.java
++++ b/x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/datafeed/extractor/DataExtractorFactory.java
+@@ -10,6 +10,7 @@
+ import org.elasticsearch.client.Client;
+ import org.elasticsearch.common.xcontent.NamedXContentRegistry;
+ import org.elasticsearch.index.IndexNotFoundException;
++import org.elasticsearch.license.RemoteClusterLicenseChecker;
+ import org.elasticsearch.xpack.core.ClientHelper;
+ import org.elasticsearch.xpack.core.ml.datafeed.DatafeedConfig;
+ import org.elasticsearch.xpack.core.ml.datafeed.extractor.DataExtractor;
+@@ -63,13 +64,17 @@ static void create(Client client,
+             }
+         );
+ 
+-        GetRollupIndexCapsAction.Request request = new GetRollupIndexCapsAction.Request(datafeed.getIndices().toArray(new String[0]));
+-
+-        ClientHelper.executeAsyncWithOrigin(
++        if (RemoteClusterLicenseChecker.containsRemoteIndex(datafeed.getIndices())) {
++            // If we have remote indices in the data feed, don't bother checking for rollup support
++            // Rollups + CCS is not supported
++            getRollupIndexCapsActionHandler.onResponse(new GetRollupIndexCapsAction.Response());
++        } else {
++            ClientHelper.executeAsyncWithOrigin(
+                 client,
+                 ClientHelper.ML_ORIGIN,
+                 GetRollupIndexCapsAction.INSTANCE,
+-                request,
++                new GetRollupIndexCapsAction.Request(datafeed.getIndices().toArray(new String[0])),
+                 getRollupIndexCapsActionHandler);
++        }
+     }
+ }
+diff --git a/x-pack/plugin/ml/src/test/java/org/elasticsearch/xpack/ml/datafeed/extractor/DataExtractorFactoryTests.java b/x-pack/plugin/ml/src/test/java/org/elasticsearch/xpack/ml/datafeed/extractor/DataExtractorFactoryTests.java
+index e82a99378c06..04a70edae03b 100644
+--- a/x-pack/plugin/ml/src/test/java/org/elasticsearch/xpack/ml/datafeed/extractor/DataExtractorFactoryTests.java
++++ b/x-pack/plugin/ml/src/test/java/org/elasticsearch/xpack/ml/datafeed/extractor/DataExtractorFactoryTests.java
+@@ -223,6 +223,60 @@ public void testCreateDataExtractorFactoryGivenRollupAndValidAggregation() {
+         DataExtractorFactory.create(client, datafeedConfig.build(), jobBuilder.build(new Date()), xContentRegistry(), listener);
+     }
+ 
++    public void testCreateDataExtractorFactoryGivenRollupAndRemoteIndex() {
++        givenAggregatableRollup("myField", "max", 5, "termField");
++        DataDescription.Builder dataDescription = new DataDescription.Builder();
++        dataDescription.setTimeField("time");
++        Job.Builder jobBuilder = DatafeedManagerTests.createDatafeedJob();
++        jobBuilder.setDataDescription(dataDescription);
++        DatafeedConfig.Builder datafeedConfig = DatafeedManagerTests.createDatafeedConfig("datafeed1", "foo");
++        datafeedConfig.setIndices(Collections.singletonList("cluster_two:my_index"));
++        datafeedConfig.setChunkingConfig(ChunkingConfig.newOff());
++        MaxAggregationBuilder maxTime = AggregationBuilders.max("time").field("time");
++        MaxAggregationBuilder myField = AggregationBuilders.max("myField").field("myField");
++        TermsAggregationBuilder myTerm = AggregationBuilders.terms("termAgg").field("termField").subAggregation(myField);
++        datafeedConfig.setParsedAggregations(AggregatorFactories.builder().addAggregator(
++            AggregationBuilders.dateHistogram("time").interval(600_000).subAggregation(maxTime).subAggregation(myTerm).field("time")));
++
++        // Test with remote index, aggregation, and no chunking
++        ActionListener<DataExtractorFactory> listener = ActionListener.wrap(
++            dataExtractorFactory -> {
++                assertThat(dataExtractorFactory, instanceOf(AggregationDataExtractorFactory.class));
++                assertWarnings("[interval] on [date_histogram] is deprecated, use [fixed_interval] or [calendar_interval] in the future.");
++            },
++            e -> fail()
++        );
++        DataExtractorFactory.create(client, datafeedConfig.build(), jobBuilder.build(new Date()), xContentRegistry(), listener);
++
++        // Test with remote index, aggregation, and chunking
++        datafeedConfig.setChunkingConfig(ChunkingConfig.newAuto());
++        listener = ActionListener.wrap(
++            dataExtractorFactory -> assertThat(dataExtractorFactory, instanceOf(ChunkedDataExtractorFactory.class)),
++            e -> fail()
++        );
++        DataExtractorFactory.create(client, datafeedConfig.build(), jobBuilder.build(new Date()), xContentRegistry(), listener);
++
++        // Test with remote index, no aggregation, and no chunking
++        datafeedConfig = DatafeedManagerTests.createDatafeedConfig("datafeed1", "foo");
++        datafeedConfig.setIndices(Collections.singletonList("cluster_two:my_index"));
++        datafeedConfig.setChunkingConfig(ChunkingConfig.newOff());
++
++        listener = ActionListener.wrap(
++            dataExtractorFactory -> assertThat(dataExtractorFactory, instanceOf(ScrollDataExtractorFactory.class)),
++            e -> fail()
++        );
++
++        DataExtractorFactory.create(client, datafeedConfig.build(), jobBuilder.build(new Date()), xContentRegistry(), listener);
++
++        // Test with remote index, no aggregation, and chunking
++        datafeedConfig.setChunkingConfig(ChunkingConfig.newAuto());
++        listener = ActionListener.wrap(
++            dataExtractorFactory -> assertThat(dataExtractorFactory, instanceOf(ChunkedDataExtractorFactory.class)),
++            e -> fail()
++        );
++        DataExtractorFactory.create(client, datafeedConfig.build(), jobBuilder.build(new Date()), xContentRegistry(), listener);
++    }
++
+     public void testCreateDataExtractorFactoryGivenRollupAndValidAggregationAndAutoChunk() {
+         givenAggregatableRollup("myField", "max", 5, "termField");
+         DataDescription.Builder dataDescription = new DataDescription.Builder();

@@ -1,0 +1,256 @@
+diff --git a/server/src/main/java/org/elasticsearch/action/bulk/BulkShardRequest.java b/server/src/main/java/org/elasticsearch/action/bulk/BulkShardRequest.java
+index efb08a01e43a..2f9a130eb82f 100644
+--- a/server/src/main/java/org/elasticsearch/action/bulk/BulkShardRequest.java
++++ b/server/src/main/java/org/elasticsearch/action/bulk/BulkShardRequest.java
+@@ -26,8 +26,8 @@
+ import org.elasticsearch.index.shard.ShardId;
+ 
+ import java.io.IOException;
+-import java.util.ArrayList;
+-import java.util.List;
++import java.util.HashSet;
++import java.util.Set;
+ 
+ public class BulkShardRequest extends ReplicatedWriteRequest<BulkShardRequest> {
+ 
+@@ -48,7 +48,13 @@ public BulkShardRequest(ShardId shardId, RefreshPolicy refreshPolicy, BulkItemRe
+ 
+     @Override
+     public String[] indices() {
+-        List<String> indices = new ArrayList<>();
++        // A bulk shard request encapsulates items targeted at a specific shard of an index.
++        // However, items could be targeting aliases of the index, so the bulk request although
++        // targeting a single concrete index shard might do so using several alias names.
++        // These alias names have to be exposed by this method because authorization works with
++        // aliases too, specifically, the item's target alias can be authorized but the concrete
++        // index might not be.
++        Set<String> indices = new HashSet<>(1);
+         for (BulkItemRequest item : items) {
+             if (item != null) {
+                 indices.add(item.index());
+diff --git a/x-pack/plugin/security/src/main/java/org/elasticsearch/xpack/security/audit/AuditTrail.java b/x-pack/plugin/security/src/main/java/org/elasticsearch/xpack/security/audit/AuditTrail.java
+index e99b822e1dca..569e8496aef8 100644
+--- a/x-pack/plugin/security/src/main/java/org/elasticsearch/xpack/security/audit/AuditTrail.java
++++ b/x-pack/plugin/security/src/main/java/org/elasticsearch/xpack/security/audit/AuditTrail.java
+@@ -5,6 +5,7 @@
+  */
+ package org.elasticsearch.xpack.security.audit;
+ 
++import org.elasticsearch.common.transport.TransportAddress;
+ import org.elasticsearch.rest.RestRequest;
+ import org.elasticsearch.transport.TransportMessage;
+ import org.elasticsearch.xpack.core.security.authc.Authentication;
+@@ -72,4 +73,13 @@ void runAsDenied(String requestId, Authentication authentication, String action,
+     void runAsDenied(String requestId, Authentication authentication, RestRequest request,
+                      AuthorizationInfo authorizationInfo);
+ 
++    /**
++     * This is a "workaround" method to log index "access_granted" and "access_denied" events for actions not tied to a
++     * {@code TransportMessage}, or when the connection is not 1:1, i.e. several audit events for an action associated with the same
++     * message. It is currently only used to audit the resolved index (alias) name for each {@code BulkItemRequest} comprised by a
++     * {@code BulkShardRequest}. We should strive to not use this and TODO refactor it out!
++     */
++    void explicitIndexAccessEvent(String requestId, AuditLevel eventType, Authentication authentication, String action, String indices,
++                                  String requestName, TransportAddress remoteAddress, AuthorizationInfo authorizationInfo);
++
+ }
+diff --git a/x-pack/plugin/security/src/main/java/org/elasticsearch/xpack/security/audit/AuditTrailService.java b/x-pack/plugin/security/src/main/java/org/elasticsearch/xpack/security/audit/AuditTrailService.java
+index 38bb93d8bcf5..ddf6d49a632a 100644
+--- a/x-pack/plugin/security/src/main/java/org/elasticsearch/xpack/security/audit/AuditTrailService.java
++++ b/x-pack/plugin/security/src/main/java/org/elasticsearch/xpack/security/audit/AuditTrailService.java
+@@ -5,6 +5,7 @@
+  */
+ package org.elasticsearch.xpack.security.audit;
+ 
++import org.elasticsearch.common.transport.TransportAddress;
+ import org.elasticsearch.license.XPackLicenseState;
+ import org.elasticsearch.rest.RestRequest;
+ import org.elasticsearch.transport.TransportMessage;
+@@ -222,4 +223,16 @@ public void runAsDenied(String requestId, Authentication authentication, RestReq
+             }
+         }
+     }
++
++    @Override
++    public void explicitIndexAccessEvent(String requestId, AuditLevel eventType, Authentication authentication, String action,
++                                         String indices, String requestName, TransportAddress remoteAddress,
++                                         AuthorizationInfo authorizationInfo) {
++        if (licenseState.isAuditingAllowed()) {
++            for (AuditTrail auditTrail : auditTrails) {
++                auditTrail.explicitIndexAccessEvent(requestId, eventType, authentication, action, indices, requestName, remoteAddress,
++                        authorizationInfo);
++            }
++        }
++    }
+ }
+diff --git a/x-pack/plugin/security/src/main/java/org/elasticsearch/xpack/security/audit/logfile/LoggingAuditTrail.java b/x-pack/plugin/security/src/main/java/org/elasticsearch/xpack/security/audit/logfile/LoggingAuditTrail.java
+index 03d1d5045262..f4e59f8c4dbf 100644
+--- a/x-pack/plugin/security/src/main/java/org/elasticsearch/xpack/security/audit/logfile/LoggingAuditTrail.java
++++ b/x-pack/plugin/security/src/main/java/org/elasticsearch/xpack/security/audit/logfile/LoggingAuditTrail.java
+@@ -443,6 +443,46 @@ public void accessGranted(String requestId, Authentication authentication, Strin
+         }
+     }
+ 
++    @Override
++    public void explicitIndexAccessEvent(String requestId, AuditLevel eventType, Authentication authentication, String action, String index,
++                                    String requestName, TransportAddress remoteAddress, AuthorizationInfo authorizationInfo) {
++        assert eventType == ACCESS_DENIED || eventType == AuditLevel.ACCESS_GRANTED || eventType == SYSTEM_ACCESS_GRANTED;
++        final String[] indices = index == null ? null : new String[] { index };
++        final User user = authentication.getUser();
++        final boolean isSystem = SystemUser.is(user) || XPackUser.is(user);
++        if (isSystem && eventType == ACCESS_GRANTED) {
++            eventType = SYSTEM_ACCESS_GRANTED;
++        }
++        if (events.contains(eventType)) {
++            if (eventFilterPolicyRegistry.ignorePredicate()
++                    .test(new AuditEventMetaInfo(Optional.of(user), Optional.of(effectiveRealmName(authentication)),
++                            Optional.of(authorizationInfo), Optional.ofNullable(indices))) == false) {
++                final LogEntryBuilder logEntryBuilder = new LogEntryBuilder()
++                        .with(EVENT_TYPE_FIELD_NAME, TRANSPORT_ORIGIN_FIELD_VALUE)
++                        .with(EVENT_ACTION_FIELD_NAME, eventType == ACCESS_DENIED ? "access_denied" : "access_granted")
++                        .with(ACTION_FIELD_NAME, action)
++                        .with(REQUEST_NAME_FIELD_NAME, requestName)
++                        .withRequestId(requestId)
++                        .withSubject(authentication)
++                        .with(INDICES_FIELD_NAME, indices)
++                        .withOpaqueId(threadContext)
++                        .withXForwardedFor(threadContext)
++                        .with(authorizationInfo.asMap());
++                final InetSocketAddress restAddress = RemoteHostHeader.restRemoteAddress(threadContext);
++                if (restAddress != null) {
++                    logEntryBuilder
++                        .with(ORIGIN_TYPE_FIELD_NAME, REST_ORIGIN_FIELD_VALUE)
++                        .with(ORIGIN_ADDRESS_FIELD_NAME, NetworkAddress.format(restAddress));
++                } else if (remoteAddress != null) {
++                    logEntryBuilder
++                        .with(ORIGIN_TYPE_FIELD_NAME, TRANSPORT_ORIGIN_FIELD_VALUE)
++                        .with(ORIGIN_ADDRESS_FIELD_NAME, NetworkAddress.format(remoteAddress.address()));
++                }
++                logger.info(logEntryBuilder.build());
++            }
++        }
++    }
++
+     @Override
+     public void accessDenied(String requestId, Authentication authentication, String action, TransportMessage message,
+                              AuthorizationInfo authorizationInfo) {
+diff --git a/x-pack/plugin/security/src/main/java/org/elasticsearch/xpack/security/authz/AuthorizationService.java b/x-pack/plugin/security/src/main/java/org/elasticsearch/xpack/security/authz/AuthorizationService.java
+index ba4839e67d23..afbe7a1231bd 100644
+--- a/x-pack/plugin/security/src/main/java/org/elasticsearch/xpack/security/authz/AuthorizationService.java
++++ b/x-pack/plugin/security/src/main/java/org/elasticsearch/xpack/security/authz/AuthorizationService.java
+@@ -61,6 +61,7 @@
+ import org.elasticsearch.xpack.core.security.user.User;
+ import org.elasticsearch.xpack.core.security.user.XPackSecurityUser;
+ import org.elasticsearch.xpack.core.security.user.XPackUser;
++import org.elasticsearch.xpack.security.audit.AuditLevel;
+ import org.elasticsearch.xpack.security.audit.AuditTrailService;
+ import org.elasticsearch.xpack.security.audit.AuditUtil;
+ import org.elasticsearch.xpack.security.authz.interceptor.RequestInterceptor;
+@@ -308,10 +309,12 @@ private void handleIndexActionAuthorizationResult(final IndexAuthorizationResult
+             // if this is performing multiple actions on the index, then check each of those actions.
+             assert request instanceof BulkShardRequest
+                 : "Action " + action + " requires " + BulkShardRequest.class + " but was " + request.getClass();
+-            authorizeBulkItems(requestInfo, authzInfo, authzEngine, resolvedIndicesAsyncSupplier, authorizedIndicesSupplier,
+-                metaData, requestId,
+-                ActionListener.wrap(ignore -> runRequestInterceptors(requestInfo, authzInfo, authorizationEngine, listener),
+-                    listener::onFailure));
++            authorizeBulkItems(requestInfo, authzInfo, authzEngine, resolvedIndicesAsyncSupplier, authorizedIndicesSupplier, metaData,
++                    requestId,
++                    wrapPreservingContext(
++                            ActionListener.wrap(ignore -> runRequestInterceptors(requestInfo, authzInfo, authorizationEngine, listener),
++                                    listener::onFailure),
++                            threadContext));
+         } else {
+             runRequestInterceptors(requestInfo, authzInfo, authorizationEngine, listener);
+         }
+@@ -493,14 +496,16 @@ private void authorizeBulkItems(RequestInfo requestInfo, AuthorizationInfo authz
+                         for (BulkItemRequest item : request.items()) {
+                             final String resolvedIndex = resolvedIndexNames.get(item.index());
+                             final String itemAction = getAction(item);
+-                            final IndicesAccessControl indicesAccessControl = actionToIndicesAccessControl.get(getAction(item));
++                            final IndicesAccessControl indicesAccessControl = actionToIndicesAccessControl.get(itemAction);
+                             final IndicesAccessControl.IndexAccessControl indexAccessControl
+                                 = indicesAccessControl.getIndexPermissions(resolvedIndex);
+                             if (indexAccessControl == null || indexAccessControl.isGranted() == false) {
+-                                auditTrail.accessDenied(requestId, authentication, itemAction, request, authzInfo);
++                                auditTrail.explicitIndexAccessEvent(requestId, AuditLevel.ACCESS_DENIED, authentication, itemAction,
++                                        resolvedIndex, item.getClass().getSimpleName(), request.remoteAddress(), authzInfo);
+                                 item.abort(resolvedIndex, denialException(authentication, itemAction, null));
+                             } else if (audit.get()) {
+-                                auditTrail.accessGranted(requestId, authentication, itemAction, request, authzInfo);
++                                auditTrail.explicitIndexAccessEvent(requestId, AuditLevel.ACCESS_GRANTED, authentication, itemAction,
++                                        resolvedIndex, item.getClass().getSimpleName(), request.remoteAddress(), authzInfo);
+                             }
+                         }
+                         listener.onResponse(null);
+@@ -521,7 +526,7 @@ private void authorizeBulkItems(RequestInfo requestInfo, AuthorizationInfo authz
+             }, listener::onFailure));
+     }
+ 
+-    private IllegalArgumentException illegalArgument(String message) {
++    private static IllegalArgumentException illegalArgument(String message) {
+         assert false : message;
+         return new IllegalArgumentException(message);
+     }
+diff --git a/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/authz/AuthorizationServiceTests.java b/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/authz/AuthorizationServiceTests.java
+index b608a5694976..29d02326cd21 100644
+--- a/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/authz/AuthorizationServiceTests.java
++++ b/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/authz/AuthorizationServiceTests.java
+@@ -124,6 +124,7 @@
+ import org.elasticsearch.xpack.core.security.user.User;
+ import org.elasticsearch.xpack.core.security.user.XPackSecurityUser;
+ import org.elasticsearch.xpack.core.security.user.XPackUser;
++import org.elasticsearch.xpack.security.audit.AuditLevel;
+ import org.elasticsearch.xpack.security.audit.AuditTrailService;
+ import org.elasticsearch.xpack.security.audit.AuditUtil;
+ import org.elasticsearch.xpack.security.authz.store.CompositeRolesStore;
+@@ -1167,14 +1168,24 @@ public void testAuthorizationOfIndividualBulkItems() throws IOException {
+         final String requestId = AuditUtil.getOrGenerateRequestId(threadContext);
+         authorize(authentication, action, request);
+ 
+-        verify(auditTrail, times(2)).accessGranted(eq(requestId), eq(authentication), eq(DeleteAction.NAME), eq(request),
+-            authzInfoRoles(new String[] { role.getName() })); // concrete-index and alias-2 delete
+-        verify(auditTrail, times(2)).accessGranted(eq(requestId), eq(authentication), eq(IndexAction.NAME), eq(request),
+-            authzInfoRoles(new String[] { role.getName() })); // concrete-index and alias-1 index
+-        verify(auditTrail).accessDenied(eq(requestId), eq(authentication), eq(DeleteAction.NAME), eq(request),
+-            authzInfoRoles(new String[] { role.getName() })); // alias-1 delete
+-        verify(auditTrail).accessDenied(eq(requestId), eq(authentication), eq(IndexAction.NAME), eq(request),
+-            authzInfoRoles(new String[] { role.getName() })); // alias-2 index
++        verify(auditTrail).explicitIndexAccessEvent(eq(requestId), eq(AuditLevel.ACCESS_GRANTED), eq(authentication),
++                eq(DeleteAction.NAME), eq("concrete-index"), eq(BulkItemRequest.class.getSimpleName()),
++                eq(request.remoteAddress()), authzInfoRoles(new String[] { role.getName() }));
++        verify(auditTrail).explicitIndexAccessEvent(eq(requestId), eq(AuditLevel.ACCESS_GRANTED), eq(authentication),
++                eq(DeleteAction.NAME), eq("alias-2"), eq(BulkItemRequest.class.getSimpleName()),
++                eq(request.remoteAddress()), authzInfoRoles(new String[] { role.getName() }));
++        verify(auditTrail).explicitIndexAccessEvent(eq(requestId), eq(AuditLevel.ACCESS_GRANTED), eq(authentication),
++                eq(IndexAction.NAME), eq("concrete-index"), eq(BulkItemRequest.class.getSimpleName()),
++                eq(request.remoteAddress()), authzInfoRoles(new String[] { role.getName() }));
++        verify(auditTrail).explicitIndexAccessEvent(eq(requestId), eq(AuditLevel.ACCESS_GRANTED), eq(authentication),
++                eq(IndexAction.NAME), eq("alias-1"), eq(BulkItemRequest.class.getSimpleName()),
++                eq(request.remoteAddress()), authzInfoRoles(new String[] { role.getName() }));
++        verify(auditTrail).explicitIndexAccessEvent(eq(requestId), eq(AuditLevel.ACCESS_DENIED), eq(authentication),
++                eq(DeleteAction.NAME), eq("alias-1"), eq(BulkItemRequest.class.getSimpleName()),
++                eq(request.remoteAddress()), authzInfoRoles(new String[] { role.getName() }));
++        verify(auditTrail).explicitIndexAccessEvent(eq(requestId), eq(AuditLevel.ACCESS_DENIED), eq(authentication),
++                eq(IndexAction.NAME), eq("alias-2"), eq(BulkItemRequest.class.getSimpleName()),
++                eq(request.remoteAddress()), authzInfoRoles(new String[] { role.getName() }));
+         verify(auditTrail).accessGranted(eq(requestId), eq(authentication), eq(action), eq(request),
+             authzInfoRoles(new String[] { role.getName() })); // bulk request is allowed
+         verifyNoMoreInteractions(auditTrail);
+@@ -1203,10 +1214,12 @@ public void testAuthorizationOfIndividualBulkItemsWithDateMath() throws IOExcept
+         authorize(authentication, action, request);
+ 
+         // both deletes should fail
+-        verify(auditTrail, times(2)).accessDenied(eq(requestId), eq(authentication), eq(DeleteAction.NAME), eq(request),
+-            authzInfoRoles(new String[] { role.getName() }));
+-        verify(auditTrail, times(2)).accessGranted(eq(requestId), eq(authentication), eq(IndexAction.NAME), eq(request),
+-            authzInfoRoles(new String[] { role.getName() }));
++        verify(auditTrail, times(2)).explicitIndexAccessEvent(eq(requestId), eq(AuditLevel.ACCESS_DENIED), eq(authentication),
++                eq(DeleteAction.NAME), Matchers.startsWith("datemath-"), eq(BulkItemRequest.class.getSimpleName()),
++                eq(request.remoteAddress()), authzInfoRoles(new String[] { role.getName() }));
++        verify(auditTrail, times(2)).explicitIndexAccessEvent(eq(requestId), eq(AuditLevel.ACCESS_GRANTED), eq(authentication),
++                eq(IndexAction.NAME), Matchers.startsWith("datemath-"), eq(BulkItemRequest.class.getSimpleName()),
++                eq(request.remoteAddress()), authzInfoRoles(new String[] { role.getName() }));
+         // bulk request is allowed
+         verify(auditTrail).accessGranted(eq(requestId), eq(authentication), eq(action), eq(request),
+             authzInfoRoles(new String[]{role.getName()}));

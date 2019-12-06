@@ -1,0 +1,277 @@
+diff --git a/Marlin/src/HAL/HAL_ESP32/HAL.cpp b/Marlin/src/HAL/HAL_ESP32/HAL.cpp
+index f37a3a4ef83..37bba692603 100644
+--- a/Marlin/src/HAL/HAL_ESP32/HAL.cpp
++++ b/Marlin/src/HAL/HAL_ESP32/HAL.cpp
+@@ -23,6 +23,7 @@
+ #ifdef ARDUINO_ARCH_ESP32
+ 
+ #include "HAL.h"
++#include "HAL_timers_ESP32.h"
+ #include <rom/rtc.h>
+ #include <driver/adc.h>
+ #include <esp_adc_cal.h>
+@@ -67,6 +68,9 @@ uint16_t HAL_adc_result;
+ // ------------------------
+ 
+ esp_adc_cal_characteristics_t characteristics;
++volatile int numPWMUsed = 0,
++             pwmPins[MAX_PWM_PINS],
++             pwmValues[MAX_PWM_PINS];
+ 
+ // ------------------------
+ // Public functions
+@@ -168,25 +172,64 @@ void HAL_adc_init() {
+ void HAL_adc_start_conversion(uint8_t adc_pin) {
+   uint32_t mv;
+   esp_adc_cal_get_voltage((adc_channel_t)get_channel(adc_pin), &characteristics, &mv);
+-
+-  HAL_adc_result = mv*1023.0/3300.0;
++  HAL_adc_result = mv * 1023.0 / 3300.0;
+ }
+ 
+ void analogWrite(pin_t pin, int value) {
++  // Use ledc hardware for internal pins
++  if (pin < 34) {
++    static int cnt_channel = 1, pin_to_channel[40] = { 0 };
++    if (pin_to_channel[pin] == 0) {
++      ledcAttachPin(pin, cnt_channel);
++      ledcSetup(cnt_channel, 490, 8);
++      ledcWrite(cnt_channel, value);
++      pin_to_channel[pin] = cnt_channel++;
++    }
++    ledcWrite(pin_to_channel[pin], value);
++    return;
++  }
++
++  int idx = -1;
+ 
+-  if (!PWM_PIN(pin)) return;
++  // Search Pin
++  for (int i = 0; i < numPWMUsed; ++i)
++    if (pwmPins[i] == pin) { idx = i; break; }
+ 
+-  static int cnt_channel = 1,
+-             pin_to_channel[40] = {};
+-  if (pin_to_channel[pin] == 0) {
+-    ledcAttachPin(pin, cnt_channel);
+-    ledcSetup(cnt_channel, 490, 8);
+-    ledcWrite(cnt_channel, value);
++  // not found ?
++  if (idx < 0) {
++    // No slots remaining
++    if (numPWMUsed >= MAX_PWM_PINS) return;
+ 
+-    pin_to_channel[pin] = cnt_channel++;
++    // Take new slot for pin
++    idx = numPWMUsed;
++    pwmPins[idx] = pin;
++    // Start timer on first use
++    if (idx == 0) HAL_timer_start(PWM_TIMER_NUM, PWM_TIMER_FREQUENCY);
++
++    ++numPWMUsed;
+   }
+ 
+-  ledcWrite(pin_to_channel[pin], value);
++  // Use 7bit internal value - add 1 to have 100% high at 255
++  pwmValues[idx] = (value + 1) / 2;
++}
++
++// Handle PWM timer interrupt
++HAL_PWM_TIMER_ISR() {
++  HAL_timer_isr_prologue(PWM_TIMER_NUM);
++
++  static uint8_t count = 0;
++
++  for (int i = 0; i < numPWMUsed; ++i) {
++    if (count == 0)                   // Start of interval
++      WRITE(pwmPins[i], pwmValues[i] ? HIGH : LOW);
++    else if (pwmValues[i] == count)   // End of duration
++      WRITE(pwmPins[i], LOW);
++  }
++
++  // 128 for 7 Bit resolution
++  count = (count + 1) & 0x7F;
++
++  HAL_timer_isr_epilogue(PWM_TIMER_NUM);
+ }
+ 
+ #endif // ARDUINO_ARCH_ESP32
+diff --git a/Marlin/src/HAL/HAL_ESP32/HAL_timers_ESP32.cpp b/Marlin/src/HAL/HAL_ESP32/HAL_timers_ESP32.cpp
+index 27bd42bdf88..fc90af4b8fd 100644
+--- a/Marlin/src/HAL/HAL_ESP32/HAL_timers_ESP32.cpp
++++ b/Marlin/src/HAL/HAL_ESP32/HAL_timers_ESP32.cpp
+@@ -47,7 +47,7 @@ static timg_dev_t *TG[2] = {&TIMERG0, &TIMERG1};
+ const tTimerConfig TimerConfig [NUM_HARDWARE_TIMERS] = {
+   { TIMER_GROUP_0, TIMER_0, STEPPER_TIMER_PRESCALE, stepTC_Handler }, // 0 - Stepper
+   { TIMER_GROUP_0, TIMER_1,    TEMP_TIMER_PRESCALE, tempTC_Handler }, // 1 - Temperature
+-  { TIMER_GROUP_1, TIMER_0,                      1, nullptr }, // 2
++  { TIMER_GROUP_1, TIMER_0,     PWM_TIMER_PRESCALE, pwmTC_Handler  }, // 2 - PWM
+   { TIMER_GROUP_1, TIMER_1,                      1, nullptr }, // 3
+ };
+ 
+@@ -55,28 +55,28 @@ const tTimerConfig TimerConfig [NUM_HARDWARE_TIMERS] = {
+ // Public functions
+ // ------------------------
+ 
+-void IRAM_ATTR timer_group0_isr(void *para) {
+-  const int timer_idx = (int)para;
++void IRAM_ATTR timer_isr(void *para) {
++  const tTimerConfig& timer = TimerConfig[(int)para];
+ 
+   // Retrieve the interrupt status and the counter value
+   // from the timer that reported the interrupt
+-  uint32_t intr_status = TIMERG0.int_st_timers.val;
+-  TIMERG0.hw_timer[timer_idx].update = 1;
++  uint32_t intr_status = TG[timer.group]->int_st_timers.val;
++  TG[timer.group]->hw_timer[timer.idx].update = 1;
+ 
+   // Clear the interrupt
+-  if (intr_status & BIT(timer_idx)) {
+-    switch (timer_idx) {
+-      case TIMER_0: TIMERG0.int_clr_timers.t0 = 1; break;
+-      case TIMER_1: TIMERG0.int_clr_timers.t1 = 1; break;
++  if (intr_status & BIT(timer.idx)) {
++    switch (timer.idx) {
++      case TIMER_0: TG[timer.group]->int_clr_timers.t0 = 1; break;
++      case TIMER_1: TG[timer.group]->int_clr_timers.t1 = 1; break;
++      case TIMER_MAX: break;
+     }
+   }
+ 
+-  const tTimerConfig timer = TimerConfig[timer_idx];
+   timer.fn();
+ 
+   // After the alarm has been triggered
+   // Enable it again so it gets triggered the next time
+-  TIMERG0.hw_timer[timer_idx].config.alarm_en = TIMER_ALARM_EN;
++  TG[timer.group]->hw_timer[timer.idx].config.alarm_en = TIMER_ALARM_EN;
+ }
+ 
+ /**
+@@ -106,8 +106,7 @@ void HAL_timer_start(const uint8_t timer_num, uint32_t frequency) {
+ 
+   timer_enable_intr(timer.group, timer.idx);
+ 
+-  // TODO need to deal with timer_group1_isr
+-  timer_isr_register(timer.group, timer.idx, timer_group0_isr, (void*)timer.idx, 0, nullptr);
++  timer_isr_register(timer.group, timer.idx, timer_isr, (void*)timer_num, 0, nullptr);
+ 
+   timer_start(timer.group, timer.idx);
+ }
+diff --git a/Marlin/src/HAL/HAL_ESP32/HAL_timers_ESP32.h b/Marlin/src/HAL/HAL_ESP32/HAL_timers_ESP32.h
+index d3da0aef800..0806fd2c776 100644
+--- a/Marlin/src/HAL/HAL_ESP32/HAL_timers_ESP32.h
++++ b/Marlin/src/HAL/HAL_ESP32/HAL_timers_ESP32.h
+@@ -40,6 +40,7 @@ typedef uint64_t hal_timer_t;
+ 
+ #define STEP_TIMER_NUM 0  // index of timer to use for stepper
+ #define TEMP_TIMER_NUM 1  // index of timer to use for temperature
++#define PWM_TIMER_NUM  2  // index of timer to use for PWM outputs
+ #define PULSE_TIMER_NUM STEP_TIMER_NUM
+ 
+ #define HAL_TIMER_RATE APB_CLK_FREQ // frequency of timer peripherals
+@@ -59,6 +60,14 @@ typedef uint64_t hal_timer_t;
+ #define TEMP_TIMER_PRESCALE    1000 // prescaler for setting Temp timer, 72Khz
+ #define TEMP_TIMER_FREQUENCY   1000 // temperature interrupt frequency
+ 
++#define PWM_TIMER_PRESCALE       10
++#if ENABLED(FAST_PWM_FAN)
++  #define PWM_TIMER_FREQUENCY  FAST_PWM_FAN_FREQUENCY
++#else
++  #define PWM_TIMER_FREQUENCY  (50*128) // 50Hz and 7bit resolution
++#endif
++#define MAX_PWM_PINS             32 // Number of PWM pin-slots
++
+ #define PULSE_TIMER_RATE         STEPPER_TIMER_RATE   // frequency of pulse timer
+ #define PULSE_TIMER_PRESCALE     STEPPER_TIMER_PRESCALE
+ #define PULSE_TIMER_TICKS_PER_US STEPPER_TIMER_TICKS_PER_US
+@@ -72,10 +81,11 @@ typedef uint64_t hal_timer_t;
+ 
+ #define HAL_TEMP_TIMER_ISR() extern "C" void tempTC_Handler(void)
+ #define HAL_STEP_TIMER_ISR() extern "C" void stepTC_Handler(void)
++#define HAL_PWM_TIMER_ISR() extern "C" void pwmTC_Handler(void)
+ 
+ extern "C" void tempTC_Handler(void);
+ extern "C" void stepTC_Handler(void);
+-
++extern "C" void pwmTC_Handler(void);
+ 
+ // ------------------------
+ // Types
+diff --git a/Marlin/src/HAL/HAL_ESP32/fastio_ESP32.h b/Marlin/src/HAL/HAL_ESP32/fastio_ESP32.h
+index 36477740958..1641116b902 100644
+--- a/Marlin/src/HAL/HAL_ESP32/fastio_ESP32.h
++++ b/Marlin/src/HAL/HAL_ESP32/fastio_ESP32.h
+@@ -66,7 +66,7 @@
+ #define extDigitalWrite(IO,V)   digitalWrite(IO,V)
+ 
+ // PWM outputs
+-#define PWM_PIN(P)              (P < 34) // NOTE Pins >= 34 are input only on ESP32, so they can't be used for output.
++#define PWM_PIN(P)              (P < 34 || P > 127) // NOTE Pins >= 34 are input only on ESP32, so they can't be used for output.
+ 
+ // Toggle pin value
+ #define TOGGLE(IO)              WRITE(IO, !READ(IO))
+diff --git a/Marlin/src/HAL/HAL_ESP32/i2s.cpp b/Marlin/src/HAL/HAL_ESP32/i2s.cpp
+index 557714f870f..1f7c508cf1c 100644
+--- a/Marlin/src/HAL/HAL_ESP32/i2s.cpp
++++ b/Marlin/src/HAL/HAL_ESP32/i2s.cpp
+@@ -56,7 +56,7 @@ static i2s_dev_t* I2S[I2S_NUM_MAX] = {&I2S0, &I2S1};
+ static i2s_dma_t dma;
+ 
+ // output value
+-uint32_t i2s_port_data;
++uint32_t i2s_port_data = 0;
+ 
+ #define I2S_ENTER_CRITICAL()  portENTER_CRITICAL(&i2s_spinlock[i2s_num])
+ #define I2S_EXIT_CRITICAL()   portEXIT_CRITICAL(&i2s_spinlock[i2s_num])
+@@ -140,13 +140,13 @@ static void IRAM_ATTR i2s_intr_handler_default(void *arg) {
+ }
+ 
+ void stepperTask(void* parameter) {
+-  uint32_t i, remaining = 0;
++  uint32_t remaining = 0;
+ 
+   while (1) {
+     xQueueReceive(dma.queue, &dma.current, portMAX_DELAY);
+     dma.rw_pos = 0;
+ 
+-    for (i = 0; i < DMA_SAMPLE_COUNT; i++) {
++    while (dma.rw_pos < DMA_SAMPLE_COUNT) {
+       // Fill with the port data post pulse_phase until the next step
+       if (remaining) {
+         i2s_push_sample();
+@@ -254,7 +254,13 @@ int i2s_init() {
+ 
+   I2S0.fifo_conf.dscr_en = 0;
+ 
+-  I2S0.conf_chan.tx_chan_mod = 0;
++  I2S0.conf_chan.tx_chan_mod = (
++    #if ENABLED(I2S_STEPPER_SPLIT_STREAM)
++      4
++    #else
++      0
++    #endif
++  );
+   I2S0.fifo_conf.tx_fifo_mod = 0;
+   I2S0.conf.tx_mono = 0;
+ 
+@@ -314,10 +320,19 @@ int i2s_init() {
+ }
+ 
+ void i2s_write(uint8_t pin, uint8_t val) {
++  #if ENABLED(I2S_STEPPER_SPLIT_STREAM)
++    if (pin >= 16) {
++      SET_BIT_TO(I2S0.conf_single_data, pin, val);
++      return;
++    }
++  #endif
+   SET_BIT_TO(i2s_port_data, pin, val);
+ }
+ 
+ uint8_t i2s_state(uint8_t pin) {
++  #if ENABLED(I2S_STEPPER_SPLIT_STREAM)
++    if (pin >= 16) return TEST(I2S0.conf_single_data, pin);
++  #endif
+   return TEST(i2s_port_data, pin);
+ }
+ 

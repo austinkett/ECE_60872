@@ -1,0 +1,141 @@
+diff --git a/core/src/main/java/org/elasticsearch/index/search/MatchQuery.java b/core/src/main/java/org/elasticsearch/index/search/MatchQuery.java
+index c2db347283c6..380b6251920e 100644
+--- a/core/src/main/java/org/elasticsearch/index/search/MatchQuery.java
++++ b/core/src/main/java/org/elasticsearch/index/search/MatchQuery.java
+@@ -22,6 +22,7 @@
+ import org.apache.lucene.analysis.Analyzer;
+ import org.apache.lucene.analysis.miscellaneous.DisableGraphAttribute;
+ import org.apache.lucene.analysis.TokenStream;
++import org.apache.lucene.index.IndexOptions;
+ import org.apache.lucene.index.Term;
+ import org.apache.lucene.queries.ExtendedCommonTermsQuery;
+ import org.apache.lucene.search.BooleanClause;
+@@ -239,6 +240,10 @@ protected Analyzer getAnalyzer(MappedFieldType fieldType, boolean quoted) {
+         }
+     }
+ 
++    private boolean hasPositions(MappedFieldType fieldType) {
++        return fieldType.indexOptions().compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) >= 0;
++    }
++
+     public Query parse(Type type, String fieldName, Object value) throws IOException {
+         MappedFieldType fieldType = context.fieldMapper(fieldName);
+         if (fieldType == null) {
+@@ -263,7 +268,11 @@ public Query parse(Type type, String fieldName, Object value) throws IOException
+         assert analyzer != null;
+         MatchQueryBuilder builder = new MatchQueryBuilder(analyzer, fieldType);
+         builder.setEnablePositionIncrements(this.enablePositionIncrements);
+-        builder.setAutoGenerateMultiTermSynonymsPhraseQuery(this.autoGenerateSynonymsPhraseQuery);
++        if (hasPositions(fieldType)) {
++            builder.setAutoGenerateMultiTermSynonymsPhraseQuery(this.autoGenerateSynonymsPhraseQuery);
++        } else {
++            builder.setAutoGenerateMultiTermSynonymsPhraseQuery(false);
++        }
+ 
+         Query query = null;
+         switch (type) {
+@@ -331,6 +340,20 @@ protected Query newSynonymQuery(Term[] terms) {
+             return blendTermsQuery(terms, mapper);
+         }
+ 
++        @Override
++        protected Query analyzePhrase(String field, TokenStream stream, int slop) throws IOException {
++            if (hasPositions(mapper) == false) {
++                IllegalStateException exc =
++                    new IllegalStateException("field:[" + field + "] was indexed without position data; cannot run PhraseQuery");
++                if (lenient) {
++                    return newLenientFieldQuery(field, exc);
++                } else {
++                    throw exc;
++                }
++            }
++            return super.analyzePhrase(field, stream, slop);
++        }
++
+         /**
+          * Checks if graph analysis should be enabled for the field depending
+          * on the provided {@link Analyzer}
+diff --git a/core/src/test/java/org/elasticsearch/index/query/MatchQueryBuilderTests.java b/core/src/test/java/org/elasticsearch/index/query/MatchQueryBuilderTests.java
+index 526210d33703..680382917bf7 100644
+--- a/core/src/test/java/org/elasticsearch/index/query/MatchQueryBuilderTests.java
++++ b/core/src/test/java/org/elasticsearch/index/query/MatchQueryBuilderTests.java
+@@ -437,8 +437,12 @@ public void testExceptionUsingAnalyzerOnNumericField() {
+ 
+     @Override
+     protected void initializeAdditionalMappings(MapperService mapperService) throws IOException {
+-        mapperService.merge("doc", new CompressedXContent(PutMappingRequest.buildFromSimplifiedDef("doc",
+-            "string_boost", "type=text,boost=4").string()), MapperService.MergeReason.MAPPING_UPDATE, false);
++        mapperService.merge("doc", new CompressedXContent(PutMappingRequest.buildFromSimplifiedDef(
++                "doc",
++                "string_boost", "type=text,boost=4", "string_no_pos",
++                "type=text,index_options=docs").string()
++            ),
++            MapperService.MergeReason.MAPPING_UPDATE, false);
+     }
+ 
+     public void testMatchPhrasePrefixWithBoost() throws Exception {
+@@ -463,6 +467,16 @@ public void testMatchPhrasePrefixWithBoost() throws Exception {
+             Query query = builder.toQuery(context);
+             assertThat(query, instanceOf(MultiPhrasePrefixQuery.class));
+         }
++    }
+ 
++    public void testLenientPhraseQuery() throws Exception {
++        assumeTrue("test runs only when at least a type is registered", getCurrentTypes().length > 0);
++        QueryShardContext context = createShardContext();
++        MatchQuery b = new MatchQuery(context);
++        b.setLenient(true);
++        Query query = b.parse(Type.PHRASE, "string_no_pos", "foo bar");
++        assertThat(query, instanceOf(MatchNoDocsQuery.class));
++        assertThat(query.toString(),
++            containsString("field:[string_no_pos] was indexed without position data; cannot run PhraseQuery"));
+     }
+ }
+diff --git a/core/src/test/java/org/elasticsearch/search/query/QueryStringIT.java b/core/src/test/java/org/elasticsearch/search/query/QueryStringIT.java
+index 733a910527c2..3ef8b9d77719 100644
+--- a/core/src/test/java/org/elasticsearch/search/query/QueryStringIT.java
++++ b/core/src/test/java/org/elasticsearch/search/query/QueryStringIT.java
+@@ -242,16 +242,24 @@ public void testAllFields() throws Exception {
+     }
+ 
+ 
+-    @LuceneTestCase.AwaitsFix(bugUrl="currently can't perform phrase queries on fields that don't support positions")
+     public void testPhraseQueryOnFieldWithNoPositions() throws Exception {
+         List<IndexRequestBuilder> reqs = new ArrayList<>();
+         reqs.add(client().prepareIndex("test", "doc", "1").setSource("f1", "foo bar", "f4", "eggplant parmesan"));
+         reqs.add(client().prepareIndex("test", "doc", "2").setSource("f1", "foo bar", "f4", "chicken parmesan"));
+         indexRandom(true, false, reqs);
+ 
+-        SearchResponse resp = client().prepareSearch("test").setQuery(queryStringQuery("\"eggplant parmesan\"")).get();
+-        assertHits(resp.getHits(), "1");
+-        assertHitCount(resp, 1L);
++        SearchResponse resp = client().prepareSearch("test")
++            .setQuery(queryStringQuery("\"eggplant parmesan\"").lenient(true)).get();
++        assertHitCount(resp, 0L);
++
++        Exception exc = expectThrows(Exception.class,
++            () -> client().prepareSearch("test").setQuery(
++                queryStringQuery("f4:\"eggplant parmesan\"").lenient(false)
++            ).get()
++        );
++        IllegalStateException ise = (IllegalStateException) ExceptionsHelper.unwrap(exc, IllegalStateException.class);
++        assertNotNull(ise);
++        assertThat(ise.getMessage(), containsString("field:[f4] was indexed without position data; cannot run PhraseQuery"));
+     }
+ 
+     public void testBooleanStrictQuery() throws Exception {
+diff --git a/core/src/test/java/org/elasticsearch/search/query/SearchQueryIT.java b/core/src/test/java/org/elasticsearch/search/query/SearchQueryIT.java
+index 06f6e20d3836..a4387c9611fe 100644
+--- a/core/src/test/java/org/elasticsearch/search/query/SearchQueryIT.java
++++ b/core/src/test/java/org/elasticsearch/search/query/SearchQueryIT.java
+@@ -177,8 +177,8 @@ public void testIndexOptions() throws Exception {
+         assertHitCount(searchResponse, 1L);
+ 
+         assertFailures(client().prepareSearch().setQuery(matchQuery("field1", "quick brown").type(Type.PHRASE).slop(0)),
+-                    RestStatus.INTERNAL_SERVER_ERROR,
+-                    containsString("field \"field1\" was indexed without position data; cannot run PhraseQuery"));
++                    RestStatus.BAD_REQUEST,
++                    containsString("field:[field1] was indexed without position data; cannot run PhraseQuery"));
+     }
+ 
+     // see #3521

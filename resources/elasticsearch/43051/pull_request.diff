@@ -1,0 +1,395 @@
+diff --git a/server/src/main/java/org/elasticsearch/common/lucene/Lucene.java b/server/src/main/java/org/elasticsearch/common/lucene/Lucene.java
+index 88d7c57f5e42..a170b7f9d6a3 100644
+--- a/server/src/main/java/org/elasticsearch/common/lucene/Lucene.java
++++ b/server/src/main/java/org/elasticsearch/common/lucene/Lucene.java
+@@ -98,6 +98,7 @@
+ import org.elasticsearch.index.mapper.SeqNoFieldMapper;
+ 
+ import java.io.IOException;
++import java.io.UncheckedIOException;
+ import java.text.ParseException;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+@@ -1085,4 +1086,33 @@ public static void scanSeqNosInReader(DirectoryReader directoryReader, long from
+             }
+         }
+     }
++
++    /**
++     * Returns a new Bits which is the union of the given Bits and a DocIdSetIterator.
++     * If the DocIdSetIterator is empty, the same Bits instance will be returned.
++     */
++    public static Bits union(Bits bits, DocIdSetIterator iterator) throws IOException {
++        iterator.nextDoc();
++        if (iterator.docID() == DocIdSetIterator.NO_MORE_DOCS) {
++            return bits;
++        } else {
++            return new Bits() {
++                @Override
++                public boolean get(int index) {
++                    if (bits.get(index)) {
++                        return true;
++                    }
++                    try {
++                        return iterator.advance(index) == index;
++                    } catch (IOException e) {
++                        throw new UncheckedIOException(e);
++                    }
++                }
++                @Override
++                public int length() {
++                    return bits.length();
++                }
++            };
++        }
++    }
+ }
+diff --git a/server/src/main/java/org/elasticsearch/index/engine/CombinedDeletionPolicy.java b/server/src/main/java/org/elasticsearch/index/engine/CombinedDeletionPolicy.java
+index addb16d58d03..ec5e26bce54c 100644
+--- a/server/src/main/java/org/elasticsearch/index/engine/CombinedDeletionPolicy.java
++++ b/server/src/main/java/org/elasticsearch/index/engine/CombinedDeletionPolicy.java
+@@ -29,6 +29,7 @@
+ import org.elasticsearch.index.translog.TranslogDeletionPolicy;
+ 
+ import java.io.IOException;
++import java.io.UncheckedIOException;
+ import java.nio.file.Path;
+ import java.util.Collection;
+ import java.util.List;
+@@ -213,6 +214,15 @@ boolean hasUnreferencedCommits() throws IOException {
+         return false;
+     }
+ 
++    long localCheckpointOfSafeCommit() {
++        try {
++            assert safeCommit != null;
++            return Long.parseLong(safeCommit.getUserData().get(SequenceNumbers.LOCAL_CHECKPOINT_KEY));
++        } catch (IOException e) {
++            throw new UncheckedIOException(e);
++        }
++    }
++
+     /**
+      * Returns a description for a given {@link IndexCommit}. This should be only used for logging and debugging.
+      */
+diff --git a/server/src/main/java/org/elasticsearch/index/engine/InternalEngine.java b/server/src/main/java/org/elasticsearch/index/engine/InternalEngine.java
+index 408f70d70d1c..f2a5914cc682 100644
+--- a/server/src/main/java/org/elasticsearch/index/engine/InternalEngine.java
++++ b/server/src/main/java/org/elasticsearch/index/engine/InternalEngine.java
+@@ -23,6 +23,7 @@
+ import org.apache.lucene.codecs.blocktree.BlockTreeTermsReader;
+ import org.apache.lucene.codecs.blocktree.BlockTreeTermsReader.FSTLoadMode;
+ import org.apache.lucene.document.Field;
++import org.apache.lucene.document.LongPoint;
+ import org.apache.lucene.document.NumericDocValuesField;
+ import org.apache.lucene.index.DirectoryReader;
+ import org.apache.lucene.index.IndexCommit;
+@@ -2177,7 +2178,8 @@ private IndexWriterConfig getIndexWriterConfig() {
+         if (softDeleteEnabled) {
+             mergePolicy = new RecoverySourcePruneMergePolicy(SourceFieldMapper.RECOVERY_SOURCE_NAME, softDeletesPolicy::getRetentionQuery,
+                 new SoftDeletesRetentionMergePolicy(Lucene.SOFT_DELETES_FIELD, softDeletesPolicy::getRetentionQuery,
+-                    new PrunePostingsMergePolicy(mergePolicy, IdFieldMapper.NAME)));
++                    new PrunePostingsMergePolicy(mergePolicy, IdFieldMapper.NAME, () -> LongPoint.newRangeQuery(
++                        SeqNoFieldMapper.NAME, combinedDeletionPolicy.localCheckpointOfSafeCommit() + 1, Long.MAX_VALUE))));
+         }
+         iwc.setMergePolicy(new ElasticsearchMergePolicy(mergePolicy));
+         iwc.setSimilarity(engineConfig.getSimilarity());
+diff --git a/server/src/main/java/org/elasticsearch/index/engine/PrunePostingsMergePolicy.java b/server/src/main/java/org/elasticsearch/index/engine/PrunePostingsMergePolicy.java
+index 0c973ba93f65..0c91810620be 100644
+--- a/server/src/main/java/org/elasticsearch/index/engine/PrunePostingsMergePolicy.java
++++ b/server/src/main/java/org/elasticsearch/index/engine/PrunePostingsMergePolicy.java
+@@ -31,11 +31,18 @@
+ import org.apache.lucene.index.Terms;
+ import org.apache.lucene.index.TermsEnum;
+ import org.apache.lucene.search.DocIdSetIterator;
++import org.apache.lucene.search.IndexSearcher;
++import org.apache.lucene.search.Query;
++import org.apache.lucene.search.ScoreMode;
++import org.apache.lucene.search.Scorer;
++import org.apache.lucene.search.Weight;
+ import org.apache.lucene.util.Bits;
+ import org.apache.lucene.util.BytesRef;
++import org.elasticsearch.common.lucene.Lucene;
+ 
+ import java.io.IOException;
+ import java.util.Iterator;
++import java.util.function.Supplier;
+ 
+ /**
+  * This merge policy drops id field postings for all delete documents this can be
+@@ -49,22 +56,22 @@
+  */
+ final class PrunePostingsMergePolicy extends OneMergeWrappingMergePolicy {
+ 
+-    PrunePostingsMergePolicy(MergePolicy in, String idField) {
++    PrunePostingsMergePolicy(MergePolicy in, String idField, Supplier<Query> retentionQuery) {
+         super(in, toWrap -> new OneMerge(toWrap.segments) {
+             @Override
+             public CodecReader wrapForMerge(CodecReader reader) throws IOException {
+                 CodecReader wrapped = toWrap.wrapForMerge(reader);
+-                return wrapReader(wrapped, idField);
++                return wrapReader(wrapped, idField, retentionQuery);
+             }
+         });
+     }
+ 
+-    private static CodecReader wrapReader(CodecReader reader, String idField) {
+-        Bits liveDocs = reader.getLiveDocs();
+-        if (liveDocs == null) {
++    private static CodecReader wrapReader(CodecReader reader, String idField, Supplier<Query> retentionQuery) throws IOException {
++        if (reader.getLiveDocs() == null) {
+             return reader; // no deleted docs - we are good!
+         }
+-        final boolean fullyDeletedSegment = reader.numDocs() == 0;
++        final Bits liveDocs = applyRetentionQuery(reader, retentionQuery.get());
++        final boolean fullyDeletedSegment = liveDocs instanceof Bits.MatchNoBits;
+         return new FilterCodecReader(reader) {
+ 
+             @Override
+@@ -221,4 +228,48 @@ public BytesRef getPayload() throws IOException {
+             return in.getPayload();
+         }
+     }
++
++    private static Bits applyRetentionQuery(CodecReader reader, Query retentionQuery) throws IOException {
++        final Bits liveDocs = reader.getLiveDocs();
++        final IndexSearcher searcher = new IndexSearcher(new FilterCodecReader(reader) {
++            @Override
++            public CacheHelper getCoreCacheHelper() {
++                return reader.getCoreCacheHelper();
++            }
++
++            @Override
++            public CacheHelper getReaderCacheHelper() {
++                return null; // we are altering live docs
++            }
++
++            @Override
++            public Bits getLiveDocs() {
++                return new Bits() {
++                    @Override
++                    public boolean get(int index) {
++                        return liveDocs.get(index) == false;
++                    }
++
++                    @Override
++                    public int length() {
++                        return liveDocs.length();
++                    }
++                };
++            }
++
++            @Override
++            public int numDocs() {
++                return reader.maxDoc() - reader.numDocs();
++            }
++        });
++        searcher.setQueryCache(null);
++        final Weight weight = searcher.createWeight(searcher.rewrite(retentionQuery), ScoreMode.COMPLETE_NO_SCORES, 1.0f);
++        final Scorer scorer = weight.scorer(reader.getContext());
++        final Bits bits = Lucene.union(liveDocs, scorer == null ? DocIdSetIterator.empty() : scorer.iterator());
++        if (bits == liveDocs && reader.numDocs() == 0) {
++            return new Bits.MatchNoBits(liveDocs.length()); // fully deleted segment
++        } else {
++            return bits;
++        }
++    }
+ }
+diff --git a/server/src/test/java/org/elasticsearch/common/lucene/LuceneTests.java b/server/src/test/java/org/elasticsearch/common/lucene/LuceneTests.java
+index 1891be362b81..9fcc3a1980c5 100644
+--- a/server/src/test/java/org/elasticsearch/common/lucene/LuceneTests.java
++++ b/server/src/test/java/org/elasticsearch/common/lucene/LuceneTests.java
+@@ -50,8 +50,10 @@
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.MMapDirectory;
+ import org.apache.lucene.store.MockDirectoryWrapper;
++import org.apache.lucene.util.BitSetIterator;
+ import org.apache.lucene.util.Bits;
+ import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.FixedBitSet;
+ import org.elasticsearch.common.collect.Tuple;
+ import org.elasticsearch.common.io.stream.NamedWriteableRegistry;
+ import org.elasticsearch.core.internal.io.IOUtils;
+@@ -75,6 +77,8 @@
+ import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ import static org.hamcrest.Matchers.equalTo;
++import static org.hamcrest.Matchers.not;
++import static org.hamcrest.Matchers.sameInstance;
+ 
+ public class LuceneTests extends ESTestCase {
+     private static final NamedWriteableRegistry EMPTY_REGISTRY = new NamedWriteableRegistry(Collections.emptyList());
+@@ -661,4 +665,27 @@ private static Object randomMissingValue(SortField.Type type) {
+                 return null;
+         }
+     }
++
++    public void testUnionDocIdSet() throws Exception {
++        int length = randomIntBetween(1, 1000);
++        FixedBitSet s1 = new FixedBitSet(length);
++        FixedBitSet s2 = new FixedBitSet(length);
++        for (int i = 0; i < length; i++) {
++            if (randomBoolean()) {
++                s1.set(i);
++            }
++            if (randomBoolean()) {
++                s2.set(i);
++            }
++        }
++        Bits merged = Lucene.union(s1, new BitSetIterator(s2, randomNonNegativeLong()));
++        if (s2.cardinality() == 0) {
++            assertThat(merged, sameInstance(s1));
++        } else {
++            assertThat(merged, not(sameInstance(s1)));
++        }
++        for (int i = 0; i < length; i++) {
++            assertThat("index=" + i, merged.get(i), equalTo(s1.get(i) || s2.get(i)));
++        }
++    }
+ }
+diff --git a/server/src/test/java/org/elasticsearch/index/engine/InternalEngineTests.java b/server/src/test/java/org/elasticsearch/index/engine/InternalEngineTests.java
+index f4e1ecd2514b..b8a5c1b80a0a 100644
+--- a/server/src/test/java/org/elasticsearch/index/engine/InternalEngineTests.java
++++ b/server/src/test/java/org/elasticsearch/index/engine/InternalEngineTests.java
+@@ -48,12 +48,14 @@
+ import org.apache.lucene.index.NoMergePolicy;
+ import org.apache.lucene.index.NumericDocValues;
+ import org.apache.lucene.index.PointValues;
++import org.apache.lucene.index.PostingsEnum;
+ import org.apache.lucene.index.SegmentInfos;
+ import org.apache.lucene.index.SoftDeletesRetentionMergePolicy;
+ import org.apache.lucene.index.Term;
+ import org.apache.lucene.index.Terms;
+ import org.apache.lucene.index.TermsEnum;
+ import org.apache.lucene.index.TieredMergePolicy;
++import org.apache.lucene.search.DocIdSetIterator;
+ import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.search.MatchAllDocsQuery;
+ import org.apache.lucene.search.ReferenceManager;
+@@ -1470,8 +1472,8 @@ public void testLookupVersionWithPrunedAwayIds() throws IOException {
+             IndexWriterConfig indexWriterConfig = new IndexWriterConfig(Lucene.STANDARD_ANALYZER);
+             indexWriterConfig.setSoftDeletesField(Lucene.SOFT_DELETES_FIELD);
+             try (IndexWriter writer = new IndexWriter(dir,
+-                indexWriterConfig.setMergePolicy(new SoftDeletesRetentionMergePolicy(Lucene.SOFT_DELETES_FIELD,
+-                    MatchAllDocsQuery::new, new PrunePostingsMergePolicy(indexWriterConfig.getMergePolicy(), "_id"))))) {
++                indexWriterConfig.setMergePolicy(new SoftDeletesRetentionMergePolicy(Lucene.SOFT_DELETES_FIELD, MatchAllDocsQuery::new,
++                    new PrunePostingsMergePolicy(indexWriterConfig.getMergePolicy(), "_id", MatchAllDocsQuery::new))))) {
+                 org.apache.lucene.document.Document doc = new org.apache.lucene.document.Document();
+                 doc.add(new Field(IdFieldMapper.NAME, "1", IdFieldMapper.Defaults.FIELD_TYPE));
+                 doc.add(new NumericDocValuesField(VersionFieldMapper.NAME, -1));
+@@ -1578,6 +1580,7 @@ public void testForceMergeWithSoftDeletesRetention() throws Exception {
+                     assertThat(msg, ops.get(seqno), notNullValue());
+                 }
+             }
++            assertPruneIdBelowLocalCheckpointSafeCommit(engine, mapperService, safeCommitCheckpoint);
+             settings.put(IndexSettings.INDEX_SOFT_DELETES_RETENTION_OPERATIONS_SETTING.getKey(), 0);
+             indexSettings.updateIndexMetaData(IndexMetaData.builder(defaultSettings.getIndexMetaData()).settings(settings).build());
+             engine.onSettingsChanged();
+@@ -1587,6 +1590,44 @@ public void testForceMergeWithSoftDeletesRetention() throws Exception {
+             engine.forceMerge(true, 1, false, false, false);
+             assertConsistentHistoryBetweenTranslogAndLuceneIndex(engine, mapperService);
+             assertThat(readAllOperationsInLucene(engine, mapperService), hasSize(liveDocs.size()));
++            assertPruneIdBelowLocalCheckpointSafeCommit(engine, mapperService, safeCommitCheckpoint);
++        }
++    }
++
++    private void assertPruneIdBelowLocalCheckpointSafeCommit(Engine engine, MapperService mapperService,
++                                                             long localCheckpointOfSafeCommit) throws IOException {
++        try (Searcher search = engine.acquireSearcher("test", Engine.SearcherScope.INTERNAL)) {
++            for (LeafReaderContext leaf : search.getDirectoryReader().leaves()) {
++                LeafReader leafReader = leaf.reader();
++                Map<String, Set<Integer>> retainedSegmentDocIds = new HashMap<>();
++                NumericDocValues seqNoDV = leafReader.getNumericDocValues(SeqNoFieldMapper.NAME);
++                for (int segmentDocID = 0; segmentDocID < leafReader.maxDoc(); segmentDocID++) {
++                    seqNoDV.advanceExact(segmentDocID);
++                    if (seqNoDV.longValue() > localCheckpointOfSafeCommit || leafReader.getLiveDocs().get(segmentDocID)) {
++                        final FieldsVisitor fields = new FieldsVisitor(true, SourceFieldMapper.NAME);
++                        leafReader.document(segmentDocID, fields);
++                        fields.postProcess(mapperService);
++                        retainedSegmentDocIds.computeIfAbsent(fields.uid().id(), k -> new HashSet<>()).add(segmentDocID);
++                    }
++                }
++                TermsEnum termsEnum = leafReader.terms(IdFieldMapper.NAME).iterator();
++                if (termsEnum == null) {
++                    assertThat(retainedSegmentDocIds.keySet(), empty());
++                    continue;
++                }
++                for (String id : retainedSegmentDocIds.keySet()) {
++                    if (termsEnum.seekExact(newUid(id).bytes()) == false) {
++                        assertThat(retainedSegmentDocIds.get(id), empty());
++                        continue;
++                    }
++                    final PostingsEnum docsEnum = termsEnum.postings(null, 0);
++                    final Set<Integer> fromTerms = new HashSet<>();
++                    while (docsEnum.nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
++                        fromTerms.add(docsEnum.docID());
++                    }
++                    assertThat(fromTerms, equalTo(retainedSegmentDocIds.get(id)));
++                }
++            }
+         }
+     }
+ 
+@@ -3965,7 +4006,6 @@ public void testSequenceIDs() throws Exception {
+         searchResult.close();
+     }
+ 
+-    @AwaitsFix(bugUrl = "https://github.com/elastic/elasticsearch/issues/42979")
+     public void testLookupSeqNoByIdInLucene() throws Exception {
+         int numOps = between(10, 100);
+         long seqNo = 0;
+@@ -5804,17 +5844,22 @@ public void testPruneAwayDeletedButRetainedIds() throws Exception {
+         IOUtils.close(engine, store);
+         Settings settings = Settings.builder()
+             .put(defaultSettings.getSettings())
+-            .put(IndexSettings.INDEX_SOFT_DELETES_SETTING.getKey(), true).build();
++            .put(IndexSettings.INDEX_SOFT_DELETES_SETTING.getKey(), true)
++            .put(IndexSettings.INDEX_SOFT_DELETES_RETENTION_OPERATIONS_SETTING.getKey(), 10000)
++            .build();
+         IndexSettings indexSettings = IndexSettingsModule.newIndexSettings(
+             IndexMetaData.builder(defaultSettings.getIndexMetaData()).settings(settings).build());
+         store = createStore(indexSettings, newDirectory());
+         LogDocMergePolicy policy = new LogDocMergePolicy();
+         policy.setMinMergeDocs(10000);
+-        try (InternalEngine engine = createEngine(indexSettings, store, createTempDir(), policy)) {
++        AtomicLong globalCheckpoint = new AtomicLong();
++        try (InternalEngine engine = createEngine(indexSettings, store, createTempDir(), policy, null, null, globalCheckpoint::get)) {
+             int numDocs = between(1, 20);
+             for (int i = 0; i < numDocs; i++) {
+                 index(engine, i);
+             }
++            globalCheckpoint.set(engine.getLocalCheckpoint());
++            engine.flush(true, true);
+             engine.forceMerge(true);
+             engine.delete(new Engine.Delete("_doc", "0", newUid("0"), primaryTerm.get()));
+             engine.refresh("test");
+@@ -5834,6 +5879,8 @@ public void testPruneAwayDeletedButRetainedIds() throws Exception {
+             }
+ 
+             // lets force merge the tombstone and the original segment and make sure the doc is still there but the ID term is gone
++            globalCheckpoint.set(engine.getLocalCheckpoint());
++            engine.flush(true, true);
+             engine.forceMerge(true);
+             engine.refresh("test");
+             try (Searcher searcher = engine.acquireSearcher("test")) {
+diff --git a/server/src/test/java/org/elasticsearch/index/engine/PrunePostingsMergePolicyTests.java b/server/src/test/java/org/elasticsearch/index/engine/PrunePostingsMergePolicyTests.java
+index 9fb944518132..1c37cd64bc70 100644
+--- a/server/src/test/java/org/elasticsearch/index/engine/PrunePostingsMergePolicyTests.java
++++ b/server/src/test/java/org/elasticsearch/index/engine/PrunePostingsMergePolicyTests.java
+@@ -35,6 +35,7 @@
+ import org.apache.lucene.index.TermsEnum;
+ import org.apache.lucene.search.DocIdSetIterator;
+ import org.apache.lucene.search.MatchAllDocsQuery;
++import org.apache.lucene.search.MatchNoDocsQuery;
+ import org.apache.lucene.search.Sort;
+ import org.apache.lucene.search.SortField;
+ import org.apache.lucene.store.Directory;
+@@ -50,7 +51,7 @@ public void testPrune() throws IOException {
+             IndexWriterConfig iwc = newIndexWriterConfig();
+             iwc.setSoftDeletesField("_soft_deletes");
+             MergePolicy mp = new SoftDeletesRetentionMergePolicy("_soft_deletes", MatchAllDocsQuery::new,
+-                new PrunePostingsMergePolicy(newLogMergePolicy(), "id"));
++                new PrunePostingsMergePolicy(newLogMergePolicy(), "id", MatchNoDocsQuery::new));
+             iwc.setMergePolicy(mp);
+             boolean sorted = randomBoolean();
+             if (sorted) {

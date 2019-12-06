@@ -1,0 +1,206 @@
+diff --git a/doc/release/1.17.0-notes.rst b/doc/release/1.17.0-notes.rst
+index 71ad17673d3..e05709fea6b 100644
+--- a/doc/release/1.17.0-notes.rst
++++ b/doc/release/1.17.0-notes.rst
+@@ -33,6 +33,16 @@ The internal use of these functions has been refactored and there are better
+ alternatives. Relace ``exec_command`` with `subprocess.Popen` and
+ ``temp_file_name`` with `tempfile.mkstemp`.
+ 
++Writeable flag of C-API wrapped arrays
++--------------------------------------
++When an array is created from the C-API to wrap a pointer to data, the only
++indication we have of the read-write nature of the data is the ``writeable``
++flag set during creation. It is dangerous to force the flag to writeable.
++In the future it will not be possible to switch the writeable flag to ``True``
++from python.
++This deprecation should not affect many users since arrays created in such
++a manner are very rare in practice and only available through the NumPy C-API.
++
+ 
+ Future Changes
+ ==============
+diff --git a/numpy/core/src/multiarray/_multiarray_tests.c.src b/numpy/core/src/multiarray/_multiarray_tests.c.src
+index c26bd16ac99..9061c05184f 100644
+--- a/numpy/core/src/multiarray/_multiarray_tests.c.src
++++ b/numpy/core/src/multiarray/_multiarray_tests.c.src
+@@ -847,6 +847,29 @@ get_buffer_info(PyObject *NPY_UNUSED(self), PyObject *args)
+ 
+ #undef GET_PYBUF_FLAG
+ 
++/*
++ * Return a new array object wrapping existing C-allocated (dummy) data.
++ * Such an array does not own its data (must not free it), but because it
++ * wraps C data, it also has no base object. Used to test arr.flags.writeable
++ * setting behaviour.
++ */
++static PyObject*
++get_c_wrapping_array(PyObject* NPY_UNUSED(self), PyObject* arg)
++{
++    int writeable, flags;
++    npy_intp zero = 0;
++
++    writeable = PyObject_IsTrue(arg);
++    if (error_converting(writeable)) {
++        return NULL;
++    }
++
++    flags = writeable ? NPY_ARRAY_WRITEABLE : 0;
++    /* Create an empty array (which points to a random place) */
++    return PyArray_NewFromDescr(&PyArray_Type, PyArray_DescrFromType(NPY_INTP),
++                                1, &zero, NULL, &zero, flags, NULL);
++}
++
+ 
+ /*
+  * Test C-api level item getting.
+@@ -1932,6 +1955,9 @@ static PyMethodDef Multiarray_TestsMethods[] = {
+     {"get_buffer_info",
+         get_buffer_info,
+         METH_VARARGS, NULL},
++    {"get_c_wrapping_array",
++        get_c_wrapping_array,
++        METH_O, NULL},
+     {"array_indexing",
+         array_indexing,
+         METH_VARARGS, NULL},
+diff --git a/numpy/core/src/multiarray/common.c b/numpy/core/src/multiarray/common.c
+index 52694d49122..8e167a37e1d 100644
+--- a/numpy/core/src/multiarray/common.c
++++ b/numpy/core/src/multiarray/common.c
+@@ -598,7 +598,7 @@ _zerofill(PyArrayObject *ret)
+ NPY_NO_EXPORT npy_bool
+ _IsWriteable(PyArrayObject *ap)
+ {
+-    PyObject *base=PyArray_BASE(ap);
++    PyObject *base = PyArray_BASE(ap);
+ #if defined(NPY_PY3K)
+     Py_buffer view;
+ #else
+@@ -606,23 +606,38 @@ _IsWriteable(PyArrayObject *ap)
+     Py_ssize_t n;
+ #endif
+ 
+-    /* If we own our own data, then no-problem */
+-    if ((base == NULL) || (PyArray_FLAGS(ap) & NPY_ARRAY_OWNDATA)) {
++    /*
++     * C-data wrapping arrays may not own their data while not having a base;
++     * WRITEBACKIFCOPY arrays have a base, but do own their data.
++     */
++    if (base == NULL || PyArray_CHKFLAGS(ap, NPY_ARRAY_OWNDATA)) {
++        /*
++         * This is somewhat unsafe for directly wrapped non-writable C-arrays,
++         * which do not know whether the memory area is writable or not and
++         * do not own their data (but have no base).
++         * It would be better if this returned PyArray_ISWRITEABLE(ap).
++         * Since it is hard to deprecate, this is deprecated only on the Python
++         * side, but not on in PyArray_UpdateFlags.
++         */
+         return NPY_TRUE;
+     }
++
+     /*
+-     * Get to the final base object
+-     * If it is a writeable array, then return TRUE
+-     * If we can find an array object
+-     * or a writeable buffer object as the final base object
++     * Get to the final base object.
++     * If it is a writeable array, then return True if we can
++     * find an array object or a writeable buffer object as
++     * the final base object.
+      */
++    while (PyArray_Check(base)) {
++        ap = (PyArrayObject *)base;
++        base = PyArray_BASE(ap);
+ 
+-    while(PyArray_Check(base)) {
+-        if (PyArray_CHKFLAGS((PyArrayObject *)base, NPY_ARRAY_OWNDATA)) {
+-            return (npy_bool) (PyArray_ISWRITEABLE((PyArrayObject *)base));
++        if (base == NULL || PyArray_CHKFLAGS(ap, NPY_ARRAY_OWNDATA)) {
++            return (npy_bool) PyArray_ISWRITEABLE(ap);
+         }
+-        base = PyArray_BASE((PyArrayObject *)base);
++        assert(!PyArray_CHKFLAGS(ap, NPY_ARRAY_OWNDATA));
+     }
++
+ #if defined(NPY_PY3K)
+     if (PyObject_GetBuffer(base, &view, PyBUF_WRITABLE|PyBUF_SIMPLE) < 0) {
+         PyErr_Clear();
+diff --git a/numpy/core/src/multiarray/methods.c b/numpy/core/src/multiarray/methods.c
+index 0ddec299533..6f56c1c6a7b 100644
+--- a/numpy/core/src/multiarray/methods.c
++++ b/numpy/core/src/multiarray/methods.c
+@@ -2546,6 +2546,22 @@ array_setflags(PyArrayObject *self, PyObject *args, PyObject *kwds)
+     if (write_flag != Py_None) {
+         if (PyObject_IsTrue(write_flag)) {
+             if (_IsWriteable(self)) {
++                /*
++                 * _IsWritable (and PyArray_UpdateFlags) allows flipping this,
++                 * although the C-Api user who created the array may have
++                 * chosen to make it non-writable for a good reason, so
++                 * deprecate.
++                 */
++                if ((PyArray_BASE(self) == NULL) &&
++                            !PyArray_CHKFLAGS(self, NPY_ARRAY_OWNDATA) &&
++                            !PyArray_CHKFLAGS(self, NPY_ARRAY_WRITEABLE)) {
++                    /* 2017-05-03, NumPy 1.17.0 */
++                    if (DEPRECATE("making a non-writeable array writeable "
++                                  "is deprecated for arrays without a base "
++                                  "which do not own their data.") < 0) {
++                        return NULL;
++                    }
++                }
+                 PyArray_ENABLEFLAGS(self, NPY_ARRAY_WRITEABLE);
+             }
+             else {
+diff --git a/numpy/core/tests/test_multiarray.py b/numpy/core/tests/test_multiarray.py
+index b29daa675fb..7180af6852d 100644
+--- a/numpy/core/tests/test_multiarray.py
++++ b/numpy/core/tests/test_multiarray.py
+@@ -143,6 +143,47 @@ def test_writeable_pickle(self):
+             assert_(vals.flags.writeable)
+             assert_(isinstance(vals.base, bytes))
+ 
++    def test_writeable_from_c_data(self):
++        # Test that the writeable flag can be changed for an array wrapping
++        # low level C-data, but not owning its data.
++        # Also see that this is deprecated to change from python.
++        from numpy.core._multiarray_tests import get_c_wrapping_array
++
++        arr_writeable = get_c_wrapping_array(True)
++        assert not arr_writeable.flags.owndata
++        assert arr_writeable.flags.writeable
++        view = arr_writeable[...]
++
++        # Toggling the writeable flag works on the view:
++        view.flags.writeable = False
++        assert not view.flags.writeable
++        view.flags.writeable = True
++        assert view.flags.writeable
++        # Flag can be unset on the arr_writeable:
++        arr_writeable.flags.writeable = False
++
++        arr_readonly = get_c_wrapping_array(False)
++        assert not arr_readonly.flags.owndata
++        assert not arr_readonly.flags.writeable
++
++        for arr in [arr_writeable, arr_readonly]:
++            view = arr[...]
++            view.flags.writeable = False  # make sure it is readonly
++            arr.flags.writeable = False
++            assert not arr.flags.writeable
++
++            with assert_raises(ValueError):
++                view.flags.writeable = True
++
++            with warnings.catch_warnings():
++                warnings.simplefilter("error", DeprecationWarning)
++                with assert_raises(DeprecationWarning):
++                    arr.flags.writeable = True
++
++            with assert_warns(DeprecationWarning):
++                arr.flags.writeable = True
++
++
+     def test_otherflags(self):
+         assert_equal(self.a.flags.carray, True)
+         assert_equal(self.a.flags['C'], True)

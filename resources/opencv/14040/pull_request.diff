@@ -1,0 +1,154 @@
+diff --git a/cmake/OpenCVCompilerOptions.cmake b/cmake/OpenCVCompilerOptions.cmake
+index 872d601108e..4b9eb90837f 100644
+--- a/cmake/OpenCVCompilerOptions.cmake
++++ b/cmake/OpenCVCompilerOptions.cmake
+@@ -279,6 +279,15 @@ if((CV_GCC OR CV_CLANG)
+   add_extra_compiler_option(-fvisibility-inlines-hidden)
+ endif()
+ 
++# workaround gcc bug for aligned ld/st
++# https://github.com/opencv/opencv/issues/13211
++if((PPC64LE AND NOT CMAKE_CROSSCOMPILING) OR OPENCV_FORCE_COMPILER_CHECK_VSX_ALIGNED)
++  ocv_check_runtime_flag("${CPU_BASELINE_FLAGS}" "OPENCV_CHECK_VSX_ALIGNED" "${OpenCV_SOURCE_DIR}/cmake/checks/runtime/cpu_vsx_aligned.cpp")
++  if(NOT OPENCV_CHECK_VSX_ALIGNED)
++    add_extra_compiler_option_force(-DCV_COMPILER_VSX_BROKEN_ALIGNED)
++  endif()
++endif()
++
+ # combine all "extra" options
+ if(NOT OPENCV_SKIP_EXTRA_COMPILER_FLAGS)
+   set(CMAKE_C_FLAGS           "${CMAKE_C_FLAGS} ${OPENCV_EXTRA_FLAGS} ${OPENCV_EXTRA_C_FLAGS}")
+diff --git a/cmake/OpenCVUtils.cmake b/cmake/OpenCVUtils.cmake
+index 17e691b8389..da6a3b9664c 100644
+--- a/cmake/OpenCVUtils.cmake
++++ b/cmake/OpenCVUtils.cmake
+@@ -480,6 +480,44 @@ macro(ocv_check_flag_support lang flag varname base_options)
+   ocv_check_compiler_flag("${_lang}" "${base_options} ${flag}" ${${varname}} ${ARGN})
+ endmacro()
+ 
++macro(ocv_check_runtime_flag flag result)
++  set(_fname "${ARGN}")
++  if(NOT DEFINED ${result})
++    file(RELATIVE_PATH _rname "${CMAKE_SOURCE_DIR}" "${_fname}")
++    message(STATUS "Performing Runtime Test ${result} (check file: ${_rname})")
++    try_run(exec_return compile_result
++      "${CMAKE_BINARY_DIR}"
++      "${_fname}"
++      CMAKE_FLAGS "-DCMAKE_EXE_LINKER_FLAGS=${CMAKE_EXE_LINKER_FLAGS}" # CMP0056 do this on new CMake
++      COMPILE_DEFINITIONS "${flag}"
++      OUTPUT_VARIABLE OUTPUT)
++
++    if(${compile_result})
++      if(exec_return EQUAL 0)
++        set(${result} 1 CACHE INTERNAL "Runtime Test ${result}")
++        message(STATUS "Performing Runtime Test ${result} - Success")
++      else()
++        message(STATUS "Performing Runtime Test ${result} - Failed(${exec_return})")
++        set(${result} 0 CACHE INTERNAL "Runtime Test ${result}")
++      endif()
++    else()
++      set(${result} 0 CACHE INTERNAL "Runtime Test ${result}")
++      message(STATUS "Performing Runtime Test ${result} - Compiling Failed")
++    endif()
++
++    if(NOT ${result})
++      file(APPEND ${CMAKE_BINARY_DIR}${CMAKE_FILES_DIRECTORY}/CMakeError.log
++        "Runtime Test failed:\n"
++        "    source file: '${_fname}'\n"
++        "    check option: '${flag}'\n"
++        "    exec return: ${exec_return}\n"
++        "===== BUILD AND RUNTIME LOG =====\n"
++        "${OUTPUT}\n"
++        "===== END =====\n\n")
++    endif()
++  endif()
++endmacro()
++
+ # turns off warnings
+ macro(ocv_warnings_disable)
+   if(NOT ENABLE_NOISY_WARNINGS)
+diff --git a/cmake/checks/runtime/cpu_vsx_aligned.cpp b/cmake/checks/runtime/cpu_vsx_aligned.cpp
+new file mode 100644
+index 00000000000..a8daa631892
+--- /dev/null
++++ b/cmake/checks/runtime/cpu_vsx_aligned.cpp
+@@ -0,0 +1,55 @@
++// check sanity of vsx aligned ld/st
++// https://github.com/opencv/opencv/issues/13211
++
++#include <altivec.h>
++
++#define vsx_ld vec_vsx_ld
++#define vsx_st vec_vsx_st
++
++template<typename T>
++static void fill(T& d, int from = 0, int to = 16)
++{
++   for (int i = from; i < to; i++)
++        d[i] = i;
++}
++
++template<typename T, typename Tvec>
++static bool check_data(T& d, Tvec& v, int from = 0, int to = 16)
++{
++    for (int i = from; i < to; i++)
++    {
++        if (d[i] != vec_extract(v, i))
++            return false;
++    }
++    return true;
++}
++
++int main()
++{
++    unsigned char __attribute__ ((aligned (16))) rbuf[16];
++    unsigned char __attribute__ ((aligned (16))) wbuf[16];
++    __vector unsigned char a;
++
++    // 1- check aligned load and store
++    fill(rbuf);
++    a = vec_ld(0, rbuf);
++    if (!check_data(rbuf, a))
++        return 1;
++    vec_st(a, 0, wbuf);
++    if (!check_data(wbuf, a))
++        return 11;
++
++    // 2- check mixing aligned load and unaligned store
++    a = vec_ld(0, rbuf);
++    vsx_st(a, 0, wbuf);
++    if (!check_data(wbuf, a))
++        return 2;
++
++    // 3- check mixing unaligned load and aligned store
++    a = vsx_ld(0, rbuf);
++    vec_st(a, 0, wbuf);
++    if (!check_data(wbuf, a))
++        return 3;
++
++    return 0;
++}
+\ No newline at end of file
+diff --git a/modules/core/include/opencv2/core/hal/intrin_vsx.hpp b/modules/core/include/opencv2/core/hal/intrin_vsx.hpp
+index 4e0c75ff935..aa7f6f3d2d1 100644
+--- a/modules/core/include/opencv2/core/hal/intrin_vsx.hpp
++++ b/modules/core/include/opencv2/core/hal/intrin_vsx.hpp
+@@ -258,8 +258,16 @@ inline void v_store_low(_Tp* ptr, const _Tpvec& a)                          \
+ inline void v_store_high(_Tp* ptr, const _Tpvec& a)                         \
+ { vec_st_h8(a.val, ptr); }
+ 
+-#define OPENCV_HAL_IMPL_VSX_LOADSTORE(_Tpvec, _Tp) \
+-OPENCV_HAL_IMPL_VSX_LOADSTORE_C(_Tpvec, _Tp, vsx_ld, vec_ld, vsx_st, vec_st)
++// working around gcc bug for aligned ld/st
++// if runtime check for vec_ld/st fail we failback to unaligned ld/st
++// https://github.com/opencv/opencv/issues/13211
++#ifdef CV_COMPILER_VSX_BROKEN_ALIGNED
++    #define OPENCV_HAL_IMPL_VSX_LOADSTORE(_Tpvec, _Tp) \
++    OPENCV_HAL_IMPL_VSX_LOADSTORE_C(_Tpvec, _Tp, vsx_ld, vsx_ld, vsx_st, vsx_st)
++#else
++    #define OPENCV_HAL_IMPL_VSX_LOADSTORE(_Tpvec, _Tp) \
++    OPENCV_HAL_IMPL_VSX_LOADSTORE_C(_Tpvec, _Tp, vsx_ld, vec_ld, vsx_st, vec_st)
++#endif
+ 
+ OPENCV_HAL_IMPL_VSX_LOADSTORE(v_uint8x16,  uchar)
+ OPENCV_HAL_IMPL_VSX_LOADSTORE(v_int8x16,   schar)

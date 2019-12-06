@@ -1,0 +1,130 @@
+diff --git a/core/src/main/java/org/elasticsearch/cluster/service/ClusterService.java b/core/src/main/java/org/elasticsearch/cluster/service/ClusterService.java
+index ce5c0f3e2589..6d69d57ad1f7 100644
+--- a/core/src/main/java/org/elasticsearch/cluster/service/ClusterService.java
++++ b/core/src/main/java/org/elasticsearch/cluster/service/ClusterService.java
+@@ -70,6 +70,7 @@
+ import java.util.HashMap;
+ import java.util.IdentityHashMap;
+ import java.util.Iterator;
++import java.util.LinkedHashSet;
+ import java.util.List;
+ import java.util.Locale;
+ import java.util.Map;
+@@ -114,7 +115,7 @@
+     private final Collection<ClusterStateListener> priorityClusterStateListeners = new CopyOnWriteArrayList<>();
+     private final Collection<ClusterStateListener> clusterStateListeners = new CopyOnWriteArrayList<>();
+     private final Collection<ClusterStateListener> lastClusterStateListeners = new CopyOnWriteArrayList<>();
+-    private final Map<ClusterStateTaskExecutor, List<UpdateTask>> updateTasksPerExecutor = new HashMap<>();
++    final Map<ClusterStateTaskExecutor, LinkedHashSet<UpdateTask>> updateTasksPerExecutor = new HashMap<>();
+     // TODO this is rather frequently changing I guess a Synced Set would be better here and a dedicated remove API
+     private final Collection<ClusterStateListener> postAppliedListeners = new CopyOnWriteArrayList<>();
+     private final Iterable<ClusterStateListener> preAppliedListeners = Iterables.concat(priorityClusterStateListeners,
+@@ -454,7 +455,8 @@ public void submitStateUpdateTask(final String source, final ClusterStateUpdateT
+             ).collect(Collectors.toList());
+ 
+             synchronized (updateTasksPerExecutor) {
+-                List<UpdateTask> existingTasks = updateTasksPerExecutor.computeIfAbsent(executor, k -> new ArrayList<>());
++                LinkedHashSet<UpdateTask> existingTasks = updateTasksPerExecutor.computeIfAbsent(executor,
++                    k -> new LinkedHashSet<>(updateTasks.size()));
+                 for (@SuppressWarnings("unchecked") UpdateTask<T> existing : existingTasks) {
+                     if (tasksIdentity.containsKey(existing.task)) {
+                         throw new IllegalStateException("task [" + executor.describeTasks(Collections.singletonList(existing.task)) +
+@@ -466,12 +468,29 @@ public void submitStateUpdateTask(final String source, final ClusterStateUpdateT
+ 
+             final UpdateTask<T> firstTask = updateTasks.get(0);
+ 
+-            if (config.timeout() != null) {
+-                updateTasksExecutor.execute(firstTask, threadPool.scheduler(), config.timeout(), () -> threadPool.generic().execute(() -> {
++            final TimeValue timeout = config.timeout();
++            if (timeout != null) {
++                updateTasksExecutor.execute(firstTask, threadPool.scheduler(), timeout, () -> threadPool.generic().execute(() -> {
++                    final ArrayList<UpdateTask<T>> toRemove = new ArrayList<>();
+                     for (UpdateTask<T> task : updateTasks) {
+                         if (task.processed.getAndSet(true) == false) {
+-                            logger.debug("cluster state update task [{}] timed out after [{}]", source, config.timeout());
+-                            task.listener.onFailure(source, new ProcessClusterEventTimeoutException(config.timeout(), source));
++                            logger.debug("cluster state update task [{}] timed out after [{}]", source, timeout);
++                            toRemove.add(task);
++                        }
++                    }
++                    if (toRemove.isEmpty() == false) {
++                        ClusterStateTaskExecutor<T> clusterStateTaskExecutor = toRemove.get(0).executor;
++                        synchronized (updateTasksPerExecutor) {
++                            LinkedHashSet<UpdateTask> existingTasks = updateTasksPerExecutor.get(clusterStateTaskExecutor);
++                            if (existingTasks != null) {
++                                existingTasks.removeAll(toRemove);
++                                if (existingTasks.isEmpty()) {
++                                    updateTasksPerExecutor.remove(clusterStateTaskExecutor);
++                                }
++                            }
++                        }
++                        for (UpdateTask<T> task : toRemove) {
++                            task.listener.onFailure(source, new ProcessClusterEventTimeoutException(timeout, source));
+                         }
+                     }
+                 }));
+@@ -567,7 +586,7 @@ public String source() {
+         final ArrayList<UpdateTask<T>> toExecute = new ArrayList<>();
+         final Map<String, ArrayList<T>> processTasksBySource = new HashMap<>();
+         synchronized (updateTasksPerExecutor) {
+-            List<UpdateTask> pending = updateTasksPerExecutor.remove(executor);
++            LinkedHashSet<UpdateTask> pending = updateTasksPerExecutor.remove(executor);
+             if (pending != null) {
+                 for (UpdateTask<T> task : pending) {
+                     if (task.processed.getAndSet(true) == false) {
+diff --git a/core/src/test/java/org/elasticsearch/cluster/service/ClusterServiceTests.java b/core/src/test/java/org/elasticsearch/cluster/service/ClusterServiceTests.java
+index bede01ed21b5..026d3a161852 100644
+--- a/core/src/test/java/org/elasticsearch/cluster/service/ClusterServiceTests.java
++++ b/core/src/test/java/org/elasticsearch/cluster/service/ClusterServiceTests.java
+@@ -148,6 +148,51 @@ public void disconnectFromNodes(List<DiscoveryNode> removedNodes) {
+         return timedClusterService;
+     }
+ 
++    public void testTimedOutUpdateTaskCleanedUp() throws Exception {
++        final CountDownLatch block = new CountDownLatch(1);
++        clusterService.submitStateUpdateTask("block-task", new ClusterStateUpdateTask() {
++            @Override
++            public ClusterState execute(ClusterState currentState) {
++                try {
++                    block.await();
++                } catch (InterruptedException e) {
++                    throw new RuntimeException(e);
++                }
++                return currentState;
++            }
++
++            @Override
++            public void onFailure(String source, Exception e) {
++                throw new RuntimeException(e);
++            }
++        });
++
++        final CountDownLatch block2 = new CountDownLatch(1);
++        clusterService.submitStateUpdateTask("test", new ClusterStateUpdateTask() {
++            @Override
++            public ClusterState execute(ClusterState currentState) {
++                block2.countDown();
++                return currentState;
++            }
++
++            @Override
++            public TimeValue timeout() {
++                return TimeValue.ZERO;
++            }
++
++            @Override
++            public void onFailure(String source, Exception e) {
++                block2.countDown();
++            }
++        });
++        block.countDown();
++        block2.await();
++        synchronized (clusterService.updateTasksPerExecutor) {
++            assertTrue("expected empty map but was " + clusterService.updateTasksPerExecutor,
++                clusterService.updateTasksPerExecutor.isEmpty());
++        }
++    }
++
+     public void testTimeoutUpdateTask() throws Exception {
+         final CountDownLatch block = new CountDownLatch(1);
+         clusterService.submitStateUpdateTask("test1", new ClusterStateUpdateTask() {

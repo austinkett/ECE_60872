@@ -1,0 +1,824 @@
+diff --git a/core/src/main/java/org/elasticsearch/http/HttpServerTransport.java b/core/src/main/java/org/elasticsearch/http/HttpServerTransport.java
+index 134557a28adc..b5a720e0160b 100644
+--- a/core/src/main/java/org/elasticsearch/http/HttpServerTransport.java
++++ b/core/src/main/java/org/elasticsearch/http/HttpServerTransport.java
+@@ -35,15 +35,32 @@
+ 
+     HttpStats stats();
+ 
+-    @FunctionalInterface
++    /**
++     * Dispatches HTTP requests.
++     */
+     interface Dispatcher {
++
+         /**
+          * Dispatches the {@link RestRequest} to the relevant request handler or responds to the given rest channel directly if
+          * the request can't be handled by any request handler.
+-         * @param request the request to dispatch
+-         * @param channel the response channel of this request
+-         * @param threadContext the nodes thread context
++         *
++         * @param request       the request to dispatch
++         * @param channel       the response channel of this request
++         * @param threadContext the thread context
++         */
++        void dispatchRequest(RestRequest request, RestChannel channel, ThreadContext threadContext);
++
++        /**
++         * Dispatches a bad request. For example, if a request is malformed it will be dispatched via this method with the cause of the bad
++         * request.
++         *
++         * @param request       the request to dispatch
++         * @param channel       the response channel of this request
++         * @param threadContext the thread context
++         * @param cause         the cause of the bad request
+          */
+-        void dispatch(RestRequest request, RestChannel channel, ThreadContext threadContext);
++        void dispatchBadRequest(RestRequest request, RestChannel channel, ThreadContext threadContext, Throwable cause);
++
+     }
++
+ }
+diff --git a/core/src/main/java/org/elasticsearch/node/Node.java b/core/src/main/java/org/elasticsearch/node/Node.java
+index 382423d9a2e9..00e00b745a09 100644
+--- a/core/src/main/java/org/elasticsearch/node/Node.java
++++ b/core/src/main/java/org/elasticsearch/node/Node.java
+@@ -401,8 +401,7 @@ protected Node(final Environment environment, Collection<Class<? extends Plugin>
+                 .collect(Collectors.toList());
+             final RestController restController = actionModule.getRestController();
+             final NetworkModule networkModule = new NetworkModule(settings, false, pluginsService.filterPlugins(NetworkPlugin.class),
+-                    threadPool, bigArrays, circuitBreakerService, namedWriteableRegistry, xContentRegistry, networkService,
+-                    restController::dispatchRequest);
++                    threadPool, bigArrays, circuitBreakerService, namedWriteableRegistry, xContentRegistry, networkService, restController);
+             final MetaDataUpgrader metaDataUpgrader = new MetaDataUpgrader(customMetaDataUpgraders);
+             final Transport transport = networkModule.getTransportSupplier().get();
+             final TransportService transportService = newTransportService(settings, transport, threadPool,
+diff --git a/core/src/main/java/org/elasticsearch/rest/RestController.java b/core/src/main/java/org/elasticsearch/rest/RestController.java
+index cddd261da854..5f033eb4aff1 100644
+--- a/core/src/main/java/org/elasticsearch/rest/RestController.java
++++ b/core/src/main/java/org/elasticsearch/rest/RestController.java
+@@ -19,18 +19,8 @@
+ 
+ package org.elasticsearch.rest;
+ 
+-import java.io.ByteArrayOutputStream;
+-import java.io.IOException;
+-import java.io.InputStream;
+-import java.util.List;
+-import java.util.Locale;
+-import java.util.Objects;
+-import java.util.Set;
+-import java.util.concurrent.atomic.AtomicBoolean;
+-import java.util.function.Supplier;
+-import java.util.function.UnaryOperator;
+-
+ import org.apache.logging.log4j.message.ParameterizedMessage;
++import org.elasticsearch.ElasticsearchException;
+ import org.elasticsearch.client.node.NodeClient;
+ import org.elasticsearch.common.Nullable;
+ import org.elasticsearch.common.Strings;
+@@ -45,9 +35,21 @@
+ import org.elasticsearch.common.util.concurrent.ThreadContext;
+ import org.elasticsearch.common.xcontent.XContentBuilder;
+ import org.elasticsearch.common.xcontent.XContentFactory;
++import org.elasticsearch.common.xcontent.XContentType;
++import org.elasticsearch.http.HttpServerTransport;
+ import org.elasticsearch.http.HttpTransportSettings;
+ import org.elasticsearch.indices.breaker.CircuitBreakerService;
+-import org.elasticsearch.common.xcontent.XContentType;
++
++import java.io.ByteArrayOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.util.List;
++import java.util.Locale;
++import java.util.Objects;
++import java.util.Set;
++import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.function.Supplier;
++import java.util.function.UnaryOperator;
+ 
+ import static org.elasticsearch.rest.RestStatus.BAD_REQUEST;
+ import static org.elasticsearch.rest.RestStatus.FORBIDDEN;
+@@ -55,7 +57,8 @@
+ import static org.elasticsearch.rest.RestStatus.NOT_ACCEPTABLE;
+ import static org.elasticsearch.rest.RestStatus.OK;
+ 
+-public class RestController extends AbstractComponent {
++public class RestController extends AbstractComponent implements HttpServerTransport.Dispatcher {
++
+     private final PathTrie<RestHandler> getHandlers = new PathTrie<>(RestUtils.REST_DECODER);
+     private final PathTrie<RestHandler> postHandlers = new PathTrie<>(RestUtils.REST_DECODER);
+     private final PathTrie<RestHandler> putHandlers = new PathTrie<>(RestUtils.REST_DECODER);
+@@ -167,6 +170,7 @@ public boolean canTripCircuitBreaker(RestRequest request) {
+         return (handler != null) ? handler.canTripCircuitBreaker() : true;
+     }
+ 
++    @Override
+     public void dispatchRequest(RestRequest request, RestChannel channel, ThreadContext threadContext) {
+         if (request.rawPath().equals("/favicon.ico")) {
+             handleFavicon(request, channel);
+@@ -205,6 +209,31 @@ public void dispatchRequest(RestRequest request, RestChannel channel, ThreadCont
+         }
+     }
+ 
++    @Override
++    public void dispatchBadRequest(
++            final RestRequest request,
++            final RestChannel channel,
++            final ThreadContext threadContext,
++            final Throwable cause) {
++        try {
++            final Exception e;
++            if (cause == null) {
++                e = new ElasticsearchException("unknown cause");
++            } else if (cause instanceof Exception) {
++                e = (Exception) cause;
++            } else {
++                e = new ElasticsearchException(cause);
++            }
++            channel.sendResponse(new BytesRestResponse(channel, BAD_REQUEST, e));
++        } catch (final IOException e) {
++            if (cause != null) {
++                e.addSuppressed(cause);
++            }
++            logger.warn("failed to send bad request response", e);
++            channel.sendResponse(new BytesRestResponse(INTERNAL_SERVER_ERROR, BytesRestResponse.TEXT_CONTENT_TYPE, BytesArray.EMPTY));
++        }
++    }
++
+     void dispatchRequest(final RestRequest request, final RestChannel channel, final NodeClient client, ThreadContext threadContext,
+                          final RestHandler handler) throws Exception {
+         if (checkRequestParameters(request, channel) == false) {
+@@ -419,4 +448,5 @@ private static CircuitBreaker inFlightRequestsBreaker(CircuitBreakerService circ
+         // We always obtain a fresh breaker to reflect changes to the breaker configuration.
+         return circuitBreakerService.getBreaker(CircuitBreaker.IN_FLIGHT_REQUESTS);
+     }
++
+ }
+diff --git a/core/src/main/java/org/elasticsearch/rest/RestRequest.java b/core/src/main/java/org/elasticsearch/rest/RestRequest.java
+index 826f57e41b3d..9aea6d213f79 100644
+--- a/core/src/main/java/org/elasticsearch/rest/RestRequest.java
++++ b/core/src/main/java/org/elasticsearch/rest/RestRequest.java
+@@ -491,4 +491,5 @@ private static XContentType parseContentType(List<String> header) {
+         }
+         throw new IllegalArgumentException("empty Content-Type header");
+     }
++
+ }
+diff --git a/core/src/test/java/org/elasticsearch/common/network/NetworkModuleTests.java b/core/src/test/java/org/elasticsearch/common/network/NetworkModuleTests.java
+index 7c73520173f4..e393fee4f23e 100644
+--- a/core/src/test/java/org/elasticsearch/common/network/NetworkModuleTests.java
++++ b/core/src/test/java/org/elasticsearch/common/network/NetworkModuleTests.java
+@@ -32,6 +32,7 @@
+ import org.elasticsearch.http.HttpInfo;
+ import org.elasticsearch.http.HttpServerTransport;
+ import org.elasticsearch.http.HttpStats;
++import org.elasticsearch.http.NullDispatcher;
+ import org.elasticsearch.indices.breaker.CircuitBreakerService;
+ import org.elasticsearch.plugins.NetworkPlugin;
+ import org.elasticsearch.rest.BaseRestHandler;
+@@ -298,6 +299,6 @@ public void testRegisterInterceptor() {
+ 
+     private NetworkModule newNetworkModule(Settings settings, boolean transportClient, NetworkPlugin... plugins) {
+         return new NetworkModule(settings, transportClient, Arrays.asList(plugins), threadPool, null, null, null, xContentRegistry(), null,
+-            (a, b, c) -> {});
++            new NullDispatcher());
+     }
+ }
+diff --git a/core/src/test/java/org/elasticsearch/rest/RestControllerTests.java b/core/src/test/java/org/elasticsearch/rest/RestControllerTests.java
+index 0ee6dd27d412..9865ccf2c136 100644
+--- a/core/src/test/java/org/elasticsearch/rest/RestControllerTests.java
++++ b/core/src/test/java/org/elasticsearch/rest/RestControllerTests.java
+@@ -19,17 +19,6 @@
+ 
+ package org.elasticsearch.rest;
+ 
+-import java.io.IOException;
+-import java.util.Arrays;
+-import java.util.Collections;
+-import java.util.HashMap;
+-import java.util.HashSet;
+-import java.util.List;
+-import java.util.Map;
+-import java.util.Set;
+-import java.util.concurrent.atomic.AtomicBoolean;
+-import java.util.function.UnaryOperator;
+-
+ import org.elasticsearch.client.node.NodeClient;
+ import org.elasticsearch.common.breaker.CircuitBreaker;
+ import org.elasticsearch.common.bytes.BytesArray;
+@@ -54,6 +43,19 @@
+ import org.elasticsearch.test.rest.FakeRestRequest;
+ import org.junit.Before;
+ 
++import java.io.IOException;
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.concurrent.atomic.AtomicReference;
++import java.util.function.UnaryOperator;
++
++import static org.hamcrest.Matchers.containsString;
+ import static org.mockito.Matchers.any;
+ import static org.mockito.Matchers.eq;
+ import static org.mockito.Mockito.doCallRealMethod;
+@@ -261,18 +263,18 @@ public void testDispatchRequiresContentTypeForRequestsWithContent() {
+             (r, c, client) -> c.sendResponse(
+                 new BytesRestResponse(RestStatus.OK, BytesRestResponse.TEXT_CONTENT_TYPE, BytesArray.EMPTY)));
+ 
+-        assertFalse(channel.sendResponseCalled.get());
++        assertFalse(channel.getSendResponseCalled());
+         restController.dispatchRequest(request, channel, new ThreadContext(Settings.EMPTY));
+-        assertTrue(channel.sendResponseCalled.get());
++        assertTrue(channel.getSendResponseCalled());
+     }
+ 
+     public void testDispatchDoesNotRequireContentTypeForRequestsWithoutContent() {
+         FakeRestRequest fakeRestRequest = new FakeRestRequest.Builder(NamedXContentRegistry.EMPTY).build();
+         AssertingChannel channel = new AssertingChannel(fakeRestRequest, true, RestStatus.OK);
+ 
+-        assertFalse(channel.sendResponseCalled.get());
++        assertFalse(channel.getSendResponseCalled());
+         restController.dispatchRequest(fakeRestRequest, channel, new ThreadContext(Settings.EMPTY));
+-        assertTrue(channel.sendResponseCalled.get());
++        assertTrue(channel.getSendResponseCalled());
+     }
+ 
+     public void testDispatchWorksWithPlainText() {
+@@ -293,9 +295,9 @@ public boolean supportsPlainText() {
+             }
+         });
+ 
+-        assertFalse(channel.sendResponseCalled.get());
++        assertFalse(channel.getSendResponseCalled());
+         restController.dispatchRequest(fakeRestRequest, channel, new ThreadContext(Settings.EMPTY));
+-        assertTrue(channel.sendResponseCalled.get());
++        assertTrue(channel.getSendResponseCalled());
+         assertWarnings("Plain text request bodies are deprecated. Use request parameters or body in a supported format.");
+     }
+ 
+@@ -305,9 +307,9 @@ public void testDispatchWorksWithAutoDetection() {
+             .withHeaders(Collections.singletonMap("Content-Type", Collections.singletonList("application/x-www-form-urlencoded"))).build();
+         AssertingChannel channel = new AssertingChannel(fakeRestRequest, true, RestStatus.OK);
+ 
+-        assertFalse(channel.sendResponseCalled.get());
++        assertFalse(channel.getSendResponseCalled());
+         restController.dispatchRequest(fakeRestRequest, channel, new ThreadContext(Settings.EMPTY));
+-        assertTrue(channel.sendResponseCalled.get());
++        assertTrue(channel.getSendResponseCalled());
+         assertWarnings("Content type detection for rest requests is deprecated. Specify the content type using the [Content-Type] header.");
+     }
+ 
+@@ -330,9 +332,9 @@ public boolean supportsContentStream() {
+             }
+         });
+ 
+-        assertFalse(channel.sendResponseCalled.get());
++        assertFalse(channel.getSendResponseCalled());
+         restController.dispatchRequest(fakeRestRequest, channel, new ThreadContext(Settings.EMPTY));
+-        assertTrue(channel.sendResponseCalled.get());
++        assertTrue(channel.getSendResponseCalled());
+     }
+ 
+     public void testDispatchWithContentStream() {
+@@ -354,9 +356,9 @@ public boolean supportsContentStream() {
+             }
+         });
+ 
+-        assertFalse(channel.sendResponseCalled.get());
++        assertFalse(channel.getSendResponseCalled());
+         restController.dispatchRequest(fakeRestRequest, channel, new ThreadContext(Settings.EMPTY));
+-        assertTrue(channel.sendResponseCalled.get());
++        assertTrue(channel.getSendResponseCalled());
+     }
+ 
+     public void testDispatchWithContentStreamAutoDetect() {
+@@ -375,9 +377,9 @@ public boolean supportsContentStream() {
+             }
+         });
+ 
+-        assertFalse(channel.sendResponseCalled.get());
++        assertFalse(channel.getSendResponseCalled());
+         restController.dispatchRequest(fakeRestRequest, channel, new ThreadContext(Settings.EMPTY));
+-        assertTrue(channel.sendResponseCalled.get());
++        assertTrue(channel.getSendResponseCalled());
+         assertWarnings("Content type detection for rest requests is deprecated. Specify the content type using the [Content-Type] header.");
+     }
+ 
+@@ -398,9 +400,9 @@ public boolean supportsContentStream() {
+             }
+         });
+ 
+-        assertFalse(channel.sendResponseCalled.get());
++        assertFalse(channel.getSendResponseCalled());
+         restController.dispatchRequest(fakeRestRequest, channel, new ThreadContext(Settings.EMPTY));
+-        assertTrue(channel.sendResponseCalled.get());
++        assertTrue(channel.getSendResponseCalled());
+ 
+         assertWarnings("Content type detection for rest requests is deprecated. Specify the content type using the [Content-Type] header.");
+ 
+@@ -408,9 +410,9 @@ public boolean supportsContentStream() {
+         fakeRestRequest = new FakeRestRequest.Builder(NamedXContentRegistry.EMPTY)
+             .withContent(YamlXContent.contentBuilder().startObject().endObject().bytes(), XContentType.YAML).withPath("/foo").build();
+         channel = new AssertingChannel(fakeRestRequest, true, RestStatus.NOT_ACCEPTABLE);
+-        assertFalse(channel.sendResponseCalled.get());
++        assertFalse(channel.getSendResponseCalled());
+         restController.dispatchRequest(fakeRestRequest, channel, new ThreadContext(Settings.EMPTY));
+-        assertTrue(channel.sendResponseCalled.get());
++        assertTrue(channel.getSendResponseCalled());
+     }
+ 
+     public void testStrictModeContentStream() {
+@@ -432,9 +434,9 @@ public boolean supportsContentStream() {
+                 return true;
+             }
+         });
+-        assertFalse(channel.sendResponseCalled.get());
++        assertFalse(channel.getSendResponseCalled());
+         restController.dispatchRequest(fakeRestRequest, channel, new ThreadContext(Settings.EMPTY));
+-        assertTrue(channel.sendResponseCalled.get());
++        assertTrue(channel.getSendResponseCalled());
+     }
+ 
+     public void testUnknownContentWithContentStream() {
+@@ -454,12 +456,32 @@ public boolean supportsContentStream() {
+                 return true;
+             }
+         });
+-        assertFalse(channel.sendResponseCalled.get());
++        assertFalse(channel.getSendResponseCalled());
+         restController.dispatchRequest(fakeRestRequest, channel, new ThreadContext(Settings.EMPTY));
+-        assertTrue(channel.sendResponseCalled.get());
++        assertTrue(channel.getSendResponseCalled());
+         assertWarnings("Content type detection for rest requests is deprecated. Specify the content type using the [Content-Type] header.");
+     }
+ 
++    public void testDispatchBadRequest() {
++        final FakeRestRequest fakeRestRequest = new FakeRestRequest.Builder(NamedXContentRegistry.EMPTY).build();
++        final AssertingChannel channel = new AssertingChannel(fakeRestRequest, true, RestStatus.BAD_REQUEST);
++        restController.dispatchBadRequest(
++                fakeRestRequest,
++                channel,
++                new ThreadContext(Settings.EMPTY),
++                randomBoolean() ? new IllegalStateException("bad request") : new Throwable("bad request"));
++        assertTrue(channel.getSendResponseCalled());
++        assertThat(channel.getRestResponse().content().utf8ToString(), containsString("bad request"));
++    }
++
++    public void testDispatchBadRequestUnknownCause() {
++        final FakeRestRequest fakeRestRequest = new FakeRestRequest.Builder(NamedXContentRegistry.EMPTY).build();
++        final AssertingChannel channel = new AssertingChannel(fakeRestRequest, true, RestStatus.BAD_REQUEST);
++        restController.dispatchBadRequest(fakeRestRequest, channel, new ThreadContext(Settings.EMPTY), null);
++        assertTrue(channel.getSendResponseCalled());
++        assertThat(channel.getRestResponse().content().utf8ToString(), containsString("unknown cause"));
++    }
++
+     private static final class TestHttpServerTransport extends AbstractLifecycleComponent implements
+         HttpServerTransport {
+ 
+@@ -497,8 +519,9 @@ public HttpStats stats() {
+     }
+ 
+     private static final class AssertingChannel extends AbstractRestChannel {
++        
+         private final RestStatus expectedStatus;
+-        private final AtomicBoolean sendResponseCalled = new AtomicBoolean(false);
++        private final AtomicReference<RestResponse> responseReference = new AtomicReference<>();
+ 
+         protected AssertingChannel(RestRequest request, boolean detailedErrorsEnabled, RestStatus expectedStatus) {
+             super(request, detailedErrorsEnabled);
+@@ -508,8 +531,17 @@ protected AssertingChannel(RestRequest request, boolean detailedErrorsEnabled, R
+         @Override
+         public void sendResponse(RestResponse response) {
+             assertEquals(expectedStatus, response.status());
+-            sendResponseCalled.set(true);
++            responseReference.set(response);
++        }
++        
++        RestResponse getRestResponse() {
++            return responseReference.get();
++        }
++        
++        boolean getSendResponseCalled() {
++            return getRestResponse() != null;
+         }
++        
+     }
+ 
+     private static final class ExceptionThrowingChannel extends AbstractRestChannel {
+diff --git a/modules/transport-netty4/src/main/java/org/elasticsearch/http/netty4/Netty4HttpRequestHandler.java b/modules/transport-netty4/src/main/java/org/elasticsearch/http/netty4/Netty4HttpRequestHandler.java
+index a83c62e52212..b31c412920aa 100644
+--- a/modules/transport-netty4/src/main/java/org/elasticsearch/http/netty4/Netty4HttpRequestHandler.java
++++ b/modules/transport-netty4/src/main/java/org/elasticsearch/http/netty4/Netty4HttpRequestHandler.java
+@@ -25,7 +25,6 @@
+ import io.netty.channel.SimpleChannelInboundHandler;
+ import io.netty.handler.codec.http.DefaultFullHttpRequest;
+ import io.netty.handler.codec.http.FullHttpRequest;
+-
+ import org.elasticsearch.common.util.concurrent.ThreadContext;
+ import org.elasticsearch.http.netty4.pipelining.HttpPipelinedRequest;
+ import org.elasticsearch.transport.netty4.Netty4Utils;
+@@ -65,11 +64,16 @@ protected void channelRead0(ChannelHandlerContext ctx, Object msg) throws Except
+                         Unpooled.copiedBuffer(request.content()),
+                         request.headers(),
+                         request.trailingHeaders());
+-
+         final Netty4HttpRequest httpRequest = new Netty4HttpRequest(serverTransport.xContentRegistry, copy, ctx.channel());
+-        serverTransport.dispatchRequest(
+-            httpRequest,
+-            new Netty4HttpChannel(serverTransport, httpRequest, pipelinedRequest, detailedErrorsEnabled, threadContext));
++        final Netty4HttpChannel channel =
++                new Netty4HttpChannel(serverTransport, httpRequest, pipelinedRequest, detailedErrorsEnabled, threadContext);
++
++        if (request.decoderResult().isSuccess()) {
++            serverTransport.dispatchRequest(httpRequest, channel);
++        } else {
++            assert request.decoderResult().isFailure();
++            serverTransport.dispatchBadRequest(httpRequest, channel, request.decoderResult().cause());
++        }
+     }
+ 
+     @Override
+diff --git a/modules/transport-netty4/src/main/java/org/elasticsearch/http/netty4/Netty4HttpServerTransport.java b/modules/transport-netty4/src/main/java/org/elasticsearch/http/netty4/Netty4HttpServerTransport.java
+index 17b5098a65b1..7ea9b6b5eea4 100644
+--- a/modules/transport-netty4/src/main/java/org/elasticsearch/http/netty4/Netty4HttpServerTransport.java
++++ b/modules/transport-netty4/src/main/java/org/elasticsearch/http/netty4/Netty4HttpServerTransport.java
+@@ -496,8 +496,12 @@ public Netty4CorsConfig getCorsConfig() {
+         return corsConfig;
+     }
+ 
+-    protected void dispatchRequest(RestRequest request, RestChannel channel) {
+-        dispatcher.dispatch(request, channel, threadPool.getThreadContext());
++    void dispatchRequest(final RestRequest request, final RestChannel channel) {
++        dispatcher.dispatchRequest(request, channel, threadPool.getThreadContext());
++    }
++
++    void dispatchBadRequest(final RestRequest request, final RestChannel channel, final Throwable cause) {
++        dispatcher.dispatchBadRequest(request, channel, threadPool.getThreadContext(), cause);
+     }
+ 
+     protected void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+diff --git a/modules/transport-netty4/src/test/java/org/elasticsearch/http/netty4/Netty4HttpChannelTests.java b/modules/transport-netty4/src/test/java/org/elasticsearch/http/netty4/Netty4HttpChannelTests.java
+index c7427e717b3a..20844a4007c2 100644
+--- a/modules/transport-netty4/src/test/java/org/elasticsearch/http/netty4/Netty4HttpChannelTests.java
++++ b/modules/transport-netty4/src/test/java/org/elasticsearch/http/netty4/Netty4HttpChannelTests.java
+@@ -47,6 +47,7 @@
+ import org.elasticsearch.common.settings.Settings;
+ import org.elasticsearch.common.util.MockBigArrays;
+ import org.elasticsearch.http.HttpTransportSettings;
++import org.elasticsearch.http.NullDispatcher;
+ import org.elasticsearch.http.netty4.cors.Netty4CorsHandler;
+ import org.elasticsearch.indices.breaker.NoneCircuitBreakerService;
+ import org.elasticsearch.rest.RestResponse;
+@@ -189,7 +190,7 @@ public void testHeadersSet() {
+         Settings settings = Settings.builder().build();
+         try (Netty4HttpServerTransport httpServerTransport =
+                      new Netty4HttpServerTransport(settings, networkService, bigArrays, threadPool, xContentRegistry(),
+-                         (request, channel, context) -> {})) {
++                         new NullDispatcher())) {
+             httpServerTransport.start();
+             final FullHttpRequest httpRequest = new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/");
+             httpRequest.headers().add(HttpHeaderNames.ORIGIN, "remote");
+@@ -219,8 +220,7 @@ public void testHeadersSet() {
+     public void testConnectionClose() throws Exception {
+         final Settings settings = Settings.builder().build();
+         try (Netty4HttpServerTransport httpServerTransport =
+-                 new Netty4HttpServerTransport(settings, networkService, bigArrays, threadPool, xContentRegistry(),
+-                     (request, channel, context) -> {})) {
++                 new Netty4HttpServerTransport(settings, networkService, bigArrays, threadPool, xContentRegistry(), new NullDispatcher())) {
+             httpServerTransport.start();
+             final FullHttpRequest httpRequest;
+             final boolean close = randomBoolean();
+@@ -256,7 +256,7 @@ private FullHttpResponse executeRequest(final Settings settings, final String or
+         // construct request and send it over the transport layer
+         try (Netty4HttpServerTransport httpServerTransport =
+                      new Netty4HttpServerTransport(settings, networkService, bigArrays, threadPool, xContentRegistry(),
+-                         (request, channel, context) -> {})) {
++                             new NullDispatcher())) {
+             httpServerTransport.start();
+             final FullHttpRequest httpRequest = new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/");
+             if (originValue != null) {
+diff --git a/modules/transport-netty4/src/test/java/org/elasticsearch/http/netty4/Netty4HttpServerPipeliningTests.java b/modules/transport-netty4/src/test/java/org/elasticsearch/http/netty4/Netty4HttpServerPipeliningTests.java
+index d7e2d7782d59..c9ca5068faf0 100644
+--- a/modules/transport-netty4/src/test/java/org/elasticsearch/http/netty4/Netty4HttpServerPipeliningTests.java
++++ b/modules/transport-netty4/src/test/java/org/elasticsearch/http/netty4/Netty4HttpServerPipeliningTests.java
+@@ -37,6 +37,7 @@
+ import org.elasticsearch.common.util.MockBigArrays;
+ import org.elasticsearch.common.util.concurrent.ThreadContext;
+ import org.elasticsearch.http.HttpServerTransport;
++import org.elasticsearch.http.NullDispatcher;
+ import org.elasticsearch.http.netty4.pipelining.HttpPipelinedRequest;
+ import org.elasticsearch.indices.breaker.NoneCircuitBreakerService;
+ import org.elasticsearch.test.ESTestCase;
+@@ -160,7 +161,7 @@ public void testThatHttpPipeliningCanBeDisabled() throws Exception {
+                 Netty4HttpServerPipeliningTests.this.networkService,
+                 Netty4HttpServerPipeliningTests.this.bigArrays,
+                 Netty4HttpServerPipeliningTests.this.threadPool,
+-                xContentRegistry(), (request, channel, context) -> {});
++                xContentRegistry(), new NullDispatcher());
+         }
+ 
+         @Override
+diff --git a/modules/transport-netty4/src/test/java/org/elasticsearch/http/netty4/Netty4HttpServerTransportTests.java b/modules/transport-netty4/src/test/java/org/elasticsearch/http/netty4/Netty4HttpServerTransportTests.java
+index 69dcaad9dd38..2b2f2421c764 100644
+--- a/modules/transport-netty4/src/test/java/org/elasticsearch/http/netty4/Netty4HttpServerTransportTests.java
++++ b/modules/transport-netty4/src/test/java/org/elasticsearch/http/netty4/Netty4HttpServerTransportTests.java
+@@ -21,6 +21,7 @@
+ 
+ import io.netty.buffer.ByteBufUtil;
+ import io.netty.buffer.Unpooled;
++import io.netty.handler.codec.TooLongFrameException;
+ import io.netty.handler.codec.http.DefaultFullHttpRequest;
+ import io.netty.handler.codec.http.FullHttpRequest;
+ import io.netty.handler.codec.http.FullHttpResponse;
+@@ -28,27 +29,39 @@
+ import io.netty.handler.codec.http.HttpResponseStatus;
+ import io.netty.handler.codec.http.HttpUtil;
+ import io.netty.handler.codec.http.HttpVersion;
++import org.elasticsearch.ElasticsearchException;
+ import org.elasticsearch.common.Strings;
+ import org.elasticsearch.common.bytes.BytesArray;
+ import org.elasticsearch.common.network.NetworkService;
++import org.elasticsearch.common.settings.Setting;
+ import org.elasticsearch.common.settings.Settings;
+ import org.elasticsearch.common.transport.TransportAddress;
++import org.elasticsearch.common.unit.ByteSizeValue;
+ import org.elasticsearch.common.util.MockBigArrays;
++import org.elasticsearch.common.util.concurrent.ThreadContext;
+ import org.elasticsearch.http.BindHttpException;
++import org.elasticsearch.http.HttpServerTransport;
++import org.elasticsearch.http.HttpTransportSettings;
++import org.elasticsearch.http.NullDispatcher;
+ import org.elasticsearch.http.netty4.cors.Netty4CorsConfig;
+ import org.elasticsearch.indices.breaker.NoneCircuitBreakerService;
+ import org.elasticsearch.rest.BytesRestResponse;
++import org.elasticsearch.rest.RestChannel;
++import org.elasticsearch.rest.RestRequest;
+ import org.elasticsearch.test.ESTestCase;
+ import org.elasticsearch.threadpool.TestThreadPool;
+ import org.elasticsearch.threadpool.ThreadPool;
+ import org.junit.After;
+ import org.junit.Before;
+ 
++import java.io.IOException;
++import java.nio.charset.Charset;
+ import java.nio.charset.StandardCharsets;
+ import java.util.Arrays;
+ import java.util.Collections;
+ import java.util.HashSet;
+ import java.util.Set;
++import java.util.concurrent.atomic.AtomicReference;
+ import java.util.stream.Collectors;
+ 
+ import static org.elasticsearch.common.Strings.collectionToDelimitedString;
+@@ -58,7 +71,11 @@
+ import static org.elasticsearch.http.HttpTransportSettings.SETTING_CORS_ALLOW_ORIGIN;
+ import static org.elasticsearch.http.HttpTransportSettings.SETTING_CORS_ENABLED;
+ import static org.elasticsearch.http.HttpTransportSettings.SETTING_CORS_MAX_AGE;
++import static org.elasticsearch.rest.RestStatus.BAD_REQUEST;
+ import static org.elasticsearch.rest.RestStatus.OK;
++import static org.hamcrest.Matchers.containsString;
++import static org.hamcrest.Matchers.equalTo;
++import static org.hamcrest.Matchers.instanceOf;
+ import static org.hamcrest.Matchers.is;
+ 
+ /**
+@@ -122,9 +139,19 @@ public void testCorsConfigWithDefaults() {
+      * Test that {@link Netty4HttpServerTransport} supports the "Expect: 100-continue" HTTP header
+      */
+     public void testExpectContinueHeader() throws Exception {
++        final HttpServerTransport.Dispatcher dispatcher = new HttpServerTransport.Dispatcher() {
++            @Override
++            public void dispatchRequest(RestRequest request, RestChannel channel, ThreadContext threadContext) {
++                channel.sendResponse(new BytesRestResponse(OK, BytesRestResponse.TEXT_CONTENT_TYPE, new BytesArray("done")));
++            }
++
++            @Override
++            public void dispatchBadRequest(RestRequest request, RestChannel channel, ThreadContext threadContext, Throwable cause) {
++                throw new AssertionError();
++            }
++        };
+         try (Netty4HttpServerTransport transport = new Netty4HttpServerTransport(Settings.EMPTY, networkService, bigArrays, threadPool,
+-                xContentRegistry(), (request, channel, context) ->
+-            channel.sendResponse(new BytesRestResponse(OK, BytesRestResponse.TEXT_CONTENT_TYPE, new BytesArray("done"))))) {
++                xContentRegistry(), dispatcher)) {
+             transport.start();
+             TransportAddress remoteAddress = randomFrom(transport.boundAddress().boundAddresses());
+ 
+@@ -146,15 +173,73 @@ public void testExpectContinueHeader() throws Exception {
+ 
+     public void testBindUnavailableAddress() {
+         try (Netty4HttpServerTransport transport = new Netty4HttpServerTransport(Settings.EMPTY, networkService, bigArrays, threadPool,
+-                xContentRegistry(), (request, channel, context) -> {})) {
++                xContentRegistry(), new NullDispatcher())) {
+             transport.start();
+             TransportAddress remoteAddress = randomFrom(transport.boundAddress().boundAddresses());
+             Settings settings = Settings.builder().put("http.port", remoteAddress.getPort()).build();
+             try (Netty4HttpServerTransport otherTransport = new Netty4HttpServerTransport(settings, networkService, bigArrays, threadPool,
+-                    xContentRegistry(), (request, channel, context) -> {})) {
++                    xContentRegistry(), new NullDispatcher())) {
+                 BindHttpException bindHttpException = expectThrows(BindHttpException.class, () -> otherTransport.start());
+                 assertEquals("Failed to bind to [" + remoteAddress.getPort() + "]", bindHttpException.getMessage());
+             }
+         }
+     }
++
++    public void testBadRequest() throws InterruptedException {
++        final AtomicReference<Throwable> causeReference = new AtomicReference<>();
++        final HttpServerTransport.Dispatcher dispatcher = new HttpServerTransport.Dispatcher() {
++
++            @Override
++            public void dispatchRequest(final RestRequest request, final RestChannel channel, final ThreadContext threadContext) {
++                throw new AssertionError();
++            }
++
++            @Override
++            public void dispatchBadRequest(final RestRequest request,
++                                           final RestChannel channel,
++                                           final ThreadContext threadContext,
++                                           final Throwable cause) {
++                causeReference.set(cause);
++                try {
++                    final ElasticsearchException e = new ElasticsearchException("you sent a bad request and you should feel bad");
++                    channel.sendResponse(new BytesRestResponse(channel, BAD_REQUEST, e));
++                } catch (final IOException e) {
++                    throw new AssertionError(e);
++                }
++            }
++
++        };
++
++        final Settings settings;
++        final int maxInitialLineLength;
++        final Setting<ByteSizeValue> httpMaxInitialLineLengthSetting = HttpTransportSettings.SETTING_HTTP_MAX_INITIAL_LINE_LENGTH;
++        if (randomBoolean()) {
++            maxInitialLineLength = httpMaxInitialLineLengthSetting.getDefault(Settings.EMPTY).bytesAsInt();
++            settings = Settings.EMPTY;
++        } else {
++            maxInitialLineLength = randomIntBetween(1, 8192);
++            settings = Settings.builder().put(httpMaxInitialLineLengthSetting.getKey(), maxInitialLineLength + "b").build();
++        }
++
++        try (Netty4HttpServerTransport transport =
++                     new Netty4HttpServerTransport(settings, networkService, bigArrays, threadPool, xContentRegistry(), dispatcher)) {
++            transport.start();
++            final TransportAddress remoteAddress = randomFrom(transport.boundAddress.boundAddresses());
++
++            try (Netty4HttpClient client = new Netty4HttpClient()) {
++                final String url = "/" + new String(new byte[maxInitialLineLength], Charset.forName("UTF-8"));
++                final FullHttpRequest request = new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, url);
++
++                final FullHttpResponse response = client.post(remoteAddress.address(), request);
++                assertThat(response.status(), equalTo(HttpResponseStatus.BAD_REQUEST));
++                assertThat(
++                        new String(response.content().array(), Charset.forName("UTF-8")),
++                        containsString("you sent a bad request and you should feel bad"));
++            }
++        }
++
++        assertNotNull(causeReference.get());
++        assertThat(causeReference.get(), instanceOf(TooLongFrameException.class));
++    }
++
+ }
+diff --git a/modules/transport-netty4/src/test/java/org/elasticsearch/rest/Netty4BadRequestIT.java b/modules/transport-netty4/src/test/java/org/elasticsearch/rest/Netty4BadRequestIT.java
+new file mode 100644
+index 000000000000..a5ba8fe18ce4
+--- /dev/null
++++ b/modules/transport-netty4/src/test/java/org/elasticsearch/rest/Netty4BadRequestIT.java
+@@ -0,0 +1,84 @@
++/*
++ * Licensed to Elasticsearch under one or more contributor
++ * license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright
++ * ownership. Elasticsearch licenses this file to you under
++ * the Apache License, Version 2.0 (the "License"); you may
++ * not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++package org.elasticsearch.rest;
++
++import org.apache.http.util.EntityUtils;
++import org.elasticsearch.client.Response;
++import org.elasticsearch.client.ResponseException;
++import org.elasticsearch.common.settings.Setting;
++import org.elasticsearch.common.settings.Settings;
++import org.elasticsearch.common.unit.ByteSizeValue;
++import org.elasticsearch.common.xcontent.XContentType;
++import org.elasticsearch.http.HttpTransportSettings;
++import org.elasticsearch.test.rest.ESRestTestCase;
++import org.elasticsearch.test.rest.yaml.ObjectPath;
++
++import java.io.IOException;
++import java.nio.charset.Charset;
++import java.nio.charset.StandardCharsets;
++import java.util.Collections;
++import java.util.Map;
++
++import static org.elasticsearch.rest.RestStatus.BAD_REQUEST;
++import static org.elasticsearch.test.hamcrest.RegexMatcher.matches;
++import static org.hamcrest.Matchers.containsString;
++import static org.hamcrest.Matchers.equalTo;
++import static org.hamcrest.Matchers.hasToString;
++
++public class Netty4BadRequestIT extends ESRestTestCase {
++
++    public void testBadRequest() throws IOException {
++        final Response response = client().performRequest("GET", "/_nodes/settings", Collections.emptyMap());
++        final String body = EntityUtils.toString(response.getEntity(), StandardCharsets.UTF_8);
++        final String contentType = response.getHeader("Content-Type");
++        final XContentType xContentType = XContentType.fromMediaTypeOrFormat(contentType);
++        final ObjectPath objectPath = ObjectPath.createFromXContent(xContentType.xContent(), body);
++        final Map<String, Object> map = objectPath.evaluate("nodes");
++        int maxMaxInitialLineLength = Integer.MIN_VALUE;
++        final Setting<ByteSizeValue> httpMaxInitialLineLength = HttpTransportSettings.SETTING_HTTP_MAX_INITIAL_LINE_LENGTH;
++        final String key = httpMaxInitialLineLength.getKey().substring("http.".length());
++        for (Map.Entry<String, Object> entry : map.entrySet()) {
++            @SuppressWarnings("unchecked") final Map<String, Object> settings =
++                    (Map<String, Object>)((Map<String, Object>)entry.getValue()).get("settings");
++                    final int maxIntialLineLength;
++            if (settings.containsKey("http")) {
++                @SuppressWarnings("unchecked") final Map<String, Object> httpSettings = (Map<String, Object>)settings.get("http");
++                if (httpSettings.containsKey(key)) {
++                    maxIntialLineLength = ByteSizeValue.parseBytesSizeValue((String)httpSettings.get(key), key).bytesAsInt();
++                } else {
++                    maxIntialLineLength = httpMaxInitialLineLength.getDefault(Settings.EMPTY).bytesAsInt();
++                }
++            } else {
++                maxIntialLineLength = httpMaxInitialLineLength.getDefault(Settings.EMPTY).bytesAsInt();
++            }
++            maxMaxInitialLineLength = Math.max(maxMaxInitialLineLength, maxIntialLineLength);
++        }
++
++        final String path = "/" + new String(new byte[maxMaxInitialLineLength], Charset.forName("UTF-8")).replace('\0', 'a');
++        final ResponseException e =
++                expectThrows(
++                        ResponseException.class,
++                        () -> client().performRequest(randomFrom("GET", "POST", "PUT"), path, Collections.emptyMap()));
++        assertThat(e.getResponse().getStatusLine().getStatusCode(), equalTo(BAD_REQUEST.getStatus()));
++        assertThat(e, hasToString(containsString("too_long_frame_exception")));
++        assertThat(e, hasToString(matches("An HTTP line is larger than \\d+ bytes")));
++    }
++
++}
+diff --git a/test/framework/src/main/java/org/elasticsearch/http/NullDispatcher.java b/test/framework/src/main/java/org/elasticsearch/http/NullDispatcher.java
+new file mode 100644
+index 000000000000..17a5e57fae80
+--- /dev/null
++++ b/test/framework/src/main/java/org/elasticsearch/http/NullDispatcher.java
+@@ -0,0 +1,38 @@
++/*
++ * Licensed to Elasticsearch under one or more contributor
++ * license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright
++ * ownership. Elasticsearch licenses this file to you under
++ * the Apache License, Version 2.0 (the "License"); you may
++ * not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++package org.elasticsearch.http;
++
++import org.elasticsearch.common.util.concurrent.ThreadContext;
++import org.elasticsearch.rest.RestChannel;
++import org.elasticsearch.rest.RestRequest;
++
++public class NullDispatcher implements HttpServerTransport.Dispatcher {
++
++    @Override
++    public void dispatchRequest(RestRequest request, RestChannel channel, ThreadContext threadContext) {
++
++    }
++
++    @Override
++    public void dispatchBadRequest(RestRequest request, RestChannel channel, ThreadContext threadContext, Throwable cause) {
++
++    }
++
++}

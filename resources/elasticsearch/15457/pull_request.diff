@@ -1,0 +1,139 @@
+diff --git a/core/src/main/java/org/elasticsearch/search/aggregations/bucket/children/ParentToChildrenAggregator.java b/core/src/main/java/org/elasticsearch/search/aggregations/bucket/children/ParentToChildrenAggregator.java
+index 6d9a1edc712c..0678338fcf77 100644
+--- a/core/src/main/java/org/elasticsearch/search/aggregations/bucket/children/ParentToChildrenAggregator.java
++++ b/core/src/main/java/org/elasticsearch/search/aggregations/bucket/children/ParentToChildrenAggregator.java
+@@ -18,6 +18,7 @@
+  */
+ package org.elasticsearch.search.aggregations.bucket.children;
+ 
++import org.apache.lucene.index.IndexReader;
+ import org.apache.lucene.index.LeafReaderContext;
+ import org.apache.lucene.index.SortedDocValues;
+ import org.apache.lucene.search.*;
+@@ -64,9 +65,6 @@
+     private final LongObjectPagedHashMap<long[]> parentOrdToOtherBuckets;
+     private boolean multipleBucketsPerParentOrd = false;
+ 
+-    // This needs to be a Set to avoid duplicate reader context entries via (#setNextReader(...), it can get invoked multiple times with the same reader context)
+-    private Set<LeafReaderContext> replay = new LinkedHashSet<>();
+-
+     public ParentToChildrenAggregator(String name, AggregatorFactories factories, AggregationContext aggregationContext,
+                                       Aggregator parent, String parentType, Query childFilter, Query parentFilter,
+                                       ValuesSource.Bytes.WithOrdinals.ParentChild valuesSource,
+@@ -99,17 +97,11 @@ public LeafBucketCollector getLeafCollector(LeafReaderContext ctx,
+         if (valuesSource == null) {
+             return LeafBucketCollector.NO_OP_COLLECTOR;
+         }
+-        if (replay == null) {
+-            throw new IllegalStateException();
+-        }
+ 
+         final SortedDocValues globalOrdinals = valuesSource.globalOrdinalsValues(parentType, ctx);
+         assert globalOrdinals != null;
+         Scorer parentScorer = parentFilter.scorer(ctx);
+         final Bits parentDocs = Lucene.asSequentialAccessBits(ctx.reader().maxDoc(), parentScorer);
+-        if (childFilter.scorer(ctx) != null) {
+-            replay.add(ctx);
+-        }
+         return new LeafBucketCollector() {
+ 
+             @Override
+@@ -138,10 +130,8 @@ public void collect(int docId, long bucket) throws IOException {
+ 
+     @Override
+     protected void doPostCollection() throws IOException {
+-        final Set<LeafReaderContext> replay = this.replay;
+-        this.replay = null;
+-
+-        for (LeafReaderContext ctx : replay) {
++        IndexReader indexReader = context().searchContext().searcher().getIndexReader();
++        for (LeafReaderContext ctx : indexReader.leaves()) {
+             DocIdSetIterator childDocsIter = childFilter.scorer(ctx);
+             if (childDocsIter == null) {
+                 continue;
+diff --git a/core/src/test/java/org/elasticsearch/search/aggregations/bucket/ChildrenIT.java b/core/src/test/java/org/elasticsearch/search/aggregations/bucket/ChildrenIT.java
+index b6611a956af5..540420c21bcd 100644
+--- a/core/src/test/java/org/elasticsearch/search/aggregations/bucket/ChildrenIT.java
++++ b/core/src/test/java/org/elasticsearch/search/aggregations/bucket/ChildrenIT.java
+@@ -18,12 +18,15 @@
+  */
+ package org.elasticsearch.search.aggregations.bucket;
+ 
++import org.elasticsearch.action.index.IndexRequest;
+ import org.elasticsearch.action.index.IndexRequestBuilder;
+ import org.elasticsearch.action.search.SearchResponse;
+ import org.elasticsearch.action.update.UpdateResponse;
+ import org.elasticsearch.cluster.metadata.IndexMetaData;
+ import org.elasticsearch.common.settings.Settings;
+ import org.elasticsearch.search.SearchHit;
++import org.elasticsearch.search.aggregations.AggregationBuilder;
++import org.elasticsearch.search.aggregations.AggregationBuilders;
+ import org.elasticsearch.search.aggregations.bucket.children.Children;
+ import org.elasticsearch.search.aggregations.bucket.terms.Terms;
+ import org.elasticsearch.search.aggregations.metrics.sum.Sum;
+@@ -392,6 +395,65 @@ public void testHierarchicalChildrenAggs() {
+         assertThat(terms.getBuckets().get(0).getDocCount(), equalTo(1l));
+     }
+ 
++    public void testPostCollectAllLeafReaders() throws Exception {
++        // The 'towns' and 'parent_names' aggs operate on parent docs and if child docs are in different segments we need
++        // to ensure those segments which child docs are also evaluated to in the post collect phase.
++
++        // Before we only evaluated segments that yielded matches in 'towns' and 'parent_names' aggs, which caused
++        // us to miss to evaluate child docs in segments we didn't have parent matches for.
++
++        assertAcked(
++            prepareCreate("index")
++                .addMapping("parentType", "name", "type=string,index=not_analyzed", "town", "type=string,index=not_analyzed")
++                .addMapping("childType", "_parent", "type=parentType", "name", "type=string,index=not_analyzed", "age", "type=integer")
++        );
++        List<IndexRequestBuilder> requests = new ArrayList<>();
++        requests.add(client().prepareIndex("index", "parentType", "1").setSource("name", "Bob", "town", "Memphis"));
++        requests.add(client().prepareIndex("index", "parentType", "2").setSource("name", "Alice", "town", "Chicago"));
++        requests.add(client().prepareIndex("index", "parentType", "3").setSource("name", "Bill", "town", "Chicago"));
++        requests.add(client().prepareIndex("index", "childType", "1").setSource("name", "Jill", "age", 5).setParent("1"));
++        requests.add(client().prepareIndex("index", "childType", "2").setSource("name", "Joey", "age", 3).setParent("1"));
++        requests.add(client().prepareIndex("index", "childType", "3").setSource("name", "John", "age", 2).setParent("2"));
++        requests.add(client().prepareIndex("index", "childType", "4").setSource("name", "Betty", "age", 6).setParent("3"));
++        requests.add(client().prepareIndex("index", "childType", "5").setSource("name", "Dan", "age", 1).setParent("3"));
++        indexRandom(true, requests);
++
++        SearchResponse response = client().prepareSearch("index")
++            .setSize(0)
++            .addAggregation(AggregationBuilders.terms("towns").field("town")
++                .subAggregation(AggregationBuilders.terms("parent_names").field("name")
++                    .subAggregation(AggregationBuilders.children("child_docs").childType("childType"))
++                )
++            )
++            .get();
++
++        Terms towns = response.getAggregations().get("towns");
++        assertThat(towns.getBuckets().size(), equalTo(2));
++        assertThat(towns.getBuckets().get(0).getKeyAsString(), equalTo("Chicago"));
++        assertThat(towns.getBuckets().get(0).getDocCount(), equalTo(2L));
++
++        Terms parents = towns.getBuckets().get(0).getAggregations().get("parent_names");
++        assertThat(parents.getBuckets().size(), equalTo(2));
++        assertThat(parents.getBuckets().get(0).getKeyAsString(), equalTo("Alice"));
++        assertThat(parents.getBuckets().get(0).getDocCount(), equalTo(1L));
++        Children children = parents.getBuckets().get(0).getAggregations().get("child_docs");
++        assertThat(children.getDocCount(), equalTo(1L));
++
++        assertThat(parents.getBuckets().get(1).getKeyAsString(), equalTo("Bill"));
++        assertThat(parents.getBuckets().get(1).getDocCount(), equalTo(1L));
++        children = parents.getBuckets().get(1).getAggregations().get("child_docs");
++        assertThat(children.getDocCount(), equalTo(2L));
++
++        assertThat(towns.getBuckets().get(1).getKeyAsString(), equalTo("Memphis"));
++        assertThat(towns.getBuckets().get(1).getDocCount(), equalTo(1L));
++        parents = towns.getBuckets().get(1).getAggregations().get("parent_names");
++        assertThat(parents.getBuckets().size(), equalTo(1));
++        assertThat(parents.getBuckets().get(0).getKeyAsString(), equalTo("Bob"));
++        assertThat(parents.getBuckets().get(0).getDocCount(), equalTo(1L));
++        children = parents.getBuckets().get(0).getAggregations().get("child_docs");
++        assertThat(children.getDocCount(), equalTo(2L));
++    }
++
+     private static final class Control {
+ 
+         final String category;

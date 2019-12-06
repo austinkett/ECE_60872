@@ -1,0 +1,1218 @@
+diff --git a/src/main/java/rx/Observable.java b/src/main/java/rx/Observable.java
+index 6c4b599bb6..4b3d7802b4 100644
+--- a/src/main/java/rx/Observable.java
++++ b/src/main/java/rx/Observable.java
+@@ -11284,11 +11284,13 @@ public final Subscription subscribe(Subscriber<? super T> subscriber) {
+      *             if {@code timeoutSelector} is null
+      * @see <a href="http://reactivex.io/documentation/operators/timeout.html">ReactiveX operators documentation: Timeout</a>
+      */
++    @SuppressWarnings("unchecked")
+     public final <U, V> Observable<T> timeout(Func0<? extends Observable<U>> firstTimeoutSelector, Func1<? super T, ? extends Observable<V>> timeoutSelector, Observable<? extends T> other) {
+         if (timeoutSelector == null) {
+             throw new NullPointerException("timeoutSelector is null");
+         }
+-        return lift(new OperatorTimeoutWithSelector<T, U, V>(firstTimeoutSelector, timeoutSelector, other));
++        return unsafeCreate(new OnSubscribeTimeoutSelectorWithFallback<T, U, V>(this,
++                firstTimeoutSelector != null ? defer((Func0<Observable<U>>)firstTimeoutSelector) : null, timeoutSelector, other));
+     }
+ 
+     /**
+@@ -11443,7 +11445,7 @@ public final Subscription subscribe(Subscriber<? super T> subscriber) {
+      * @see <a href="http://reactivex.io/documentation/operators/timeout.html">ReactiveX operators documentation: Timeout</a>
+      */
+     public final Observable<T> timeout(long timeout, TimeUnit timeUnit, Observable<? extends T> other, Scheduler scheduler) {
+-        return lift(new OperatorTimeout<T>(timeout, timeUnit, other, scheduler));
++        return unsafeCreate(new OnSubscribeTimeoutTimedWithFallback<T>(this, timeout, timeUnit, scheduler, other));
+     }
+ 
+     /**
+diff --git a/src/main/java/rx/internal/operators/OnSubscribeTimeoutSelectorWithFallback.java b/src/main/java/rx/internal/operators/OnSubscribeTimeoutSelectorWithFallback.java
+new file mode 100644
+index 0000000000..75d75777c8
+--- /dev/null
++++ b/src/main/java/rx/internal/operators/OnSubscribeTimeoutSelectorWithFallback.java
+@@ -0,0 +1,247 @@
++/**
++ * Copyright 2014 Netflix, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package rx.internal.operators;
++
++import java.util.concurrent.TimeoutException;
++import java.util.concurrent.atomic.AtomicLong;
++
++import rx.*;
++import rx.exceptions.Exceptions;
++import rx.functions.Func1;
++import rx.internal.operators.OnSubscribeTimeoutTimedWithFallback.FallbackSubscriber;
++import rx.internal.producers.ProducerArbiter;
++import rx.internal.subscriptions.SequentialSubscription;
++import rx.plugins.RxJavaHooks;
++
++/**
++ * Switches to the fallback Observable if: the first upstream item doesn't arrive before
++ * the first timeout Observable signals an item or completes; or the Observable generated from
++ * the previous upstream item signals its item or completes before the upstream signals the next item
++ * of its own.
++ *
++ * @param <T> the input and output value type
++ * @param <U> the value type of the first timeout Observable
++ * @param <V> the value type of the item-based timeout Observable
++ *
++ * @since 1.3.3
++ */
++public final class OnSubscribeTimeoutSelectorWithFallback<T, U, V> implements Observable.OnSubscribe<T> {
++
++    final Observable<T> source;
++
++    final Observable<U> firstTimeoutIndicator;
++
++    final Func1<? super T, ? extends Observable<V>> itemTimeoutIndicator;
++
++    final Observable<? extends T> fallback;
++
++    public OnSubscribeTimeoutSelectorWithFallback(Observable<T> source,
++            Observable<U> firstTimeoutIndicator,
++            Func1<? super T, ? extends Observable<V>> itemTimeoutIndicator,
++            Observable<? extends T> fallback) {
++        this.source = source;
++        this.firstTimeoutIndicator = firstTimeoutIndicator;
++        this.itemTimeoutIndicator = itemTimeoutIndicator;
++        this.fallback = fallback;
++    }
++
++    @Override
++    public void call(Subscriber<? super T> t) {
++        TimeoutMainSubscriber<T> parent = new TimeoutMainSubscriber<T>(t, itemTimeoutIndicator, fallback);
++        t.add(parent.upstream);
++        t.setProducer(parent.arbiter);
++        parent.startFirst(firstTimeoutIndicator);
++        source.subscribe(parent);
++    }
++
++    static final class TimeoutMainSubscriber<T> extends Subscriber<T> {
++
++        final Subscriber<? super T> actual;
++
++        final Func1<? super T, ? extends Observable<?>> itemTimeoutIndicator;
++
++        final Observable<? extends T> fallback;
++
++        final ProducerArbiter arbiter;
++
++        final AtomicLong index;
++
++        final SequentialSubscription task;
++
++        final SequentialSubscription upstream;
++
++        long consumed;
++
++        TimeoutMainSubscriber(Subscriber<? super T> actual,
++                Func1<? super T, ? extends Observable<?>> itemTimeoutIndicator,
++                Observable<? extends T> fallback) {
++            this.actual = actual;
++            this.itemTimeoutIndicator = itemTimeoutIndicator;
++            this.fallback = fallback;
++            this.arbiter = new ProducerArbiter();
++            this.index = new AtomicLong();
++            this.task = new SequentialSubscription();
++            this.upstream = new SequentialSubscription(this);
++            this.add(task);
++        }
++
++
++        @Override
++        public void onNext(T t) {
++            long idx = index.get();
++            if (idx == Long.MAX_VALUE || !index.compareAndSet(idx, idx + 1)) {
++                return;
++            }
++
++            Subscription s = task.get();
++            if (s != null) {
++                s.unsubscribe();
++            }
++
++            actual.onNext(t);
++
++            consumed++;
++
++            Observable<?> timeoutObservable;
++
++            try {
++                timeoutObservable = itemTimeoutIndicator.call(t);
++                if (timeoutObservable == null) {
++                    throw new NullPointerException("The itemTimeoutIndicator returned a null Observable");
++                }
++            } catch (Throwable ex) {
++                Exceptions.throwIfFatal(ex);
++                unsubscribe();
++                index.getAndSet(Long.MAX_VALUE);
++                actual.onError(ex);
++                return;
++            }
++
++            TimeoutConsumer tc = new TimeoutConsumer(idx + 1);
++            if (task.replace(tc)) {
++                timeoutObservable.subscribe(tc);
++            }
++
++        }
++
++        void startFirst(Observable<?> firstTimeoutIndicator) {
++            if (firstTimeoutIndicator != null) {
++                TimeoutConsumer tc = new TimeoutConsumer(0L);
++                if (task.replace(tc)) {
++                    firstTimeoutIndicator.subscribe(tc);
++                }
++            }
++        }
++
++        @Override
++        public void onError(Throwable e) {
++            if (index.getAndSet(Long.MAX_VALUE) != Long.MAX_VALUE) {
++                task.unsubscribe();
++
++                actual.onError(e);
++            } else {
++                RxJavaHooks.onError(e);
++            }
++        }
++
++        @Override
++        public void onCompleted() {
++            if (index.getAndSet(Long.MAX_VALUE) != Long.MAX_VALUE) {
++                task.unsubscribe();
++
++                actual.onCompleted();
++            }
++        }
++
++        @Override
++        public void setProducer(Producer p) {
++            arbiter.setProducer(p);
++        }
++
++        void onTimeout(long idx) {
++            if (!index.compareAndSet(idx, Long.MAX_VALUE)) {
++                return;
++            }
++
++            unsubscribe();
++
++            if (fallback == null) {
++                actual.onError(new TimeoutException());
++            } else {
++                long c = consumed;
++                if (c != 0L) {
++                    arbiter.produced(c);
++                }
++
++                FallbackSubscriber<T> fallbackSubscriber = new FallbackSubscriber<T>(actual, arbiter);
++
++                if (upstream.replace(fallbackSubscriber)) {
++                    fallback.subscribe(fallbackSubscriber);
++                }
++            }
++        }
++
++        void onTimeoutError(long idx, Throwable ex) {
++            if (index.compareAndSet(idx, Long.MAX_VALUE)) {
++                unsubscribe();
++
++                actual.onError(ex);
++            } else {
++                RxJavaHooks.onError(ex);
++            }
++
++        }
++
++        final class TimeoutConsumer extends Subscriber<Object> {
++
++            final long idx;
++
++            boolean done;
++
++            TimeoutConsumer(long idx) {
++                this.idx = idx;
++            }
++
++            @Override
++            public void onNext(Object t) {
++                if (!done) {
++                    done = true;
++                    unsubscribe();
++                    onTimeout(idx);
++                }
++            }
++
++            @Override
++            public void onError(Throwable e) {
++                if (!done) {
++                    done = true;
++                    onTimeoutError(idx, e);
++                } else {
++                    RxJavaHooks.onError(e);
++                }
++            }
++
++            @Override
++            public void onCompleted() {
++                if (!done) {
++                    done = true;
++                    onTimeout(idx);
++                }
++            }
++        }
++    }
++}
+diff --git a/src/main/java/rx/internal/operators/OnSubscribeTimeoutTimedWithFallback.java b/src/main/java/rx/internal/operators/OnSubscribeTimeoutTimedWithFallback.java
+new file mode 100644
+index 0000000000..e70c57d667
+--- /dev/null
++++ b/src/main/java/rx/internal/operators/OnSubscribeTimeoutTimedWithFallback.java
+@@ -0,0 +1,227 @@
++/**
++ * Copyright 2014 Netflix, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package rx.internal.operators;
++
++import java.util.concurrent.*;
++import java.util.concurrent.atomic.AtomicLong;
++
++import rx.*;
++import rx.Scheduler.Worker;
++import rx.functions.Action0;
++import rx.internal.producers.ProducerArbiter;
++import rx.internal.subscriptions.SequentialSubscription;
++import rx.plugins.RxJavaHooks;
++
++/**
++ * Switches to consuming a fallback Observable if the main source doesn't signal an onNext event
++ * within the given time frame after subscription or the previous onNext event.
++ *
++ * @param <T> the value type
++ * @since 1.3.3
++ */
++public final class OnSubscribeTimeoutTimedWithFallback<T> implements Observable.OnSubscribe<T> {
++
++    final Observable<T> source;
++
++    final long timeout;
++
++    final TimeUnit unit;
++
++    final Scheduler scheduler;
++
++    final Observable<? extends T> fallback;
++
++    public OnSubscribeTimeoutTimedWithFallback(Observable<T> source, long timeout,
++            TimeUnit unit, Scheduler scheduler,
++            Observable<? extends T> fallback) {
++        this.source = source;
++        this.timeout = timeout;
++        this.unit = unit;
++        this.scheduler = scheduler;
++        this.fallback = fallback;
++    }
++
++    @Override
++    public void call(Subscriber<? super T> t) {
++        TimeoutMainSubscriber<T> parent = new TimeoutMainSubscriber<T>(t, timeout, unit, scheduler.createWorker(), fallback);
++        t.add(parent.upstream);
++        t.setProducer(parent.arbiter);
++        parent.startTimeout(0L);
++        source.subscribe(parent);
++    }
++
++    static final class TimeoutMainSubscriber<T> extends Subscriber<T> {
++
++        final Subscriber<? super T> actual;
++
++        final long timeout;
++
++        final TimeUnit unit;
++
++        final Worker worker;
++
++        final Observable<? extends T> fallback;
++
++        final ProducerArbiter arbiter;
++
++        final AtomicLong index;
++
++        final SequentialSubscription task;
++
++        final SequentialSubscription upstream;
++
++        long consumed;
++
++        TimeoutMainSubscriber(Subscriber<? super T> actual, long timeout,
++                TimeUnit unit, Worker worker,
++                Observable<? extends T> fallback) {
++            this.actual = actual;
++            this.timeout = timeout;
++            this.unit = unit;
++            this.worker = worker;
++            this.fallback = fallback;
++            this.arbiter = new ProducerArbiter();
++            this.index = new AtomicLong();
++            this.task = new SequentialSubscription();
++            this.upstream = new SequentialSubscription(this);
++            this.add(worker);
++            this.add(task);
++        }
++
++
++        @Override
++        public void onNext(T t) {
++            long idx = index.get();
++            if (idx == Long.MAX_VALUE || !index.compareAndSet(idx, idx + 1)) {
++                return;
++            }
++
++            Subscription s = task.get();
++            if (s != null) {
++                s.unsubscribe();
++            }
++
++            consumed++;
++
++            actual.onNext(t);
++
++            startTimeout(idx + 1);
++        }
++
++        void startTimeout(long nextIdx) {
++            task.replace(worker.schedule(new TimeoutTask(nextIdx), timeout, unit));
++        }
++
++        @Override
++        public void onError(Throwable e) {
++            if (index.getAndSet(Long.MAX_VALUE) != Long.MAX_VALUE) {
++                task.unsubscribe();
++
++                actual.onError(e);
++
++                worker.unsubscribe();
++            } else {
++                RxJavaHooks.onError(e);
++            }
++        }
++
++        @Override
++        public void onCompleted() {
++            if (index.getAndSet(Long.MAX_VALUE) != Long.MAX_VALUE) {
++                task.unsubscribe();
++
++                actual.onCompleted();
++
++                worker.unsubscribe();
++            }
++        }
++
++        @Override
++        public void setProducer(Producer p) {
++            arbiter.setProducer(p);
++        }
++
++        void onTimeout(long idx) {
++            if (!index.compareAndSet(idx, Long.MAX_VALUE)) {
++                return;
++            }
++
++            unsubscribe();
++
++            if (fallback == null) {
++                actual.onError(new TimeoutException());
++            } else {
++                long c = consumed;
++                if (c != 0L) {
++                    arbiter.produced(c);
++                }
++
++                FallbackSubscriber<T> fallbackSubscriber = new FallbackSubscriber<T>(actual, arbiter);
++
++                if (upstream.replace(fallbackSubscriber)) {
++                    fallback.subscribe(fallbackSubscriber);
++                }
++            }
++        }
++
++        final class TimeoutTask implements Action0 {
++
++            final long idx;
++
++            TimeoutTask(long idx) {
++                this.idx = idx;
++            }
++
++            @Override
++            public void call() {
++                onTimeout(idx);
++            }
++        }
++    }
++
++    static final class FallbackSubscriber<T> extends Subscriber<T> {
++
++        final Subscriber<? super T> actual;
++
++        final ProducerArbiter arbiter;
++
++        FallbackSubscriber(Subscriber<? super T> actual, ProducerArbiter arbiter) {
++            this.actual = actual;
++            this.arbiter = arbiter;
++        }
++
++        @Override
++        public void onNext(T t) {
++            actual.onNext(t);
++        }
++
++        @Override
++        public void onError(Throwable e) {
++            actual.onError(e);
++        }
++
++        @Override
++        public void onCompleted() {
++            actual.onCompleted();
++        }
++
++        @Override
++        public void setProducer(Producer p) {
++            arbiter.setProducer(p);
++        }
++    }
++}
+diff --git a/src/main/java/rx/internal/operators/OperatorTimeout.java b/src/main/java/rx/internal/operators/OperatorTimeout.java
+deleted file mode 100644
+index 3c74663e80..0000000000
+--- a/src/main/java/rx/internal/operators/OperatorTimeout.java
++++ /dev/null
+@@ -1,58 +0,0 @@
+-/**
+- * Copyright 2014 Netflix, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- * http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package rx.internal.operators;
+-
+-import java.util.concurrent.TimeUnit;
+-
+-import rx.*;
+-import rx.functions.Action0;
+-
+-/**
+- * Applies a timeout policy for each element in the observable sequence, using
+- * the specified scheduler to run timeout timers. If the next element isn't
+- * received within the specified timeout duration starting from its predecessor,
+- * the other observable sequence is used to produce future messages from that
+- * point on.
+- * @param <T> the value type
+- */
+-public final class OperatorTimeout<T> extends OperatorTimeoutBase<T> {
+-
+-    public OperatorTimeout(final long timeout, final TimeUnit timeUnit, Observable<? extends T> other, Scheduler scheduler) {
+-        super(new FirstTimeoutStub<T>() {
+-
+-            @Override
+-            public Subscription call(final TimeoutSubscriber<T> timeoutSubscriber, final Long seqId, Scheduler.Worker inner) {
+-                return inner.schedule(new Action0() {
+-                    @Override
+-                    public void call() {
+-                        timeoutSubscriber.onTimeout(seqId);
+-                    }
+-                }, timeout, timeUnit);
+-            }
+-        }, new TimeoutStub<T>() {
+-
+-            @Override
+-            public Subscription call(final TimeoutSubscriber<T> timeoutSubscriber, final Long seqId, T value, Scheduler.Worker inner) {
+-                return inner.schedule(new Action0() {
+-                    @Override
+-                    public void call() {
+-                        timeoutSubscriber.onTimeout(seqId);
+-                    }
+-                }, timeout, timeUnit);
+-            }
+-        }, other, scheduler);
+-    }
+-}
+diff --git a/src/main/java/rx/internal/operators/OperatorTimeoutBase.java b/src/main/java/rx/internal/operators/OperatorTimeoutBase.java
+deleted file mode 100644
+index 435a60e503..0000000000
+--- a/src/main/java/rx/internal/operators/OperatorTimeoutBase.java
++++ /dev/null
+@@ -1,206 +0,0 @@
+-/**
+- * Copyright 2014 Netflix, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- * http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package rx.internal.operators;
+-
+-import java.util.concurrent.TimeoutException;
+-
+-import rx.*;
+-import rx.Observable.Operator;
+-import rx.functions.*;
+-import rx.internal.producers.ProducerArbiter;
+-import rx.observers.SerializedSubscriber;
+-import rx.subscriptions.SerialSubscription;
+-
+-class OperatorTimeoutBase<T> implements Operator<T, T> {
+-    final FirstTimeoutStub<T> firstTimeoutStub;
+-    final TimeoutStub<T> timeoutStub;
+-    final Observable<? extends T> other;
+-    final Scheduler scheduler;
+-
+-    /**
+-     * Set up the timeout action on the first value.
+-     *
+-     * @param <T>
+-     */
+-    /* package-private */interface FirstTimeoutStub<T> extends
+-            Func3<TimeoutSubscriber<T>, Long, Scheduler.Worker, Subscription> {
+-    }
+-
+-    /**
+-     * Set up the timeout action based on every value
+-     *
+-     * @param <T>
+-     */
+-    /* package-private */interface TimeoutStub<T> extends
+-            Func4<TimeoutSubscriber<T>, Long, T, Scheduler.Worker, Subscription> {
+-    }
+-
+-    /* package-private */OperatorTimeoutBase(FirstTimeoutStub<T> firstTimeoutStub, TimeoutStub<T> timeoutStub, Observable<? extends T> other, Scheduler scheduler) {
+-        this.firstTimeoutStub = firstTimeoutStub;
+-        this.timeoutStub = timeoutStub;
+-        this.other = other;
+-        this.scheduler = scheduler;
+-    }
+-
+-    @Override
+-    public Subscriber<? super T> call(Subscriber<? super T> subscriber) {
+-        Scheduler.Worker inner = scheduler.createWorker();
+-        subscriber.add(inner);
+-        // Use SynchronizedSubscriber for safe memory access
+-        // as the subscriber will be accessed in the current thread or the
+-        // scheduler or other Observables.
+-        final SerializedSubscriber<T> synchronizedSubscriber = new SerializedSubscriber<T>(subscriber);
+-
+-        final SerialSubscription serial = new SerialSubscription();
+-        synchronizedSubscriber.add(serial);
+-
+-        TimeoutSubscriber<T> timeoutSubscriber = new TimeoutSubscriber<T>(synchronizedSubscriber, timeoutStub, serial, other, inner);
+-
+-        synchronizedSubscriber.add(timeoutSubscriber);
+-        synchronizedSubscriber.setProducer(timeoutSubscriber.arbiter);
+-
+-        serial.set(firstTimeoutStub.call(timeoutSubscriber, 0L, inner));
+-
+-        return timeoutSubscriber;
+-    }
+-
+-    /* package-private */static final class TimeoutSubscriber<T> extends
+-            Subscriber<T> {
+-
+-        final SerialSubscription serial;
+-
+-        final SerializedSubscriber<T> serializedSubscriber;
+-
+-        final TimeoutStub<T> timeoutStub;
+-
+-        final Observable<? extends T> other;
+-
+-        final Scheduler.Worker inner;
+-
+-        final ProducerArbiter arbiter;
+-
+-        /** Guarded by this. */
+-        boolean terminated;
+-        /** Guarded by this. */
+-        long actual;
+-
+-        TimeoutSubscriber(
+-                SerializedSubscriber<T> serializedSubscriber,
+-                TimeoutStub<T> timeoutStub, SerialSubscription serial,
+-                Observable<? extends T> other,
+-                Scheduler.Worker inner) {
+-            this.serializedSubscriber = serializedSubscriber;
+-            this.timeoutStub = timeoutStub;
+-            this.serial = serial;
+-            this.other = other;
+-            this.inner = inner;
+-            this.arbiter = new ProducerArbiter();
+-        }
+-
+-        @Override
+-        public void setProducer(Producer p) {
+-            arbiter.setProducer(p);
+-        }
+-
+-        @Override
+-        public void onNext(T value) {
+-            boolean onNextWins = false;
+-            long a;
+-            synchronized (this) {
+-                if (!terminated) {
+-                    a = ++actual;
+-                    onNextWins = true;
+-                } else {
+-                    a = actual;
+-                }
+-            }
+-            if (onNextWins) {
+-                serializedSubscriber.onNext(value);
+-                serial.set(timeoutStub.call(this, a, value, inner));
+-            }
+-        }
+-
+-        @Override
+-        public void onError(Throwable error) {
+-            boolean onErrorWins = false;
+-            synchronized (this) {
+-                if (!terminated) {
+-                    terminated = true;
+-                    onErrorWins = true;
+-                }
+-            }
+-            if (onErrorWins) {
+-                serial.unsubscribe();
+-                serializedSubscriber.onError(error);
+-            }
+-        }
+-
+-        @Override
+-        public void onCompleted() {
+-            boolean onCompletedWins = false;
+-            synchronized (this) {
+-                if (!terminated) {
+-                    terminated = true;
+-                    onCompletedWins = true;
+-                }
+-            }
+-            if (onCompletedWins) {
+-                serial.unsubscribe();
+-                serializedSubscriber.onCompleted();
+-            }
+-        }
+-
+-        public void onTimeout(long seqId) {
+-            long expected = seqId;
+-            boolean timeoutWins = false;
+-            synchronized (this) {
+-                if (expected == actual && !terminated) {
+-                    terminated = true;
+-                    timeoutWins = true;
+-                }
+-            }
+-            if (timeoutWins) {
+-                if (other == null) {
+-                    serializedSubscriber.onError(new TimeoutException());
+-                } else {
+-                    Subscriber<T> second = new Subscriber<T>() {
+-                        @Override
+-                        public void onNext(T t) {
+-                            serializedSubscriber.onNext(t);
+-                        }
+-
+-                        @Override
+-                        public void onError(Throwable e) {
+-                            serializedSubscriber.onError(e);
+-                        }
+-
+-                        @Override
+-                        public void onCompleted() {
+-                            serializedSubscriber.onCompleted();
+-                        }
+-
+-                        @Override
+-                        public void setProducer(Producer p) {
+-                            arbiter.setProducer(p);
+-                        }
+-                    };
+-                    other.unsafeSubscribe(second);
+-                    serial.set(second);
+-                }
+-            }
+-        }
+-    }
+-}
+\ No newline at end of file
+diff --git a/src/main/java/rx/internal/operators/OperatorTimeoutWithSelector.java b/src/main/java/rx/internal/operators/OperatorTimeoutWithSelector.java
+deleted file mode 100644
+index 16034dba6c..0000000000
+--- a/src/main/java/rx/internal/operators/OperatorTimeoutWithSelector.java
++++ /dev/null
+@@ -1,111 +0,0 @@
+-/**
+- * Copyright 2014 Netflix, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- * http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package rx.internal.operators;
+-
+-import rx.*;
+-import rx.exceptions.Exceptions;
+-import rx.functions.*;
+-import rx.schedulers.Schedulers;
+-import rx.subscriptions.Subscriptions;
+-
+-/**
+- * Returns an Observable that mirrors the source Observable. If either the first
+- * item emitted by the source Observable or any subsequent item don't arrive
+- * within time windows defined by provided Observables, switch to the
+- * <code>other</code> Observable if provided, or emit a TimeoutException .
+- * @param <T> the value type of the main Observable
+- * @param <U> the value type of the first timeout Observable
+- * @param <V> the value type of the subsequent timeout Observable
+- */
+-public class OperatorTimeoutWithSelector<T, U, V> extends
+-        OperatorTimeoutBase<T> {
+-
+-    public OperatorTimeoutWithSelector(
+-            final Func0<? extends Observable<U>> firstTimeoutSelector,
+-            final Func1<? super T, ? extends Observable<V>> timeoutSelector,
+-            Observable<? extends T> other) {
+-        super(new FirstTimeoutStub<T>() {
+-
+-            @Override
+-            public Subscription call(
+-                    final TimeoutSubscriber<T> timeoutSubscriber,
+-                    final Long seqId, Scheduler.Worker inner) {
+-                if (firstTimeoutSelector != null) {
+-                    Observable<U> o;
+-                    try {
+-                        o = firstTimeoutSelector.call();
+-                    } catch (Throwable t) {
+-                        Exceptions.throwOrReport(t, timeoutSubscriber);
+-                        return Subscriptions.unsubscribed();
+-                    }
+-                    return o.unsafeSubscribe(new Subscriber<U>() {
+-
+-                        @Override
+-                        public void onCompleted() {
+-                            timeoutSubscriber.onTimeout(seqId);
+-                        }
+-
+-                        @Override
+-                        public void onError(Throwable e) {
+-                            timeoutSubscriber.onError(e);
+-                        }
+-
+-                        @Override
+-                        public void onNext(U t) {
+-                            timeoutSubscriber.onTimeout(seqId);
+-                        }
+-
+-                    });
+-                } else {
+-                    return Subscriptions.unsubscribed();
+-                }
+-            }
+-        }, new TimeoutStub<T>() {
+-
+-            @Override
+-            public Subscription call(
+-                    final TimeoutSubscriber<T> timeoutSubscriber,
+-                    final Long seqId, T value, Scheduler.Worker inner) {
+-                Observable<V> o;
+-                try {
+-                    o = timeoutSelector.call(value);
+-                } catch (Throwable t) {
+-                    Exceptions.throwOrReport(t, timeoutSubscriber);
+-                    return Subscriptions.unsubscribed();
+-                }
+-                return o.unsafeSubscribe(new Subscriber<V>() {
+-
+-                    @Override
+-                    public void onCompleted() {
+-                        timeoutSubscriber.onTimeout(seqId);
+-                    }
+-
+-                    @Override
+-                    public void onError(Throwable e) {
+-                        timeoutSubscriber.onError(e);
+-                    }
+-
+-                    @Override
+-                    public void onNext(V t) {
+-                        timeoutSubscriber.onTimeout(seqId);
+-                    }
+-
+-                });
+-            }
+-        }, other, Schedulers.immediate());
+-    }
+-
+-}
+diff --git a/src/test/java/rx/internal/operators/OperatorTimeoutTests.java b/src/test/java/rx/internal/operators/OperatorTimeoutTests.java
+index fba5b1d6c5..6be7706d0f 100644
+--- a/src/test/java/rx/internal/operators/OperatorTimeoutTests.java
++++ b/src/test/java/rx/internal/operators/OperatorTimeoutTests.java
+@@ -15,21 +15,26 @@
+  */
+ package rx.internal.operators;
+ 
++import static org.junit.Assert.assertEquals;
+ import static org.mockito.Matchers.*;
+ import static org.mockito.Mockito.*;
+ 
+ import java.io.IOException;
++import java.util.*;
+ import java.util.concurrent.*;
+ 
+ import org.junit.*;
+ import org.mockito.*;
+ 
+ import rx.*;
++import rx.Observable;
+ import rx.Observable.OnSubscribe;
+-import rx.functions.Func1;
+-import rx.observers.TestSubscriber;
++import rx.Observer;
++import rx.exceptions.TestException;
++import rx.functions.*;
++import rx.observers.*;
+ import rx.schedulers.TestScheduler;
+-import rx.subjects.PublishSubject;
++import rx.subjects.*;
+ 
+ public class OperatorTimeoutTests {
+     private PublishSubject<String> underlyingSubject;
+@@ -427,4 +432,71 @@ public void withDefaultSchedulerAndOther() {
+         ts.assertNoErrors();
+         ts.assertCompleted();
+     }
++
++    @Test
++    public void disconnectOnTimeout() {
++        final List<String> list = Collections.synchronizedList(new ArrayList<String>());
++
++        TestScheduler sch = new TestScheduler();
++
++        Subject<Long, Long> subject = PublishSubject.create();
++        Observable<Long> initialObservable = subject.share()
++        .map(new Func1<Long, Long>() {
++            @Override
++            public Long call(Long value) {
++                list.add("Received value " + value);
++                return value;
++            }
++        });
++
++        Observable<Long> timeoutObservable = initialObservable
++        .map(new Func1<Long, Long>() {
++            @Override
++            public Long call(Long value) {
++               list.add("Timeout received value " + value);
++               return value;
++            }
++        });
++
++        TestSubscriber<Long> subscriber = new TestSubscriber<Long>();
++        initialObservable
++        .doOnUnsubscribe(new Action0() {
++            @Override
++            public void call() {
++                list.add("Unsubscribed");
++            }
++        })
++        .timeout(1, TimeUnit.SECONDS, timeoutObservable, sch).subscribe(subscriber);
++
++        subject.onNext(5L);
++
++        sch.advanceTimeBy(2, TimeUnit.SECONDS);
++
++        subject.onNext(10L);
++        subject.onCompleted();
++
++        subscriber.awaitTerminalEvent();
++        subscriber.assertNoErrors();
++        subscriber.assertValues(5L, 10L);
++
++        assertEquals(Arrays.asList(
++                "Received value 5",
++                "Unsubscribed",
++                "Received value 10",
++                "Timeout received value 10"
++        ), list);
++    }
++
++    @Test
++    public void fallbackIsError() {
++        TestScheduler sch = new TestScheduler();
++
++        AssertableSubscriber<Object> as = Observable.never()
++                .timeout(1, TimeUnit.SECONDS, Observable.error(new TestException()), sch)
++        .test();
++
++        sch.advanceTimeBy(1, TimeUnit.SECONDS);
++
++        as.assertFailure(TestException.class);
++    }
+ }
+diff --git a/src/test/java/rx/internal/operators/OperatorTimeoutWithSelectorTest.java b/src/test/java/rx/internal/operators/OperatorTimeoutWithSelectorTest.java
+index 50ce9e5865..628d1eca55 100644
+--- a/src/test/java/rx/internal/operators/OperatorTimeoutWithSelectorTest.java
++++ b/src/test/java/rx/internal/operators/OperatorTimeoutWithSelectorTest.java
+@@ -19,7 +19,8 @@
+ import static org.mockito.Matchers.*;
+ import static org.mockito.Mockito.*;
+ 
+-import java.util.Arrays;
++import java.io.IOException;
++import java.util.*;
+ import java.util.concurrent.*;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ 
+@@ -28,13 +29,15 @@
+ import org.mockito.invocation.InvocationOnMock;
+ import org.mockito.stubbing.Answer;
+ 
+-import rx.*;
++import rx.Observable;
+ import rx.Observable.OnSubscribe;
++import rx.Observer;
++import rx.Subscriber;
+ import rx.exceptions.TestException;
+ import rx.functions.*;
+-import rx.observers.TestSubscriber;
+-import rx.schedulers.Schedulers;
+-import rx.subjects.PublishSubject;
++import rx.observers.*;
++import rx.schedulers.*;
++import rx.subjects.*;
+ 
+ public class OperatorTimeoutWithSelectorTest {
+     @Test(timeout = 2000)
+@@ -439,4 +442,169 @@ public void selectorNull() {
+             assertEquals("timeoutSelector is null", ex.getMessage());
+         }
+     }
++
++    @Test
++    public void disconnectOnTimeout() {
++        final List<String> list = Collections.synchronizedList(new ArrayList<String>());
++
++        final TestScheduler sch = new TestScheduler();
++
++        Subject<Long, Long> subject = PublishSubject.create();
++        Observable<Long> initialObservable = subject.share()
++        .map(new Func1<Long, Long>() {
++            @Override
++            public Long call(Long value) {
++                list.add("Received value " + value);
++                return value;
++            }
++        });
++
++        Observable<Long> timeoutObservable = initialObservable
++        .map(new Func1<Long, Long>() {
++            @Override
++            public Long call(Long value) {
++               list.add("Timeout received value " + value);
++               return value;
++            }
++        });
++
++        TestSubscriber<Long> subscriber = new TestSubscriber<Long>();
++        initialObservable
++        .doOnUnsubscribe(new Action0() {
++            @Override
++            public void call() {
++                list.add("Unsubscribed");
++            }
++        })
++        .timeout(
++                new Func0<Observable<Long>>() {
++                    @Override
++                    public Observable<Long> call() {
++                        return Observable.timer(1, TimeUnit.SECONDS, sch);
++                    }
++                },
++                new Func1<Long, Observable<Long>>() {
++                    @Override
++                    public Observable<Long> call(Long v) {
++                        return Observable.timer(1, TimeUnit.SECONDS, sch);
++                    }
++                },
++                timeoutObservable).subscribe(subscriber);
++
++        subject.onNext(5L);
++
++        sch.advanceTimeBy(2, TimeUnit.SECONDS);
++
++        subject.onNext(10L);
++        subject.onCompleted();
++
++        subscriber.awaitTerminalEvent();
++        subscriber.assertNoErrors();
++        subscriber.assertValues(5L, 10L);
++
++        assertEquals(Arrays.asList(
++                "Received value 5",
++                "Unsubscribed",
++                "Received value 10",
++                "Timeout received value 10"
++        ), list);
++    }
++
++    @Test
++    public void fallbackIsError() {
++        final TestScheduler sch = new TestScheduler();
++
++        AssertableSubscriber<Object> as = Observable.never()
++                .timeout(new Func0<Observable<Long>>() {
++                    @Override
++                    public Observable<Long> call() {
++                        return Observable.timer(1, TimeUnit.SECONDS, sch);
++                    }
++                },
++                new Func1<Object, Observable<Long>>() {
++                    @Override
++                    public Observable<Long> call(Object v) {
++                        return Observable.timer(1, TimeUnit.SECONDS, sch);
++                    }
++                }, Observable.error(new TestException()))
++        .test();
++
++        sch.advanceTimeBy(1, TimeUnit.SECONDS);
++
++        as.assertFailure(TestException.class);
++    }
++
++    @Test
++    public void mainErrors() {
++        final TestScheduler sch = new TestScheduler();
++
++        AssertableSubscriber<Object> as = Observable.error(new IOException())
++                .timeout(new Func0<Observable<Long>>() {
++                    @Override
++                    public Observable<Long> call() {
++                        return Observable.timer(1, TimeUnit.SECONDS, sch);
++                    }
++                },
++                new Func1<Object, Observable<Long>>() {
++                    @Override
++                    public Observable<Long> call(Object v) {
++                        return Observable.timer(1, TimeUnit.SECONDS, sch);
++                    }
++                }, Observable.error(new TestException()))
++        .test();
++
++        as.assertFailure(IOException.class);
++
++        sch.advanceTimeBy(1, TimeUnit.SECONDS);
++
++        as.assertFailure(IOException.class);
++    }
++
++    @Test
++    public void timeoutCompletesWithFallback() {
++        final TestScheduler sch = new TestScheduler();
++
++        AssertableSubscriber<Object> as = Observable.never()
++                .timeout(new Func0<Observable<Long>>() {
++                    @Override
++                    public Observable<Long> call() {
++                        return Observable.timer(1, TimeUnit.SECONDS, sch).ignoreElements();
++                    }
++                },
++                new Func1<Object, Observable<Long>>() {
++                    @Override
++                    public Observable<Long> call(Object v) {
++                        return Observable.timer(1, TimeUnit.SECONDS, sch);
++                    }
++                }, Observable.just(1))
++        .test();
++
++        sch.advanceTimeBy(1, TimeUnit.SECONDS);
++
++        as.assertResult(1);
++    }
++
++    @Test
++    public void nullItemTimeout() {
++        final TestScheduler sch = new TestScheduler();
++
++        AssertableSubscriber<Integer> as = Observable.just(1).concatWith(Observable.<Integer>never())
++                .timeout(new Func0<Observable<Long>>() {
++                    @Override
++                    public Observable<Long> call() {
++                        return Observable.timer(1, TimeUnit.SECONDS, sch).ignoreElements();
++                    }
++                },
++                new Func1<Object, Observable<Long>>() {
++                    @Override
++                    public Observable<Long> call(Object v) {
++                        return null;
++                    }
++                }, Observable.just(1))
++        .test();
++
++        sch.advanceTimeBy(1, TimeUnit.SECONDS);
++
++        as.assertFailureAndMessage(NullPointerException.class, "The itemTimeoutIndicator returned a null Observable", 1);
++    }
+ }

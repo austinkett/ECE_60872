@@ -1,0 +1,478 @@
+diff --git a/core/src/main/java/org/elasticsearch/index/engine/Engine.java b/core/src/main/java/org/elasticsearch/index/engine/Engine.java
+index 0e112118da83..aefaf9dc1b99 100644
+--- a/core/src/main/java/org/elasticsearch/index/engine/Engine.java
++++ b/core/src/main/java/org/elasticsearch/index/engine/Engine.java
+@@ -336,13 +336,25 @@ public final GetResult get(Get get) throws EngineException {
+      * @see Searcher#close()
+      */
+     public final Searcher acquireSearcher(String source) throws EngineException {
++        return acquireSearcher(source, getSearcherManager());
++    }
++
++    /**
++     * Returns a new searcher instance from the specified {@link SearcherManager}. The consumer of this
++     * API is responsible for releasing the returned seacher in a
++     * safe manner, preferably in a try/finally block.
++     *
++     * @see Searcher#close()
++     */
++    protected final Searcher acquireSearcher(String source, SearcherManager manager) throws EngineException {
++        assert manager != null;
++
+         boolean success = false;
+          /* Acquire order here is store -> manager since we need
+           * to make sure that the store is not closed before
+           * the searcher is acquired. */
+         store.incRef();
+         try {
+-            final SearcherManager manager = getSearcherManager(); // can never be null
+             /* This might throw NPE but that's fine we will run ensureOpen()
+             *  in the catch block and throw the right exception */
+             final IndexSearcher searcher = manager.acquire();
+diff --git a/core/src/main/java/org/elasticsearch/index/engine/InternalEngine.java b/core/src/main/java/org/elasticsearch/index/engine/InternalEngine.java
+index 74cac49b76d6..e793f79f4ac1 100644
+--- a/core/src/main/java/org/elasticsearch/index/engine/InternalEngine.java
++++ b/core/src/main/java/org/elasticsearch/index/engine/InternalEngine.java
+@@ -100,8 +100,13 @@
+     private final IndexWriter indexWriter;
+ 
+     private final SearcherFactory searcherFactory;
++
++    // Used to make recent indexing changes visible to incoming searches:
+     private final SearcherManager searcherManager;
+ 
++    // Used to move indexing buffer to disk w/o making searches see the changes:
++    private final SearcherManager internalSearcherManager;
++
+     private final Lock flushLock = new ReentrantLock();
+     private final ReentrantLock optimizeLock = new ReentrantLock();
+ 
+@@ -128,8 +133,9 @@ public InternalEngine(EngineConfig engineConfig, boolean skipInitialTranslogReco
+         store.incRef();
+         IndexWriter writer = null;
+         Translog translog = null;
+-        SearcherManager manager = null;
+         EngineMergeScheduler scheduler = null;
++        SearcherManager searcherManager = null;
++        SearcherManager internalSearcherManager = null;
+         boolean success = false;
+         try {
+             this.lastDeleteVersionPruneTimeMSec = engineConfig.getThreadPool().estimatedTimeInMillis();
+@@ -161,15 +167,20 @@ public InternalEngine(EngineConfig engineConfig, boolean skipInitialTranslogReco
+                 }
+             }
+             this.translog = translog;
+-            manager = createSearcherManager();
+-            this.searcherManager = manager;
+-            this.versionMap.setManager(searcherManager);
++            searcherManager = createSearcherManager();
++            this.searcherManager = searcherManager;
++
++            internalSearcherManager = createSearcherManager();
++            this.internalSearcherManager = internalSearcherManager;
++
++            this.versionMap.setManager(internalSearcherManager);
+             try {
+                 if (skipInitialTranslogRecovery) {
+                     // make sure we point at the latest translog from now on..
+                     commitIndexWriter(writer, translog, lastCommittedSegmentInfos.getUserData().get(SYNC_COMMIT_ID));
+                 } else {
+                     recoverFromTranslog(engineConfig, translogGeneration);
++                    // IndexShard.finalizeRecovery will refresh() us, so we don't here
+                 }
+             } catch (IOException | EngineException ex) {
+                 throw new EngineCreationFailureException(shardId, "failed to recover from translog", ex);
+@@ -177,7 +188,7 @@ public InternalEngine(EngineConfig engineConfig, boolean skipInitialTranslogReco
+             success = true;
+         } finally {
+             if (success == false) {
+-                IOUtils.closeWhileHandlingException(writer, translog, manager, scheduler);
++                IOUtils.closeWhileHandlingException(writer, translog, searcherManager, internalSearcherManager, scheduler);
+                 versionMap.clear();
+                 if (isClosed.get() == false) {
+                     // failure we need to dec the store reference
+@@ -285,14 +296,15 @@ protected void recoverFromTranslog(EngineConfig engineConfig, Translog.TranslogG
+     }
+ 
+     private SearcherManager createSearcherManager() throws EngineException {
+-        boolean success = false;
++        DirectoryReader directoryReader = null;
+         SearcherManager searcherManager = null;
+         try {
+             try {
+-                final DirectoryReader directoryReader = ElasticsearchDirectoryReader.wrap(DirectoryReader.open(indexWriter, true), shardId);
++                directoryReader = ElasticsearchDirectoryReader.wrap(DirectoryReader.open(indexWriter, true), shardId);
+                 searcherManager = new SearcherManager(directoryReader, searcherFactory);
+-                lastCommittedSegmentInfos = readLastCommittedSegmentInfos(searcherManager, store);
+-                success = true;
++                if (lastCommittedSegmentInfos == null) {
++                    lastCommittedSegmentInfos = readLastCommittedSegmentInfos(searcherManager, store);
++                }
+                 return searcherManager;
+             } catch (IOException e) {
+                 maybeFailEngine("start", e);
+@@ -304,8 +316,8 @@ private SearcherManager createSearcherManager() throws EngineException {
+                 throw new EngineCreationFailureException(shardId, "failed to open reader on writer", e);
+             }
+         } finally {
+-            if (success == false) { // release everything we created on a failure
+-                IOUtils.closeWhileHandlingException(searcherManager, indexWriter);
++            if (searcherManager == null) { // release everything we created on a failure
++                IOUtils.closeWhileHandlingException(directoryReader, indexWriter);
+             }
+         }
+     }
+@@ -330,13 +342,19 @@ public GetResult get(Get get, Function<String, Searcher> searcherFactory) throws
+                         return new GetResult(true, versionValue.version(), op.getSource());
+                     }
+                 }
+-            }
+ 
+-            // no version, get the version from the index, we know that we refresh on flush
+-            return getFromSearcher(get, searcherFactory);
++                return getFromSearcher(get, this::acquireInternalSearcher);
++            } else {
++                // no version, get the version from the index, we know that we refresh on flush
++                return getFromSearcher(get, searcherFactory);
++            }
+         }
+     }
+ 
++    private final Searcher acquireInternalSearcher(String source) throws EngineException {
++        return acquireSearcher(source, internalSearcherManager);
++    }
++
+     @Override
+     public boolean index(Index index) {
+         final boolean created;
+@@ -495,6 +513,8 @@ public void refresh(String source) throws EngineException {
+         try (ReleasableLock lock = readLock.acquire()) {
+             ensureOpen();
+             searcherManager.maybeRefreshBlocking();
++            IndexSearcher s = searcherManager.acquire();
++            searcherManager.release(s);
+         } catch (AlreadyClosedException e) {
+             ensureOpen();
+             maybeFailEngine("refresh", e);
+@@ -505,7 +525,29 @@ public void refresh(String source) throws EngineException {
+             throw new RefreshFailedEngineException(shardId, t);
+         }
+ 
+-        // TODO: maybe we should just put a scheduled job in threadPool?
++        mergeScheduler.refreshConfig();
++
++        // we must also refresh our internal searcher, so that a subsequent real-time get (which uses internal searcher) comes from the
++        // index and not xlog:
++        refreshInternal();
++    }
++
++    private void refreshInternal() throws EngineException {
++        // we obtain a read lock here, since we don't want a flush to happen while we are refreshing
++        // since it flushes the index as well (though, in terms of concurrency, we are allowed to do it)
++        try (ReleasableLock lock = readLock.acquire()) {
++            ensureOpen();
++            internalSearcherManager.maybeRefreshBlocking();
++        } catch (AlreadyClosedException e) {
++            ensureOpen();
++            maybeFailEngine("refreshInternal", e);
++        } catch (EngineClosedException e) {
++            throw e;
++        } catch (Throwable t) {
++            failEngine("refreshInternal failed", t);
++            throw new RefreshFailedEngineException(shardId, t);
++        }
++
+         // We check for pruning in each delete request, but we also prune here e.g. in case a delete burst comes in and then no more deletes
+         // for a long time:
+         maybePruneDeletedTombstones();
+@@ -532,7 +574,7 @@ public void writeIndexingBuffer() throws EngineException {
+                 // The version map is using > 25% of the indexing buffer, so we do a refresh so the version map also clears
+                 logger.debug("use refresh to write indexing buffer (heap size=[{}]), to also clear version map (heap size=[{}])",
+                              new ByteSizeValue(indexingBufferBytes), new ByteSizeValue(versionMapBytes));
+-                refresh("write indexing buffer");
++                refreshInternal();
+             } else {
+                 // Most of our heap is used by the indexing buffer, so we do a cheaper (just writes segments, doesn't open a new searcher) IW.flush:
+                 logger.debug("use IndexWriter.flush to write indexing buffer (heap size=[{}]) since version map is small (heap size=[{}])",
+@@ -599,9 +641,6 @@ final boolean tryRenewSyncCommit() {
+             maybeFailEngine("renew sync commit", ex);
+             throw new EngineException(shardId, "failed to renew sync commit", ex);
+         }
+-        if (renewed) { // refresh outside of the write lock
+-            refresh("renew sync commit");
+-        }
+ 
+         return renewed;
+     }
+@@ -643,7 +682,7 @@ public CommitId flush(boolean force, boolean waitIfOngoing) throws EngineExcepti
+                         commitIndexWriter(indexWriter, translog);
+                         logger.trace("finished commit for flush");
+                         // we need to refresh in order to clear older version values
+-                        refresh("version_table_flush");
++                        refreshInternal();
+                         // after refresh documents can be retrieved from the index so we can now commit the translog
+                         translog.commit();
+                     } catch (Throwable e) {
+@@ -691,7 +730,7 @@ private void pruneDeletedTombstones() {
+ 
+         // TODO: not good that we reach into LiveVersionMap here; can we move this inside VersionMap instead?  problem is the dirtyLock...
+ 
+-        // we only need to prune the deletes map; the current/old version maps are cleared on refresh:
++        // we only need to prune the deletes map; the current/old version maps are cleared on refreshInternal:
+         for (Map.Entry<BytesRef, VersionValue> entry : versionMap.getAllTombstones()) {
+             BytesRef uid = entry.getKey();
+             synchronized (dirtyLock(uid)) { // can we do it without this lock on each value? maybe batch to a set and get the lock once per set?
+@@ -865,6 +904,11 @@ protected final void closeNoLock(String reason) {
+                 } catch (Throwable t) {
+                     logger.warn("Failed to close SearcherManager", t);
+                 }
++                try {
++                    IOUtils.close(internalSearcherManager);
++                } catch (Throwable t) {
++                    logger.warn("Failed to close internal SearcherManager", t);
++                }
+                 try {
+                     IOUtils.close(translog);
+                 } catch (Throwable t) {
+@@ -902,8 +946,11 @@ private Object dirtyLock(Term uid) {
+     }
+ 
+     private long loadCurrentVersionFromIndex(Term uid) throws IOException {
+-        try (final Searcher searcher = acquireSearcher("load_version")) {
+-            return Versions.loadVersion(searcher.reader(), uid);
++        IndexSearcher searcher = internalSearcherManager.acquire();
++        try {
++            return Versions.loadVersion(searcher.getIndexReader(), uid);
++        } finally {
++            internalSearcherManager.release(searcher);
+         }
+     }
+ 
+@@ -1112,7 +1159,7 @@ public synchronized void afterMerge(OnGoingMerge merge) {
+                     @Override
+                     public void onFailure(Throwable t) {
+                         if (isClosed.get() == false) {
+-                            logger.warn("failed to flush after merge has finished");
++                            logger.warn("failed to flush after merge has finished", t);
+                         }
+                     }
+ 
+diff --git a/core/src/test/java/org/elasticsearch/action/admin/indices/segments/IndicesSegmentsRequestTests.java b/core/src/test/java/org/elasticsearch/action/admin/indices/segments/IndicesSegmentsRequestTests.java
+index a2b4d97235df..1eb734f3c4c5 100644
+--- a/core/src/test/java/org/elasticsearch/action/admin/indices/segments/IndicesSegmentsRequestTests.java
++++ b/core/src/test/java/org/elasticsearch/action/admin/indices/segments/IndicesSegmentsRequestTests.java
+@@ -47,6 +47,7 @@ public void setupIndex() {
+             client().prepareIndex("test", "type1", id).setSource("text", "sometext").get();
+         }
+         client().admin().indices().prepareFlush("test").setWaitIfOngoing(true).get();
++        client().admin().indices().prepareRefresh("test").get();
+     }
+ 
+     public void testBasic() {
+diff --git a/core/src/test/java/org/elasticsearch/bwcompat/OldIndexBackwardsCompatibilityIT.java b/core/src/test/java/org/elasticsearch/bwcompat/OldIndexBackwardsCompatibilityIT.java
+index 1518f2ebc3a0..37a9f2175008 100644
+--- a/core/src/test/java/org/elasticsearch/bwcompat/OldIndexBackwardsCompatibilityIT.java
++++ b/core/src/test/java/org/elasticsearch/bwcompat/OldIndexBackwardsCompatibilityIT.java
+@@ -425,6 +425,7 @@ void assertUpgradeWorks(String indexName, boolean alreadyLatest) throws Exceptio
+             UpgradeIT.assertNotUpgraded(client(), indexName);
+         }
+         assertNoFailures(client().admin().indices().prepareUpgrade(indexName).get());
++        refresh(indexName);
+         UpgradeIT.assertUpgraded(client(), indexName);
+     }
+ 
+diff --git a/core/src/test/java/org/elasticsearch/get/GetActionIT.java b/core/src/test/java/org/elasticsearch/get/GetActionIT.java
+index cce4c0d22c42..7d95df36428b 100644
+--- a/core/src/test/java/org/elasticsearch/get/GetActionIT.java
++++ b/core/src/test/java/org/elasticsearch/get/GetActionIT.java
+@@ -127,8 +127,9 @@ public void testSimpleGet() {
+         assertThat(response.getField("field1").getValues().get(0).toString(), equalTo("value1"));
+         assertThat(response.getField("field2"), nullValue());
+ 
+-        logger.info("--> flush the index, so we load it from it");
++        logger.info("--> flush and refresh the index, so we load it from it");
+         flush();
++        refresh();
+ 
+         logger.info("--> realtime get 1 (loaded from index)");
+         response = client().prepareGet(indexOrAlias(), "type1", "1").get();
+diff --git a/core/src/test/java/org/elasticsearch/index/engine/InternalEngineTests.java b/core/src/test/java/org/elasticsearch/index/engine/InternalEngineTests.java
+index 56affa3db23c..579ad757868e 100644
+--- a/core/src/test/java/org/elasticsearch/index/engine/InternalEngineTests.java
++++ b/core/src/test/java/org/elasticsearch/index/engine/InternalEngineTests.java
+@@ -1037,6 +1037,7 @@ public void testForceMerge() throws IOException {
+                 assertEquals(numDocs, test.reader().numDocs());
+             }
+             engine.forceMerge(true, 1, false, false, false);
++            engine.refresh("test");
+             assertEquals(engine.segments(true).size(), 1);
+ 
+             ParsedDocument doc = testParsedDocument(Integer.toString(0), Integer.toString(0), "test", null, -1, -1, testDocument(), B_1, null);
+@@ -1044,6 +1045,7 @@ public void testForceMerge() throws IOException {
+             engine.delete(new Engine.Delete(index.type(), index.id(), index.uid()));
+             engine.forceMerge(true, 10, true, false, false); //expunge deletes
+ 
++            engine.refresh("test");
+             assertEquals(engine.segments(true).size(), 1);
+             try (Engine.Searcher test = engine.acquireSearcher("test")) {
+                 assertEquals(numDocs - 1, test.reader().numDocs());
+@@ -1055,6 +1057,7 @@ public void testForceMerge() throws IOException {
+             engine.delete(new Engine.Delete(index.type(), index.id(), index.uid()));
+             engine.forceMerge(true, 10, false, false, false); //expunge deletes
+ 
++            engine.refresh("test");
+             assertEquals(engine.segments(true).size(), 1);
+             try (Engine.Searcher test = engine.acquireSearcher("test")) {
+                 assertEquals(numDocs - 2, test.reader().numDocs());
+@@ -1651,6 +1654,7 @@ public void testTranslogReplayWithFailure() throws IOException {
+             // no mock directory, no fun.
+             engine = createEngine(store, primaryTranslogDir);
+         }
++        engine.refresh("test");
+         try (Engine.Searcher searcher = engine.acquireSearcher("test")) {
+             TopDocs topDocs = searcher.searcher().search(new MatchAllDocsQuery(), randomIntBetween(numDocs, numDocs + 10));
+             assertThat(topDocs.totalHits, equalTo(numDocs));
+@@ -1807,6 +1811,7 @@ public void testTranslogReplay() throws IOException {
+         engine.close();
+         engine.config().setCreate(false);
+         engine = new InternalEngine(engine.config(), false); // we need to reuse the engine config unless the parser.mappingModified won't work
++        engine.refresh("test");
+ 
+         try (Engine.Searcher searcher = engine.acquireSearcher("test")) {
+             TopDocs topDocs = searcher.searcher().search(new MatchAllDocsQuery(), randomIntBetween(numDocs, numDocs + 10));
+@@ -1853,6 +1858,7 @@ public void testTranslogReplay() throws IOException {
+ 
+         engine.close();
+         engine = createEngine(store, primaryTranslogDir);
++        engine.refresh("test");
+         try (Engine.Searcher searcher = engine.acquireSearcher("test")) {
+             TopDocs topDocs = searcher.searcher().search(new MatchAllDocsQuery(), numDocs + 1);
+             assertThat(topDocs.totalHits, equalTo(numDocs + 1));
+@@ -1861,11 +1867,10 @@ public void testTranslogReplay() throws IOException {
+         assertEquals(flush ? 1 : 2, parser.recoveredOps.get());
+         engine.delete(new Engine.Delete("test", Integer.toString(randomId), newUid(uuidValue)));
+         if (randomBoolean()) {
+-            engine.refresh("test");
+-        } else {
+             engine.close();
+             engine = createEngine(store, primaryTranslogDir);
+         }
++        engine.refresh("test");
+         try (Engine.Searcher searcher = engine.acquireSearcher("test")) {
+             TopDocs topDocs = searcher.searcher().search(new MatchAllDocsQuery(), numDocs);
+             assertThat(topDocs.totalHits, equalTo(numDocs));
+@@ -1947,6 +1952,7 @@ public void testRecoverFromForeignTranslog() throws IOException {
+         }
+ 
+         engine = createEngine(store, primaryTranslogDir); // and recover again!
++        engine.refresh("test");
+         try (Engine.Searcher searcher = engine.acquireSearcher("test")) {
+             TopDocs topDocs = searcher.searcher().search(new MatchAllDocsQuery(), randomIntBetween(numDocs, numDocs + 10));
+             assertThat(topDocs.totalHits, equalTo(numDocs));
+diff --git a/core/src/test/java/org/elasticsearch/indices/stats/IndexStatsIT.java b/core/src/test/java/org/elasticsearch/indices/stats/IndexStatsIT.java
+index c6dbff842ef6..f51acb0f754e 100644
+--- a/core/src/test/java/org/elasticsearch/indices/stats/IndexStatsIT.java
++++ b/core/src/test/java/org/elasticsearch/indices/stats/IndexStatsIT.java
+@@ -538,6 +538,7 @@ public void testSegmentsStats() {
+ 
+         client().admin().indices().prepareFlush().get();
+         client().admin().indices().prepareForceMerge().setMaxNumSegments(1).execute().actionGet();
++        refresh("test1");
+         stats = client().admin().indices().prepareStats().setSegments(true).get();
+ 
+         assertThat(stats.getTotal().getSegments(), notNullValue());
+diff --git a/core/src/test/java/org/elasticsearch/search/child/ChildQuerySearchIT.java b/core/src/test/java/org/elasticsearch/search/child/ChildQuerySearchIT.java
+index 45be05c10d88..dfc053bc82b6 100644
+--- a/core/src/test/java/org/elasticsearch/search/child/ChildQuerySearchIT.java
++++ b/core/src/test/java/org/elasticsearch/search/child/ChildQuerySearchIT.java
+@@ -515,6 +515,7 @@ public void testHasChildAndHasParentFailWhenSomeSegmentsDontContainAnyParentOrCh
+         client().prepareIndex("test", "parent", "1").setSource("p_field", 1).get();
+         client().prepareIndex("test", "child", "1").setParent("1").setSource("c_field", 1).get();
+         client().admin().indices().prepareFlush("test").get();
++        refresh("test");
+ 
+         client().prepareIndex("test", "type1", "1").setSource("p_field", 1).get();
+         client().admin().indices().prepareFlush("test").get();
+@@ -778,6 +779,7 @@ public void testHasChildAndHasParentFilter_withFilter() throws Exception {
+ 
+         client().prepareIndex("test", "type1", "3").setSource("p_field", 2).get();
+         client().admin().indices().prepareFlush("test").get();
++        refresh("test");
+ 
+         SearchResponse searchResponse = client().prepareSearch("test")
+                 .setQuery(boolQuery().must(matchAllQuery()).filter(hasChildQuery("child", termQuery("c_field", 1)))).get();
+diff --git a/core/src/test/java/org/elasticsearch/search/nested/SimpleNestedIT.java b/core/src/test/java/org/elasticsearch/search/nested/SimpleNestedIT.java
+index 618900928312..af8d32b46ed5 100644
+--- a/core/src/test/java/org/elasticsearch/search/nested/SimpleNestedIT.java
++++ b/core/src/test/java/org/elasticsearch/search/nested/SimpleNestedIT.java
+@@ -78,8 +78,9 @@ public void testSimpleNested() throws Exception {
+                 .endObject()).execute().actionGet();
+ 
+         waitForRelocation(ClusterHealthStatus.GREEN);
+-        // flush, so we fetch it from the index (as see that we filter nested docs)
++        // flush and refresh, so we fetch it from the index (as see that we filter nested docs)
+         flush();
++        refresh();
+         GetResponse getResponse = client().prepareGet("test", "type1", "1").get();
+         assertThat(getResponse.isExists(), equalTo(true));
+         assertThat(getResponse.getSourceAsBytes(), notNullValue());
+@@ -124,8 +125,9 @@ public void testSimpleNested() throws Exception {
+                 .endArray()
+                 .endObject()).execute().actionGet();
+         waitForRelocation(ClusterHealthStatus.GREEN);
+-        // flush, so we fetch it from the index (as see that we filter nested docs)
++        // flush and refresh, so we fetch it from the index (as see that we filter nested docs)
+         flush();
++        refresh();
+         assertDocumentCount("test", 6);
+ 
+         searchResponse = client().prepareSearch("test").setQuery(nestedQuery("nested1",
+@@ -149,8 +151,8 @@ public void testSimpleNested() throws Exception {
+         DeleteResponse deleteResponse = client().prepareDelete("test", "type1", "2").execute().actionGet();
+         assertThat(deleteResponse.isFound(), equalTo(true));
+ 
+-        // flush, so we fetch it from the index (as see that we filter nested docs)
+-        flush();
++        // refresh, so we fetch it from the index (as see that we filter nested docs)
++        refresh();
+         assertDocumentCount("test", 3);
+ 
+         searchResponse = client().prepareSearch("test").setQuery(nestedQuery("nested1", termQuery("nested1.n_field1", "n_value1_1"))).execute().actionGet();
+@@ -181,8 +183,9 @@ public void testMultiNested() throws Exception {
+                 .endArray()
+                 .endObject()).execute().actionGet();
+ 
+-        // flush, so we fetch it from the index (as see that we filter nested docs)
++        // flush and refresh, so we fetch it from the index (as see that we filter nested docs)
+         flush();
++        refresh();
+         GetResponse getResponse = client().prepareGet("test", "type1", "1").execute().actionGet();
+         assertThat(getResponse.isExists(), equalTo(true));
+         waitForRelocation(ClusterHealthStatus.GREEN);
+@@ -1057,14 +1060,10 @@ public void testCheckFixedBitSetCache() throws Exception {
+         assertThat(clusterStatsResponse.getIndicesStats().getSegments().getBitsetMemoryInBytes(), equalTo(0l));
+     }
+ 
+-    /**
+-     */
+     private void assertDocumentCount(String index, long numdocs) {
+         IndicesStatsResponse stats = admin().indices().prepareStats(index).clear().setDocs(true).get();
+         assertNoFailures(stats);
+         assertThat(stats.getIndex(index).getPrimaries().docs.getCount(), is(numdocs));
+ 
+     }
+-
+-
+ }
+diff --git a/modules/lang-groovy/src/test/java/org/elasticsearch/messy/tests/IndexedScriptTests.java b/modules/lang-groovy/src/test/java/org/elasticsearch/messy/tests/IndexedScriptTests.java
+index a3a786a140e3..b131782d02a7 100644
+--- a/modules/lang-groovy/src/test/java/org/elasticsearch/messy/tests/IndexedScriptTests.java
++++ b/modules/lang-groovy/src/test/java/org/elasticsearch/messy/tests/IndexedScriptTests.java
+@@ -114,6 +114,7 @@ public void testUpdateScripts() {
+         ensureGreen("test_index");
+         client().prepareIndex("test_index", "test_type", "1").setSource("{\"foo\":\"bar\"}").get();
+         flush("test_index");
++        refresh("test_index");
+ 
+         int iterations = randomIntBetween(2, 11);
+         for (int i = 1; i < iterations; i++) {

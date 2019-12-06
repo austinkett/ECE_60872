@@ -1,0 +1,531 @@
+diff --git a/docs/reference/query-dsl/span-multi-term-query.asciidoc b/docs/reference/query-dsl/span-multi-term-query.asciidoc
+index b41906b56507..ff7af83451be 100644
+--- a/docs/reference/query-dsl/span-multi-term-query.asciidoc
++++ b/docs/reference/query-dsl/span-multi-term-query.asciidoc
+@@ -36,3 +36,11 @@ GET /_search
+ }
+ --------------------------------------------------
+ // CONSOLE
++
++WARNING: By default `span_multi queries are rewritten to a `span_or` query
++containing **all** the expanded terms. This can be expensive if the number of expanded
++terms is large. To avoid an unbounded expansion you can set the
++<<query-dsl-multi-term-rewrite,rewrite method>> of the multi term query to `top_terms_*`
++rewrite. Or, if you use `span_multi` on `prefix` query only, you can
++activate the <<index-prefix-config,`index_prefixes`>> field option of the `text` field instead. This will
++rewrite any prefix query on the field to a a single term query that matches the indexed prefix.
+\ No newline at end of file
+diff --git a/rest-api-spec/src/main/resources/rest-api-spec/test/search/190_index_prefix_search.yml b/rest-api-spec/src/main/resources/rest-api-spec/test/search/190_index_prefix_search.yml
+index 963bed70750a..dfe0b6825cdc 100644
+--- a/rest-api-spec/src/main/resources/rest-api-spec/test/search/190_index_prefix_search.yml
++++ b/rest-api-spec/src/main/resources/rest-api-spec/test/search/190_index_prefix_search.yml
+@@ -1,8 +1,8 @@
+----
+-"search with index prefixes":
++setup:
+   - skip:
+-      version: " - 6.99.99"
++      version: " - 6.2.99"
+       reason: index_prefixes is only available as of 6.3.0
++
+   - do:
+       indices.create:
+         index:  test
+@@ -27,6 +27,11 @@
+       indices.refresh:
+         index: [test]
+ 
++---
++"search with index prefixes":
++  - skip:
++      version: " - 6.2.99"
++      reason: index_prefixes is only available as of 6.3.0
+   - do:
+       search:
+         index: test
+@@ -57,3 +62,23 @@
+ 
+   - match: {hits.total: 1}
+   - match: {hits.hits.0._score: 1}
++
++---
++"search index prefixes with span_multi":
++  - skip:
++      version: " - 6.99.99"
++      reason: span_multi throws an exception with prefix fields on < versions
++
++  - do:
++      search:
++        index: test
++        body:
++          query:
++            span_near:
++              clauses: [
++                { "span_term": { "text": "short" } },
++                { "span_multi": { "match": { "prefix": { "text": "word" } } } }
++              ]
++
++  - match: {hits.total: 1}
++
+diff --git a/server/src/main/java/org/elasticsearch/index/mapper/TextFieldMapper.java b/server/src/main/java/org/elasticsearch/index/mapper/TextFieldMapper.java
+index d2ba5fbc0c2d..29f1cbb721fe 100644
+--- a/server/src/main/java/org/elasticsearch/index/mapper/TextFieldMapper.java
++++ b/server/src/main/java/org/elasticsearch/index/mapper/TextFieldMapper.java
+@@ -40,6 +40,7 @@
+ import org.apache.lucene.search.PhraseQuery;
+ import org.apache.lucene.search.Query;
+ import org.apache.lucene.search.TermQuery;
++import org.elasticsearch.Version;
+ import org.elasticsearch.common.collect.Iterators;
+ import org.elasticsearch.common.logging.ESLoggerFactory;
+ import org.elasticsearch.common.settings.Settings;
+@@ -175,7 +176,16 @@ public TextFieldMapper build(BuilderContext context) {
+                 if (fieldType().isSearchable() == false) {
+                     throw new IllegalArgumentException("Cannot set index_prefixes on unindexed field [" + name() + "]");
+                 }
+-                if (fieldType.indexOptions() == IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS) {
++                // Copy the index options of the main field to allow phrase queries on
++                // the prefix field.
++                if (context.indexCreatedVersion().onOrAfter(Version.V_6_4_0)) {
++                    if (fieldType.indexOptions() == IndexOptions.DOCS_AND_FREQS) {
++                        // frequencies are not needed because prefix queries always use a constant score
++                        prefixFieldType.setIndexOptions(IndexOptions.DOCS);
++                    } else {
++                        prefixFieldType.setIndexOptions(fieldType.indexOptions());
++                    }
++                } else if (fieldType.indexOptions() == IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS) {
+                     prefixFieldType.setIndexOptions(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS);
+                 }
+                 if (fieldType.storeTermVectorOffsets()) {
+diff --git a/server/src/main/java/org/elasticsearch/index/query/SpanMultiTermQueryBuilder.java b/server/src/main/java/org/elasticsearch/index/query/SpanMultiTermQueryBuilder.java
+index 4f102b58616f..b574cadc423b 100644
+--- a/server/src/main/java/org/elasticsearch/index/query/SpanMultiTermQueryBuilder.java
++++ b/server/src/main/java/org/elasticsearch/index/query/SpanMultiTermQueryBuilder.java
+@@ -18,18 +18,28 @@
+  */
+ package org.elasticsearch.index.query;
+ 
++import org.apache.lucene.index.Term;
+ import org.apache.lucene.search.BoostQuery;
++import org.apache.lucene.search.ConstantScoreQuery;
+ import org.apache.lucene.search.MultiTermQuery;
++import org.apache.lucene.search.PrefixQuery;
+ import org.apache.lucene.search.Query;
++import org.apache.lucene.search.TermQuery;
++import org.apache.lucene.search.spans.FieldMaskingSpanQuery;
+ import org.apache.lucene.search.spans.SpanBoostQuery;
+ import org.apache.lucene.search.spans.SpanMultiTermQueryWrapper;
+ import org.apache.lucene.search.spans.SpanQuery;
++import org.apache.lucene.search.spans.SpanTermQuery;
++import org.elasticsearch.Version;
+ import org.elasticsearch.common.ParseField;
+ import org.elasticsearch.common.ParsingException;
+ import org.elasticsearch.common.io.stream.StreamInput;
+ import org.elasticsearch.common.io.stream.StreamOutput;
++import org.elasticsearch.common.xcontent.LoggingDeprecationHandler;
+ import org.elasticsearch.common.xcontent.XContentBuilder;
+ import org.elasticsearch.common.xcontent.XContentParser;
++import org.elasticsearch.index.mapper.TextFieldMapper;
++import org.elasticsearch.index.query.support.QueryParsers;
+ 
+ import java.io.IOException;
+ import java.util.Objects;
+@@ -124,22 +134,67 @@ public static SpanMultiTermQueryBuilder fromXContent(XContentParser parser) thro
+     protected Query doToQuery(QueryShardContext context) throws IOException {
+         Query subQuery = multiTermQueryBuilder.toQuery(context);
+         float boost = AbstractQueryBuilder.DEFAULT_BOOST;
+-        if (subQuery instanceof BoostQuery) {
+-            BoostQuery boostQuery = (BoostQuery) subQuery;
+-            subQuery = boostQuery.getQuery();
+-            boost = boostQuery.getBoost();
++        while (true) {
++            if (subQuery instanceof ConstantScoreQuery) {
++                subQuery = ((ConstantScoreQuery) subQuery).getQuery();
++                boost = 1;
++            } else if (subQuery instanceof BoostQuery) {
++                BoostQuery boostQuery = (BoostQuery) subQuery;
++                subQuery = boostQuery.getQuery();
++                boost *= boostQuery.getBoost();
++            } else {
++                break;
++            }
+         }
+-        //no MultiTermQuery extends SpanQuery, so SpanBoostQuery is not supported here
++        final SpanQuery spanQuery;
++        // no MultiTermQuery extends SpanQuery, so SpanBoostQuery is not supported here
+         assert subQuery instanceof SpanBoostQuery == false;
+-        if (subQuery instanceof MultiTermQuery == false) {
+-            throw new UnsupportedOperationException("unsupported inner query, should be " + MultiTermQuery.class.getName() +" but was "
+-                    + subQuery.getClass().getName());
++        if (subQuery instanceof TermQuery) {
++            /**
++             * Text fields that index prefixes can rewrite prefix queries
++             * into term queries. See {@link TextFieldMapper.TextFieldType#prefixQuery}.
++             */
++            if (multiTermQueryBuilder.getClass() != PrefixQueryBuilder.class) {
++                throw new UnsupportedOperationException("unsupported inner query generated by " +
++                    multiTermQueryBuilder.getClass().getName() + ", should be " + MultiTermQuery.class.getName()
++                    + " but was " + subQuery.getClass().getName());
++            }
++            if (context.getIndexSettings().getIndexVersionCreated().before(Version.V_6_4_0)) {
++                /**
++                 * Indices created in this version do not index positions on the prefix field
++                 * so we cannot use it to match positional queries. Instead, we explicitly create the prefix
++                 * query on the main field to avoid the rewrite.
++                 */
++                PrefixQueryBuilder prefixBuilder = (PrefixQueryBuilder) multiTermQueryBuilder;
++                PrefixQuery prefixQuery = new PrefixQuery(new Term(prefixBuilder.fieldName(), prefixBuilder.value()));
++                if (prefixBuilder.rewrite() != null) {
++                    MultiTermQuery.RewriteMethod rewriteMethod =
++                        QueryParsers.parseRewriteMethod(prefixBuilder.rewrite(), null, LoggingDeprecationHandler.INSTANCE);
++                    prefixQuery.setRewriteMethod(rewriteMethod);
++                }
++                spanQuery = new SpanMultiTermQueryWrapper<>(prefixQuery);
++            } else {
++                String origFieldName = ((PrefixQueryBuilder) multiTermQueryBuilder).fieldName();
++                SpanTermQuery spanTermQuery = new SpanTermQuery(((TermQuery) subQuery).getTerm());
++                /**
++                 * Prefixes are indexed in a different field so we mask the term query with the original field
++                 * name. This is required because span_near and span_or queries don't work across different field.
++                 * The masking is safe because the prefix field is indexed using the same content than the original field
++                 * and the prefix analyzer preserves positions.
++                 */
++                spanQuery = new FieldMaskingSpanQuery(spanTermQuery, origFieldName);
++            }
++        } else {
++            if (subQuery instanceof MultiTermQuery == false) {
++                throw new UnsupportedOperationException("unsupported inner query, should be "
++                    + MultiTermQuery.class.getName() + " but was " + subQuery.getClass().getName());
++            }
++            spanQuery = new SpanMultiTermQueryWrapper<>((MultiTermQuery) subQuery);
+         }
+-        SpanQuery wrapper = new SpanMultiTermQueryWrapper<>((MultiTermQuery) subQuery);
+         if (boost != AbstractQueryBuilder.DEFAULT_BOOST) {
+-            wrapper = new SpanBoostQuery(wrapper, boost);
++            return new SpanBoostQuery(spanQuery, boost);
+         }
+-        return wrapper;
++        return spanQuery;
+     }
+ 
+     @Override
+diff --git a/server/src/test/java/org/elasticsearch/index/mapper/TextFieldMapperTests.java b/server/src/test/java/org/elasticsearch/index/mapper/TextFieldMapperTests.java
+index b7da270a15ab..ed8274fad05d 100644
+--- a/server/src/test/java/org/elasticsearch/index/mapper/TextFieldMapperTests.java
++++ b/server/src/test/java/org/elasticsearch/index/mapper/TextFieldMapperTests.java
+@@ -37,6 +37,7 @@
+ import org.apache.lucene.search.Query;
+ import org.apache.lucene.search.TermQuery;
+ import org.apache.lucene.util.BytesRef;
++import org.elasticsearch.Version;
+ import org.elasticsearch.action.index.IndexRequest;
+ import org.elasticsearch.common.Strings;
+ import org.elasticsearch.common.bytes.BytesReference;
+@@ -638,7 +639,7 @@ public void testIndexPrefixIndexTypes() throws IOException {
+                 .field("type", "text")
+                 .field("analyzer", "english")
+                 .startObject("index_prefixes").endObject()
+-                .field("index_options", "positions")
++                .field("index_options", "freqs")
+                 .endObject().endObject().endObject().endObject());
+ 
+             DocumentMapper mapper = parser.parse("type", new CompressedXContent(mapping));
+@@ -649,6 +650,27 @@ public void testIndexPrefixIndexTypes() throws IOException {
+             assertFalse(ft.storeTermVectors());
+         }
+ 
++        {
++            String mapping = Strings.toString(XContentFactory.jsonBuilder().startObject().startObject("type")
++                .startObject("properties").startObject("field")
++                .field("type", "text")
++                .field("analyzer", "english")
++                .startObject("index_prefixes").endObject()
++                .field("index_options", "positions")
++                .endObject().endObject().endObject().endObject());
++
++            DocumentMapper mapper = parser.parse("type", new CompressedXContent(mapping));
++
++            FieldMapper prefix = mapper.mappers().getMapper("field._index_prefix");
++            FieldType ft = prefix.fieldType;
++            if (indexService.getIndexSettings().getIndexVersionCreated().onOrAfter(Version.V_6_4_0)) {
++                assertEquals(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS, ft.indexOptions());
++            } else {
++                assertEquals(IndexOptions.DOCS, ft.indexOptions());
++            }
++            assertFalse(ft.storeTermVectors());
++        }
++
+         {
+             String mapping = Strings.toString(XContentFactory.jsonBuilder().startObject().startObject("type")
+                 .startObject("properties").startObject("field")
+@@ -662,7 +684,11 @@ public void testIndexPrefixIndexTypes() throws IOException {
+ 
+             FieldMapper prefix = mapper.mappers().getMapper("field._index_prefix");
+             FieldType ft = prefix.fieldType;
+-            assertEquals(IndexOptions.DOCS, ft.indexOptions());
++            if (indexService.getIndexSettings().getIndexVersionCreated().onOrAfter(Version.V_6_4_0)) {
++                assertEquals(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS, ft.indexOptions());
++            } else {
++                assertEquals(IndexOptions.DOCS, ft.indexOptions());
++            }
+             assertTrue(ft.storeTermVectorOffsets());
+         }
+ 
+@@ -679,7 +705,11 @@ public void testIndexPrefixIndexTypes() throws IOException {
+ 
+             FieldMapper prefix = mapper.mappers().getMapper("field._index_prefix");
+             FieldType ft = prefix.fieldType;
+-            assertEquals(IndexOptions.DOCS, ft.indexOptions());
++            if (indexService.getIndexSettings().getIndexVersionCreated().onOrAfter(Version.V_6_4_0)) {
++                assertEquals(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS, ft.indexOptions());
++            } else {
++                assertEquals(IndexOptions.DOCS, ft.indexOptions());
++            }
+             assertFalse(ft.storeTermVectorOffsets());
+         }
+     }
+diff --git a/server/src/test/java/org/elasticsearch/index/query/SpanMultiTermQueryBuilderTests.java b/server/src/test/java/org/elasticsearch/index/query/SpanMultiTermQueryBuilderTests.java
+index 50371ced0e02..b77816823597 100644
+--- a/server/src/test/java/org/elasticsearch/index/query/SpanMultiTermQueryBuilderTests.java
++++ b/server/src/test/java/org/elasticsearch/index/query/SpanMultiTermQueryBuilderTests.java
+@@ -22,24 +22,46 @@
+ import org.apache.lucene.index.Term;
+ import org.apache.lucene.search.BoostQuery;
+ import org.apache.lucene.search.MultiTermQuery;
++import org.apache.lucene.search.PrefixQuery;
+ import org.apache.lucene.search.Query;
+ import org.apache.lucene.search.TermQuery;
++import org.apache.lucene.search.spans.FieldMaskingSpanQuery;
+ import org.apache.lucene.search.spans.SpanBoostQuery;
+ import org.apache.lucene.search.spans.SpanMultiTermQueryWrapper;
+ import org.apache.lucene.search.spans.SpanQuery;
++import org.apache.lucene.search.spans.SpanTermQuery;
++import org.elasticsearch.Version;
++import org.elasticsearch.common.Strings;
++import org.elasticsearch.common.compress.CompressedXContent;
+ import org.elasticsearch.common.io.stream.StreamOutput;
+-import org.elasticsearch.common.xcontent.ToXContent;
++import org.elasticsearch.common.settings.Settings;
+ import org.elasticsearch.common.xcontent.XContentBuilder;
++import org.elasticsearch.index.mapper.MapperService;
+ import org.elasticsearch.search.internal.SearchContext;
+ import org.elasticsearch.test.AbstractQueryTestCase;
+ 
+ import java.io.IOException;
+ 
++import static org.elasticsearch.common.xcontent.XContentFactory.jsonBuilder;
+ import static org.hamcrest.CoreMatchers.containsString;
+ import static org.hamcrest.CoreMatchers.equalTo;
+ import static org.hamcrest.CoreMatchers.instanceOf;
++import static org.hamcrest.CoreMatchers.either;
+ 
+ public class SpanMultiTermQueryBuilderTests extends AbstractQueryTestCase<SpanMultiTermQueryBuilder> {
++    @Override
++    protected void initializeAdditionalMappings(MapperService mapperService) throws IOException {
++        XContentBuilder mapping = jsonBuilder().startObject().startObject("_doc").startObject("properties")
++            .startObject("prefix_field")
++                .field("type", "text")
++                .startObject("index_prefixes").endObject()
++            .endObject()
++            .endObject().endObject().endObject();
++
++        mapperService.merge("_doc",
++            new CompressedXContent(Strings.toString(mapping)), MapperService.MergeReason.MAPPING_UPDATE);
++    }
++
+     @Override
+     protected SpanMultiTermQueryBuilder doCreateTestQueryBuilder() {
+         MultiTermQueryBuilder multiTermQueryBuilder = RandomQueryBuilder.createMultiTermQuery(random());
+@@ -62,14 +84,67 @@ protected void doAssertLuceneQuery(SpanMultiTermQueryBuilder queryBuilder, Query
+             BoostQuery boostQuery = (BoostQuery) multiTermQuery;
+             multiTermQuery = boostQuery.getQuery();
+         }
+-        assertThat(multiTermQuery, instanceOf(MultiTermQuery.class));
+-        assertThat(spanMultiTermQueryWrapper.getWrappedQuery(), equalTo(new SpanMultiTermQueryWrapper<>((MultiTermQuery)multiTermQuery).getWrappedQuery()));
++        assertThat(multiTermQuery, either(instanceOf(MultiTermQuery.class)).or(instanceOf(TermQuery.class)));
++        assertThat(spanMultiTermQueryWrapper.getWrappedQuery(),
++            equalTo(new SpanMultiTermQueryWrapper<>((MultiTermQuery)multiTermQuery).getWrappedQuery()));
+     }
+ 
+     public void testIllegalArgument() {
+         expectThrows(IllegalArgumentException.class, () -> new SpanMultiTermQueryBuilder((MultiTermQueryBuilder) null));
+     }
+ 
++    private static class TermMultiTermQueryBuilder implements MultiTermQueryBuilder {
++        @Override
++        public Query toQuery(QueryShardContext context) throws IOException {
++            return new TermQuery(new Term("foo", "bar"));
++        }
++
++        @Override
++        public Query toFilter(QueryShardContext context) throws IOException {
++            return toQuery(context);
++        }
++
++        @Override
++        public QueryBuilder queryName(String queryName) {
++            return this;
++        }
++
++        @Override
++        public String queryName() {
++            return "foo";
++        }
++
++        @Override
++        public float boost() {
++            return 1f;
++        }
++
++        @Override
++        public QueryBuilder boost(float boost) {
++            return this;
++        }
++
++        @Override
++        public String getName() {
++            return "foo";
++        }
++
++        @Override
++        public String getWriteableName() {
++            return "foo";
++        }
++
++        @Override
++        public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
++            return builder;
++        }
++
++        @Override
++        public void writeTo(StreamOutput out) throws IOException {
++
++        }
++    }
++
+     /**
+      * test checks that we throw an {@link UnsupportedOperationException} if the query wrapped
+      * by {@link SpanMultiTermQueryBuilder} does not generate a lucene {@link MultiTermQuery}.
+@@ -77,69 +152,70 @@ public void testIllegalArgument() {
+      * to a date.
+      */
+     public void testUnsupportedInnerQueryType() throws IOException {
+-        MultiTermQueryBuilder query = new MultiTermQueryBuilder() {
+-            @Override
+-            public Query toQuery(QueryShardContext context) throws IOException {
+-                return new TermQuery(new Term("foo", "bar"));
+-            }
+-
+-            @Override
+-            public Query toFilter(QueryShardContext context) throws IOException {
+-                return toQuery(context);
+-            }
+-
+-            @Override
+-            public QueryBuilder queryName(String queryName) {
+-                return this;
+-            }
+-
+-            @Override
+-            public String queryName() {
+-                return "foo";
+-            }
+-
+-            @Override
+-            public float boost() {
+-                return 1f;
+-            }
+-
+-            @Override
+-            public QueryBuilder boost(float boost) {
+-                return this;
+-            }
+-
+-            @Override
+-            public String getName() {
+-                return "foo";
+-            }
+-
+-            @Override
+-            public String getWriteableName() {
+-                return "foo";
+-            }
+-
+-            @Override
+-            public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
+-                return builder;
+-            }
+-
+-            @Override
+-            public void writeTo(StreamOutput out) throws IOException {
+-
+-            }
+-        };
++        MultiTermQueryBuilder query = new TermMultiTermQueryBuilder();
+         SpanMultiTermQueryBuilder spamMultiTermQuery = new SpanMultiTermQueryBuilder(query);
+         UnsupportedOperationException e = expectThrows(UnsupportedOperationException.class,
+                 () -> spamMultiTermQuery.toQuery(createShardContext()));
+-        assertThat(e.getMessage(), containsString("unsupported inner query, should be " + MultiTermQuery.class.getName()));
++        assertThat(e.getMessage(), containsString("unsupported inner query generated by " + TermMultiTermQueryBuilder.class.getName() +
++            ", should be " + MultiTermQuery.class.getName()));
+     }
+ 
+     public void testToQueryInnerSpanMultiTerm() throws IOException {
++
+         Query query = new SpanOrQueryBuilder(createTestQueryBuilder()).toQuery(createShardContext());
+         //verify that the result is still a span query, despite the boost that might get set (SpanBoostQuery rather than BoostQuery)
+         assertThat(query, instanceOf(SpanQuery.class));
+     }
+ 
++    public void testToQueryInnerTermQuery() throws IOException {
++        final QueryShardContext context = createShardContext();
++        if (context.getIndexSettings().getIndexVersionCreated().onOrAfter(Version.V_6_4_0)) {
++            Query query = new SpanMultiTermQueryBuilder(new PrefixQueryBuilder("prefix_field", "foo"))
++                .toQuery(context);
++            assertThat(query, instanceOf(FieldMaskingSpanQuery.class));
++            FieldMaskingSpanQuery fieldSpanQuery = (FieldMaskingSpanQuery) query;
++            assertThat(fieldSpanQuery.getField(), equalTo("prefix_field"));
++            assertThat(fieldSpanQuery.getMaskedQuery(), instanceOf(SpanTermQuery.class));
++            SpanTermQuery spanTermQuery = (SpanTermQuery) fieldSpanQuery.getMaskedQuery();
++            assertThat(spanTermQuery.getTerm().text(), equalTo("foo"));
++
++            query = new SpanMultiTermQueryBuilder(new PrefixQueryBuilder("prefix_field", "foo"))
++                .boost(2.0f)
++                .toQuery(context);
++            assertThat(query, instanceOf(SpanBoostQuery.class));
++            SpanBoostQuery boostQuery = (SpanBoostQuery) query;
++            assertThat(boostQuery.getBoost(), equalTo(2.0f));
++            assertThat(boostQuery.getQuery(), instanceOf(FieldMaskingSpanQuery.class));
++            fieldSpanQuery = (FieldMaskingSpanQuery) boostQuery.getQuery();
++            assertThat(fieldSpanQuery.getField(), equalTo("prefix_field"));
++            assertThat(fieldSpanQuery.getMaskedQuery(), instanceOf(SpanTermQuery.class));
++            spanTermQuery = (SpanTermQuery) fieldSpanQuery.getMaskedQuery();
++            assertThat(spanTermQuery.getTerm().text(), equalTo("foo"));
++        } else {
++            Query query = new SpanMultiTermQueryBuilder(new PrefixQueryBuilder("prefix_field", "foo"))
++                .toQuery(context);
++            assertThat(query, instanceOf(SpanMultiTermQueryWrapper.class));
++            SpanMultiTermQueryWrapper wrapper = (SpanMultiTermQueryWrapper) query;
++            assertThat(wrapper.getWrappedQuery(), instanceOf(PrefixQuery.class));
++            PrefixQuery prefixQuery = (PrefixQuery) wrapper.getWrappedQuery();
++            assertThat(prefixQuery.getField(), equalTo("prefix_field"));
++            assertThat(prefixQuery.getPrefix().text(), equalTo("foo"));
++
++            query = new SpanMultiTermQueryBuilder(new PrefixQueryBuilder("prefix_field", "foo"))
++                .boost(2.0f)
++                .toQuery(context);
++            assertThat(query, instanceOf(SpanBoostQuery.class));
++            SpanBoostQuery boostQuery = (SpanBoostQuery) query;
++            assertThat(boostQuery.getBoost(), equalTo(2.0f));
++            assertThat(boostQuery.getQuery(), instanceOf(SpanMultiTermQueryWrapper.class));
++            wrapper = (SpanMultiTermQueryWrapper) boostQuery.getQuery();
++            assertThat(wrapper.getWrappedQuery(), instanceOf(PrefixQuery.class));
++            prefixQuery = (PrefixQuery) wrapper.getWrappedQuery();
++            assertThat(prefixQuery.getField(), equalTo("prefix_field"));
++            assertThat(prefixQuery.getPrefix().text(), equalTo("foo"));
++        }
++    }
++
+     public void testFromJson() throws IOException {
+         String json =
+                 "{\n" +

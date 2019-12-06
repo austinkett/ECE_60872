@@ -1,0 +1,186 @@
+diff --git a/numpy/core/src/common/npy_longdouble.c b/numpy/core/src/common/npy_longdouble.c
+index 561f4b825d9..c580e0cce9a 100644
+--- a/numpy/core/src/common/npy_longdouble.c
++++ b/numpy/core/src/common/npy_longdouble.c
+@@ -6,6 +6,7 @@
+ #include "numpy/ndarraytypes.h"
+ #include "numpy/npy_math.h"
+ #include "npy_pycompat.h"
++#include "numpyos.h"
+ 
+ /*
+  * Heavily derived from PyLong_FromDouble
+@@ -94,3 +95,84 @@ npy_longdouble_to_PyLong(npy_longdouble ldval)
+     Py_DECREF(l_chunk_size);
+     return v;
+ }
++
++/* Helper function to get unicode(PyLong).encode('utf8') */
++static PyObject *
++_PyLong_Bytes(PyObject *long_obj) {
++    PyObject *bytes;
++#if defined(NPY_PY3K)
++    PyObject *unicode = PyObject_Str(long_obj);
++    if (unicode == NULL) {
++        return NULL;
++    }
++    bytes = PyUnicode_AsUTF8String(unicode);
++    Py_DECREF(unicode);
++#else
++    bytes = PyObject_Str(long_obj);
++#endif
++    return bytes;
++}
++
++
++/**
++ * TODO: currently a hack that converts the long through a string. This is
++ * correct, but slow.
++ *
++ * Another approach would be to do this numerically, in a similar way to
++ * PyLong_AsDouble.
++ * However, in order to respect rounding modes correctly, this needs to know
++ * the size of the mantissa, which is platform-dependent.
++ */
++NPY_VISIBILITY_HIDDEN npy_longdouble
++npy_longdouble_from_PyLong(PyObject *long_obj) {
++    npy_longdouble result = 1234;
++    char *end;
++    char *cstr;
++    PyObject *bytes;
++
++    /* convert the long to a string */
++    bytes = _PyLong_Bytes(long_obj);
++    if (bytes == NULL) {
++        return -1;
++    }
++
++    cstr = PyBytes_AsString(bytes);
++    if (cstr == NULL) {
++        goto fail;
++    }
++    end = NULL;
++
++    /* convert the string to a long double and capture errors */
++    errno = 0;
++    result = NumPyOS_ascii_strtold(cstr, &end);
++    if (errno == ERANGE) {
++        /* strtold returns INFINITY of the correct sign. */
++        if (PyErr_Warn(PyExc_RuntimeWarning,
++                "overflow encountered in conversion from python long") < 0) {
++            goto fail;
++        }
++    }
++    else if (errno) {
++        PyErr_Format(PyExc_RuntimeError,
++                     "Could not parse python long as longdouble: %s (%s)",
++                     cstr,
++                     strerror(errno));
++        goto fail;
++    }
++
++    /* Extra characters at the end of the string, or nothing parsed */
++    if (end == cstr || *end != '\0') {
++        PyErr_Format(PyExc_RuntimeError,
++                     "Could not parse long as longdouble: %s",
++                     cstr);
++        goto fail;
++    }
++
++    /* finally safe to decref now that we're done with `end` */
++    Py_DECREF(bytes);
++    return result;
++
++fail:
++    Py_DECREF(bytes);
++    return -1;
++}
+diff --git a/numpy/core/src/common/npy_longdouble.h b/numpy/core/src/common/npy_longdouble.h
+index 036b530709c..01db06de76f 100644
+--- a/numpy/core/src/common/npy_longdouble.h
++++ b/numpy/core/src/common/npy_longdouble.h
+@@ -14,4 +14,14 @@
+ NPY_VISIBILITY_HIDDEN PyObject *
+ npy_longdouble_to_PyLong(npy_longdouble ldval);
+ 
++/* Convert a python `long` integer to a npy_longdouble
++ *
++ * This performs the same task as PyLong_AsDouble, but for long doubles
++ * which have a greater range.
++ *
++ * Returns -1 if an error occurs.
++ */
++NPY_VISIBILITY_HIDDEN npy_longdouble
++npy_longdouble_from_PyLong(PyObject *long_obj);
++
+ #endif
+diff --git a/numpy/core/src/multiarray/arraytypes.c.src b/numpy/core/src/multiarray/arraytypes.c.src
+index 49819ca4a5e..afa44a627c6 100644
+--- a/numpy/core/src/multiarray/arraytypes.c.src
++++ b/numpy/core/src/multiarray/arraytypes.c.src
+@@ -30,6 +30,7 @@
+ #include <emmintrin.h>
+ #endif
+ 
++#include "npy_longdouble.h"
+ #include "numpyos.h"
+ #include <string.h>
+ 
+@@ -328,6 +329,17 @@ string_to_long_double(PyObject*op)
+     npy_longdouble temp;
+     PyObject* b;
+ 
++    /* Convert python long objects to a longdouble, without precision or range
++     * loss via a double.
++     */
++    if ((PyLong_Check(op) && !PyBool_Check(op))
++#if !defined(NPY_PY3K)
++        || (PyInt_Check(op) && !PyBool_Check(op))
++#endif
++    ) {
++        return npy_longdouble_from_PyLong(op);
++    }
++
+     if (PyUnicode_Check(op)) {
+         b = PyUnicode_AsUTF8String(op);
+         if (!b) {
+diff --git a/numpy/core/tests/test_longdouble.py b/numpy/core/tests/test_longdouble.py
+index cf50d5d5c6e..ee4197f8f7a 100644
+--- a/numpy/core/tests/test_longdouble.py
++++ b/numpy/core/tests/test_longdouble.py
+@@ -1,5 +1,6 @@
+ from __future__ import division, absolute_import, print_function
+ 
++import warnings
+ import pytest
+ 
+ import numpy as np
+@@ -205,3 +206,28 @@ def test_fromstring_foreign_sep(self):
+     def test_fromstring_foreign_value(self):
+         b = np.fromstring("1,234", dtype=np.longdouble, sep=" ")
+         assert_array_equal(b[0], 1)
++
++@pytest.mark.parametrize("int_val", [
++    # cases discussed in gh-10723
++    # and gh-9968
++    2 ** 1024, 0])
++def test_longdouble_from_int(int_val):
++    # for issue gh-9968
++    str_val = str(int_val)
++    # we'll expect a RuntimeWarning on platforms
++    # with np.longdouble equivalent to np.double
++    # for large integer input
++    with warnings.catch_warnings(record=True) as w:
++        warnings.filterwarnings('always', '', RuntimeWarning)
++        # can be inf==inf on some platforms
++        assert np.longdouble(int_val) == np.longdouble(str_val)
++        # we can't directly compare the int and
++        # max longdouble value on all platforms
++        if np.allclose(np.finfo(np.longdouble).max,
++                       np.finfo(np.double).max) and w:
++            assert w[0].category is RuntimeWarning
++
++@pytest.mark.parametrize("bool_val", [
++    True, False])
++def test_longdouble_from_bool(bool_val):
++    assert np.longdouble(bool_val) == np.longdouble(int(bool_val))

@@ -1,0 +1,224 @@
+diff --git a/numpy/core/include/numpy/npy_common.h b/numpy/core/include/numpy/npy_common.h
+index 64aaaacff8c..5498f1157fc 100644
+--- a/numpy/core/include/numpy/npy_common.h
++++ b/numpy/core/include/numpy/npy_common.h
+@@ -86,6 +86,13 @@
+ #define NPY_UNLIKELY(x) (x)
+ #endif
+ 
++
++#ifdef HAVE___BUILTIN_UNREACHABLE
++#define NPY_UNREACHABLE() __builtin_unreachable()
++#else
++#define NPY_UNREACHABLE()
++#endif
++
+ #ifdef HAVE___BUILTIN_PREFETCH
+ /* unlike _mm_prefetch also works on non-x86 */
+ #define NPY_PREFETCH(x, rw, loc) __builtin_prefetch((x), (rw), (loc))
+diff --git a/numpy/core/setup_common.py b/numpy/core/setup_common.py
+index f837df11217..0ca919557f5 100644
+--- a/numpy/core/setup_common.py
++++ b/numpy/core/setup_common.py
+@@ -133,6 +133,7 @@ def check_api_version(apiversion, codegen_dir):
+                        ("__builtin_bswap32", '5u'),
+                        ("__builtin_bswap64", '5u'),
+                        ("__builtin_expect", '5, 0'),
++                       ("__builtin_unreachable", ''),
+                        ("__builtin_mul_overflow", '5, 5, (int*)5'),
+                        # broken on OSX 10.11, make sure its not optimized away
+                        ("volatile int r = __builtin_cpu_supports", '"sse"',
+diff --git a/numpy/core/src/multiarray/compiled_base.c b/numpy/core/src/multiarray/compiled_base.c
+index 118cf375407..a3600423045 100644
+--- a/numpy/core/src/multiarray/compiled_base.c
++++ b/numpy/core/src/multiarray/compiled_base.c
+@@ -471,6 +471,64 @@ binary_search_with_guess(const npy_double key, const npy_double *arr,
+ 
+ #undef LIKELY_IN_CACHE_SIZE
+ 
++/**
++ * Special case for producing the correct result when the naive one is NaN.
++ *
++ * x0, x1: the x bounds of the segment to interpolate
++ * y0, y1: the y bounds of the segment to interpolate
++ *
++ * Assumes that:
++ *  - naive interpolation gives NaN
++ *  - `!(x0 >= x) && !(x >= x1)`, which implies x is finite and so irrelevant
++ */
++NPY_NO_EXPORT double
++_non_finite_interp(double x0, double x1, double y0, double y1) {
++    if (npy_isfinite(x0) && npy_isfinite(x1)) {
++        /** infinities of opposite sign, or any nans */
++        if (npy_isnan(y0 + y1)) {
++            return NPY_NAN;
++        }
++        else if (y0 == NPY_INFINITY || y1 == NPY_INFINITY) {
++            return NPY_INFINITY;
++        }
++        else if (y0 == -NPY_INFINITY || y1 == -NPY_INFINITY) {
++            return -NPY_INFINITY;
++        }
++        else if (npy_isfinite(y0) && npy_isfinite(y1)) {
++            // Can't do better than the naive result - perhaps it overflowed.
++            return NPY_NAN;
++        }
++        else {
++            assert(0);
++            NPY_UNREACHABLE(); // by inspection
++        }
++    }
++    else if (npy_isfinite(y0) && npy_isfinite(y1)) {
++        /** infinities of opposite sign, or any nans */
++        if (npy_isnan(x0 + x1)) {
++            return NPY_NAN;
++        }
++        /* assumption: x is finite, so pick the finite bound */
++        else if (x0 == -NPY_INFINITY) {
++            return y1;
++        }
++        else if (x1 == NPY_INFINITY) {
++            return y0;
++        }
++        else {
++            /* implies x0 == x1 == +-INF which is forbidden by the
++             * preconditions
++             */
++            assert(0);
++            return NPY_NAN;
++        }
++    }
++    else {
++        /* infinities in both axes => undefined slope */
++        return NPY_NAN;
++    }
++}
++
+ NPY_NO_EXPORT PyObject *
+ arr_interp(PyObject *NPY_UNUSED(self), PyObject *args, PyObject *kwdict)
+ {
+@@ -606,6 +664,12 @@ arr_interp(PyObject *NPY_UNUSED(self), PyObject *args, PyObject *kwdict)
+                 const npy_double slope = (slopes != NULL) ? slopes[j] :
+                                          (dy[j+1] - dy[j]) / (dx[j+1] - dx[j]);
+                 dres[i] = slope*(x_val - dx[j]) + dy[j];
++                /* Sometimes nan should be some other value */
++                if (npy_isnan(dres[i])) {
++                    dres[i] = _non_finite_interp(
++                        dx[j], dx[j+1], dy[j], dy[j+1]
++                    );
++                }
+             }
+         }
+ 
+@@ -788,6 +852,18 @@ arr_interp_complex(PyObject *NPY_UNUSED(self), PyObject *args, PyObject *kwdict)
+ 
+                 dres[i].real = slope.real*(x_val - dx[j]) + dy[j].real;
+                 dres[i].imag = slope.imag*(x_val - dx[j]) + dy[j].imag;
++
++                /* Sometimes nan should be some other value */
++                if (npy_isnan(dres[i].real)) {
++                    dres[i].real = _non_finite_interp(
++                        dx[j], dx[j+1], dy[j].real, dy[j+1].real
++                    );
++                }
++                if (npy_isnan(dres[i].imag)) {
++                    dres[i].imag = _non_finite_interp(
++                        dx[j], dx[j+1], dy[j].imag, dy[j+1].imag
++                    );
++                }
+             }
+         }
+ 
+diff --git a/numpy/lib/tests/test_function_base.py b/numpy/lib/tests/test_function_base.py
+index d9a97db1b21..50551334d65 100644
+--- a/numpy/lib/tests/test_function_base.py
++++ b/numpy/lib/tests/test_function_base.py
+@@ -33,6 +33,17 @@ def get_mat(n):
+     return data
+ 
+ 
++def _make_complex(real, imag):
++    """
++    Like real + 1j * imag, but behaves as expected when imag contains non-finite
++    values
++    """
++    ret = np.zeros(np.broadcast(real, imag).shape, np.complex_)
++    ret.real = real
++    ret.imag = imag
++    return ret
++
++
+ class TestRot90(object):
+     def test_basic(self):
+         assert_raises(ValueError, rot90, np.ones(4))
+@@ -2354,7 +2365,7 @@ def test_scalar_interpolation_point(self):
+         x0 = np.nan
+         assert_almost_equal(np.interp(x0, x, y), x0)
+ 
+-    def test_non_finite_behavior(self):
++    def test_non_finite_behavior_exact_x(self):
+         x = [1, 2, 2.5, 3, 4]
+         xp = [1, 2, 3, 4]
+         fp = [1, 2, np.inf, 4]
+@@ -2362,6 +2373,61 @@ def test_non_finite_behavior(self):
+         fp = [1, 2, np.nan, 4]
+         assert_almost_equal(np.interp(x, xp, fp), [1, 2, np.nan, np.nan, 4])
+ 
++    @pytest.fixture(params=[
++        lambda x: np.float_(x),
++        lambda x: _make_complex(x, 0),
++        lambda x: _make_complex(0, x),
++        lambda x: _make_complex(x, np.multiply(x, -2))
++    ], ids=[
++        'real',
++        'complex-real',
++        'complex-imag',
++        'complex-both'
++    ])
++    def sc(self, request):
++        """ scale function used by the below tests """
++        return request.param
++
++    def test_non_finite_any_nan(self, sc):
++        """ test that nans are propagated """
++        assert_equal(np.interp(0.5, [np.nan,      1], sc([     0,     10])), sc(np.nan))
++        assert_equal(np.interp(0.5, [     0, np.nan], sc([     0,     10])), sc(np.nan))
++        assert_equal(np.interp(0.5, [     0,      1], sc([np.nan,     10])), sc(np.nan))
++        assert_equal(np.interp(0.5, [     0,      1], sc([     0, np.nan])), sc(np.nan))
++
++    def test_non_finite_inf(self, sc):
++        """ Test that interp between opposite infs gives nan """
++        assert_equal(np.interp(0.5, [-np.inf, +np.inf], sc([      0,      10])), sc(np.nan))
++        assert_equal(np.interp(0.5, [      0,       1], sc([-np.inf, +np.inf])), sc(np.nan))
++        assert_equal(np.interp(0.5, [      0,       1], sc([+np.inf, -np.inf])), sc(np.nan))
++
++    def test_non_finite_half_inf_xf(self, sc):
++        """ Test that interp where both axes have a bound at inf gives nan """
++        assert_equal(np.interp(0.5, [-np.inf,       1], sc([-np.inf,      10])), sc(np.nan))
++        assert_equal(np.interp(0.5, [-np.inf,       1], sc([+np.inf,      10])), sc(np.nan))
++        assert_equal(np.interp(0.5, [-np.inf,       1], sc([      0, -np.inf])), sc(np.nan))
++        assert_equal(np.interp(0.5, [-np.inf,       1], sc([      0, +np.inf])), sc(np.nan))
++        assert_equal(np.interp(0.5, [      0, +np.inf], sc([-np.inf,      10])), sc(np.nan))
++        assert_equal(np.interp(0.5, [      0, +np.inf], sc([+np.inf,      10])), sc(np.nan))
++        assert_equal(np.interp(0.5, [      0, +np.inf], sc([      0, -np.inf])), sc(np.nan))
++        assert_equal(np.interp(0.5, [      0, +np.inf], sc([      0, +np.inf])), sc(np.nan))
++
++    def test_non_finite_half_inf_x(self, sc):
++        """ Test interp where the x axis has a bound at inf """
++        assert_equal(np.interp(0.5, [-np.inf, -np.inf], sc([0, 10])), sc(10))
++        assert_equal(np.interp(0.5, [-np.inf, 1      ], sc([0, 10])), sc(10))
++        assert_equal(np.interp(0.5, [      0, +np.inf], sc([0, 10])), sc(0))
++        assert_equal(np.interp(0.5, [+np.inf, +np.inf], sc([0, 10])), sc(0))
++
++    def test_non_finite_half_inf_f(self, sc):
++        """ Test interp where the f axis has a bound at inf """
++        assert_equal(np.interp(0.5, [0, 1], sc([      0, -np.inf])), sc(-np.inf))
++        assert_equal(np.interp(0.5, [0, 1], sc([      0, +np.inf])), sc(+np.inf))
++        assert_equal(np.interp(0.5, [0, 1], sc([-np.inf,      10])), sc(-np.inf))
++        assert_equal(np.interp(0.5, [0, 1], sc([+np.inf,      10])), sc(+np.inf))
++        assert_equal(np.interp(0.5, [0, 1], sc([-np.inf, -np.inf])), sc(-np.inf))
++        assert_equal(np.interp(0.5, [0, 1], sc([+np.inf, +np.inf])), sc(+np.inf))
++
+     def test_complex_interp(self):
+         # test complex interpolation
+         x = np.linspace(0, 1, 5)

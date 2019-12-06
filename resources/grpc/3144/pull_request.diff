@@ -1,0 +1,167 @@
+diff --git a/src/ruby/bin/math_client.rb b/src/ruby/bin/math_client.rb
+index 6319cda3091..0ebd26f7806 100755
+--- a/src/ruby/bin/math_client.rb
++++ b/src/ruby/bin/math_client.rb
+@@ -50,7 +50,7 @@ def do_div(stub)
+   GRPC.logger.info('----------------')
+   req = Math::DivArgs.new(dividend: 7, divisor: 3)
+   GRPC.logger.info("div(7/3): req=#{req.inspect}")
+-  resp = stub.div(req, INFINITE_FUTURE)
++  resp = stub.div(req, timeout: INFINITE_FUTURE)
+   GRPC.logger.info("Answer: #{resp.inspect}")
+   GRPC.logger.info('----------------')
+ end
+@@ -71,7 +71,7 @@ def do_fib(stub)
+   GRPC.logger.info('----------------')
+   req = Math::FibArgs.new(limit: 11)
+   GRPC.logger.info("fib(11): req=#{req.inspect}")
+-  resp = stub.fib(req, INFINITE_FUTURE)
++  resp = stub.fib(req, timeout: INFINITE_FUTURE)
+   resp.each do |r|
+     GRPC.logger.info("Answer: #{r.inspect}")
+   end
+@@ -86,7 +86,7 @@ def do_div_many(stub)
+   reqs << Math::DivArgs.new(dividend: 5, divisor: 2)
+   reqs << Math::DivArgs.new(dividend: 7, divisor: 2)
+   GRPC.logger.info("div(7/3), div(5/2), div(7/2): reqs=#{reqs.inspect}")
+-  resp = stub.div_many(reqs, 10)
++  resp = stub.div_many(reqs, timeout: INFINITE_FUTURE)
+   resp.each do |r|
+     GRPC.logger.info("Answer: #{r.inspect}")
+   end
+diff --git a/src/ruby/bin/math_server.rb b/src/ruby/bin/math_server.rb
+index b41ccf6ce16..9a921b13d6a 100755
+--- a/src/ruby/bin/math_server.rb
++++ b/src/ruby/bin/math_server.rb
+@@ -41,9 +41,25 @@
+ 
+ require 'forwardable'
+ require 'grpc'
++require 'logger'
+ require 'math_services'
+ require 'optparse'
+ 
++# RubyLogger defines a logger for gRPC based on the standard ruby logger.
++module RubyLogger
++  def logger
++    LOGGER
++  end
++
++  LOGGER = Logger.new(STDOUT)
++end
++
++# GRPC is the general RPC module
++module GRPC
++  # Inject the noop #logger if no module-level logger method has been injected.
++  extend RubyLogger
++end
++
+ # Holds state for a fibonacci series
+ class Fibber
+   def initialize(limit)
+diff --git a/src/ruby/ext/grpc/rb_server.c b/src/ruby/ext/grpc/rb_server.c
+index 7e76349d2e1..bd19b2fe4e7 100644
+--- a/src/ruby/ext/grpc/rb_server.c
++++ b/src/ruby/ext/grpc/rb_server.c
+@@ -234,6 +234,7 @@ static VALUE grpc_rb_server_request_call(VALUE self, VALUE cqueue,
+                grpc_call_error_detail_of(err), err);
+       return Qnil;
+     }
++
+     ev = grpc_rb_completion_queue_pluck_event(cqueue, tag_new, timeout);
+     if (ev.type == GRPC_QUEUE_TIMEOUT) {
+       grpc_request_call_stack_cleanup(&st);
+@@ -298,36 +299,15 @@ static VALUE grpc_rb_server_destroy(int argc, VALUE *argv, VALUE self) {
+   if (s->wrapped != NULL) {
+     grpc_server_shutdown_and_notify(s->wrapped, cq, NULL);
+     ev = grpc_rb_completion_queue_pluck_event(cqueue, Qnil, timeout);
+-
+     if (!ev.success) {
+-      rb_warn("server shutdown failed, there will be a LEAKED object warning");
+-      return Qnil;
+-      /*
+-         TODO: renable the rb_raise below.
+-
+-         At the moment if the timeout is INFINITE_FUTURE as recommended, the
+-         pluck blocks forever, even though
+-
+-         the outstanding server_request_calls correctly fail on the other
+-         thread that they are running on.
+-
+-         it's almost as if calls that fail on the other thread do not get
+-         cleaned up by shutdown request, even though it caused htem to
+-         terminate.
+-
+-         rb_raise(rb_eRuntimeError, "grpc server shutdown did not succeed");
+-         return Qnil;
+-
+-         The workaround is just to use a timeout and return without really
+-         shutting down the server, and rely on the grpc core garbage collection
+-         it down as a 'LEAKED OBJECT'.
+-
+-      */
++      rb_warn("server shutdown failed, cancelling the calls, objects may leak");
++      grpc_server_cancel_all_calls(s->wrapped);
++      return Qfalse;
+     }
+     grpc_server_destroy(s->wrapped);
+     s->wrapped = NULL;
+   }
+-  return Qnil;
++  return Qtrue;
+ }
+ 
+ /*
+diff --git a/src/ruby/lib/grpc/generic/rpc_server.rb b/src/ruby/lib/grpc/generic/rpc_server.rb
+index 67bf35ce02c..38ea3334136 100644
+--- a/src/ruby/lib/grpc/generic/rpc_server.rb
++++ b/src/ruby/lib/grpc/generic/rpc_server.rb
+@@ -277,10 +277,11 @@ def stop
+       @stop_mutex.synchronize do
+         @stopped = true
+       end
+-      @pool.stop
+       deadline = from_relative_time(@poll_period)
+-
++      return if @server.close(@cq, deadline)
++      deadline = from_relative_time(@poll_period)
+       @server.close(@cq, deadline)
++      @pool.stop
+     end
+ 
+     # determines if the server has been stopped
+@@ -383,7 +384,6 @@ def run
+       @pool.start
+       @server.start
+       loop_handle_server_calls
+-      @running = false
+     end
+ 
+     # Sends UNAVAILABLE if there are too many unprocessed jobs
+@@ -414,14 +414,13 @@ def loop_handle_server_calls
+       fail 'not running' unless @running
+       loop_tag = Object.new
+       until stopped?
+-        deadline = from_relative_time(@poll_period)
+         begin
+-          an_rpc = @server.request_call(@cq, loop_tag, deadline)
++          an_rpc = @server.request_call(@cq, loop_tag, INFINITE_FUTURE)
+           c = new_active_server_call(an_rpc)
+         rescue Core::CallError, RuntimeError => e
+           # these might happen for various reasonse.  The correct behaviour of
+-          # the server is to log them and continue.
+-          GRPC.logger.warn("server call failed: #{e}")
++          # the server is to log them and continue, if it's not shutting down.
++          GRPC.logger.warn("server call failed: #{e}") unless stopped?
+           next
+         end
+         unless c.nil?
+@@ -431,6 +430,8 @@ def loop_handle_server_calls
+           end
+         end
+       end
++      @running = false
++      GRPC.logger.info("stopped: #{self}")
+     end
+ 
+     def new_active_server_call(an_rpc)

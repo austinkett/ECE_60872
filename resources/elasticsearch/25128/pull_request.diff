@@ -1,0 +1,140 @@
+diff --git a/core/src/main/java/org/elasticsearch/action/bulk/TransportShardBulkAction.java b/core/src/main/java/org/elasticsearch/action/bulk/TransportShardBulkAction.java
+index 597b27eae4bd..7a2c5eb02222 100644
+--- a/core/src/main/java/org/elasticsearch/action/bulk/TransportShardBulkAction.java
++++ b/core/src/main/java/org/elasticsearch/action/bulk/TransportShardBulkAction.java
+@@ -477,7 +477,7 @@ static ReplicaItemExecutionMode replicaItemExecutionMode(final BulkItemRequest r
+                     case FAILURE:
+                         final BulkItemResponse.Failure failure = item.getPrimaryResponse().getFailure();
+                         assert failure.getSeqNo() != SequenceNumbersService.UNASSIGNED_SEQ_NO : "seq no must be assigned";
+-                        operationResult = executeFailureNoOpOnReplica(failure, replica);
++                        operationResult = executeFailureNoOpOnReplica(failure, primaryTerm, replica);
+                         assert operationResult != null : "operation result must never be null when primary response has no failure";
+                         location = syncOperationResultOrThrow(operationResult, location);
+                         break;
+@@ -673,9 +673,10 @@ static ReplicaItemExecutionMode replicaItemExecutionMode(final BulkItemRequest r
+         return replica.delete(delete);
+     }
+ 
+-    private static Engine.NoOpResult executeFailureNoOpOnReplica(BulkItemResponse.Failure primaryFailure, IndexShard replica) throws IOException {
+-        final Engine.NoOp noOp = replica.prepareMarkingSeqNoAsNoOp(
+-                primaryFailure.getSeqNo(), primaryFailure.getMessage());
++    private static Engine.NoOpResult executeFailureNoOpOnReplica(BulkItemResponse.Failure primaryFailure, long primaryTerm,
++                                                                 IndexShard replica) throws IOException {
++        final Engine.NoOp noOp = replica.prepareMarkingSeqNoAsNoOpOnReplica(
++                primaryFailure.getSeqNo(), primaryTerm, primaryFailure.getMessage());
+         return replica.markSeqNoAsNoOp(noOp);
+     }
+ 
+diff --git a/core/src/main/java/org/elasticsearch/index/shard/IndexShard.java b/core/src/main/java/org/elasticsearch/index/shard/IndexShard.java
+index 83edd73350b1..18f025c27c37 100644
+--- a/core/src/main/java/org/elasticsearch/index/shard/IndexShard.java
++++ b/core/src/main/java/org/elasticsearch/index/shard/IndexShard.java
+@@ -628,10 +628,11 @@ private IndexShardState changeState(IndexShardState newState, String reason) {
+         return result;
+     }
+ 
+-    public Engine.NoOp prepareMarkingSeqNoAsNoOp(long seqNo, String reason) {
++    public Engine.NoOp prepareMarkingSeqNoAsNoOpOnReplica(long seqNo, long opPrimaryTerm, String reason) {
+         verifyReplicationTarget();
++        assert opPrimaryTerm <= this.primaryTerm : "op term [ " + opPrimaryTerm + " ] > shard term [" + this.primaryTerm + "]";
+         long startTime = System.nanoTime();
+-        return new Engine.NoOp(seqNo, primaryTerm, Engine.Operation.Origin.REPLICA, startTime, reason);
++        return new Engine.NoOp(seqNo, opPrimaryTerm, Engine.Operation.Origin.REPLICA, startTime, reason);
+     }
+ 
+     public Engine.NoOpResult markSeqNoAsNoOp(Engine.NoOp noOp) throws IOException {
+diff --git a/core/src/test/java/org/elasticsearch/action/bulk/TransportShardBulkActionTests.java b/core/src/test/java/org/elasticsearch/action/bulk/TransportShardBulkActionTests.java
+index 39a4bb2feca3..aa7f613a176a 100644
+--- a/core/src/test/java/org/elasticsearch/action/bulk/TransportShardBulkActionTests.java
++++ b/core/src/test/java/org/elasticsearch/action/bulk/TransportShardBulkActionTests.java
+@@ -541,11 +541,13 @@ public void testNoOpReplicationOnPrimaryDocumentFailure() throws Exception {
+         itemRequests[0] = itemRequest;
+         BulkShardRequest bulkShardRequest = new BulkShardRequest(
+                 shard.shardId(), RefreshPolicy.NONE, itemRequests);
++        bulkShardRequest.primaryTerm(randomIntBetween(1, (int) shard.getPrimaryTerm()));
+         TransportShardBulkAction.performOnReplica(bulkShardRequest, shard);
+         ArgumentCaptor<Engine.NoOp> noOp = ArgumentCaptor.forClass(Engine.NoOp.class);
+         verify(shard, times(1)).markSeqNoAsNoOp(noOp.capture());
+         final Engine.NoOp noOpValue = noOp.getValue();
+         assertThat(noOpValue.seqNo(), equalTo(1L));
++        assertThat(noOpValue.primaryTerm(), equalTo(bulkShardRequest.primaryTerm()));
+         assertThat(noOpValue.reason(), containsString(failureMessage));
+         closeShards(shard);
+     }
+diff --git a/core/src/test/java/org/elasticsearch/index/replication/ESIndexLevelReplicationTestCase.java b/core/src/test/java/org/elasticsearch/index/replication/ESIndexLevelReplicationTestCase.java
+index 8e27ab5e9d39..72ace394d011 100644
+--- a/core/src/test/java/org/elasticsearch/index/replication/ESIndexLevelReplicationTestCase.java
++++ b/core/src/test/java/org/elasticsearch/index/replication/ESIndexLevelReplicationTestCase.java
+@@ -105,7 +105,7 @@ protected IndexMetaData buildIndexMetaData(int replicas, Map<String, String> map
+             .build();
+         IndexMetaData.Builder metaData = IndexMetaData.builder(index.getName())
+             .settings(settings)
+-            .primaryTerm(0, 1);
++            .primaryTerm(0, randomIntBetween(1, 100));
+         for (Map.Entry<String, String> typeMapping : mappings.entrySet()) {
+             metaData.putMapping(typeMapping.getKey(), typeMapping.getValue());
+         }
+diff --git a/core/src/test/java/org/elasticsearch/index/replication/IndexLevelReplicationTests.java b/core/src/test/java/org/elasticsearch/index/replication/IndexLevelReplicationTests.java
+index c13177a62505..9b2200d8be3f 100644
+--- a/core/src/test/java/org/elasticsearch/index/replication/IndexLevelReplicationTests.java
++++ b/core/src/test/java/org/elasticsearch/index/replication/IndexLevelReplicationTests.java
+@@ -238,7 +238,7 @@ protected EngineFactory getEngineFactory(ShardRouting routing) {
+                             .source("{}", XContentType.JSON)
+             );
+             assertTrue(response.isFailed());
+-            assertNoOpTranslogOperationForDocumentFailure(shards, 1, failureMessage);
++            assertNoOpTranslogOperationForDocumentFailure(shards, 1, shards.getPrimary().getPrimaryTerm(), failureMessage);
+             shards.assertAllEqual(0);
+ 
+             // add some replicas
+@@ -252,7 +252,7 @@ protected EngineFactory getEngineFactory(ShardRouting routing) {
+                             .source("{}", XContentType.JSON)
+             );
+             assertTrue(response.isFailed());
+-            assertNoOpTranslogOperationForDocumentFailure(shards, 2, failureMessage);
++            assertNoOpTranslogOperationForDocumentFailure(shards, 2, shards.getPrimary().getPrimaryTerm(), failureMessage);
+             shards.assertAllEqual(0);
+         }
+     }
+@@ -323,6 +323,7 @@ public long addDocument(Iterable<? extends IndexableField> doc) throws IOExcepti
+     private static void assertNoOpTranslogOperationForDocumentFailure(
+             Iterable<IndexShard> replicationGroup,
+             int expectedOperation,
++            long expectedPrimaryTerm,
+             String failureMessage) throws IOException {
+         for (IndexShard indexShard : replicationGroup) {
+             try(Translog.View view = indexShard.acquireTranslogView()) {
+@@ -333,6 +334,7 @@ private static void assertNoOpTranslogOperationForDocumentFailure(
+                 do {
+                     assertThat(op.opType(), equalTo(Translog.Operation.Type.NO_OP));
+                     assertThat(op.seqNo(), equalTo(expectedSeqNo));
++                    assertThat(op.primaryTerm(), equalTo(expectedPrimaryTerm));
+                     assertThat(((Translog.NoOp) op).reason(), containsString(failureMessage));
+                     op = snapshot.next();
+                     expectedSeqNo++;
+diff --git a/core/src/test/java/org/elasticsearch/index/shard/IndexShardTests.java b/core/src/test/java/org/elasticsearch/index/shard/IndexShardTests.java
+index b299168ce622..5072e7a3b894 100644
+--- a/core/src/test/java/org/elasticsearch/index/shard/IndexShardTests.java
++++ b/core/src/test/java/org/elasticsearch/index/shard/IndexShardTests.java
+@@ -1281,7 +1281,7 @@ public void testRecoverFromStoreWithNoOps() throws IOException {
+         while((operation = snapshot.next()) != null) {
+             if (operation.opType() == Translog.Operation.Type.NO_OP) {
+                 numNoops++;
+-                assertEquals(1, operation.primaryTerm());
++                assertEquals(newShard.getPrimaryTerm(), operation.primaryTerm());
+                 assertEquals(0, operation.seqNo());
+             }
+         }
+diff --git a/test/framework/src/main/java/org/elasticsearch/index/shard/IndexShardTestCase.java b/test/framework/src/main/java/org/elasticsearch/index/shard/IndexShardTestCase.java
+index a4d587b4835d..4600c80b7a8d 100644
+--- a/test/framework/src/main/java/org/elasticsearch/index/shard/IndexShardTestCase.java
++++ b/test/framework/src/main/java/org/elasticsearch/index/shard/IndexShardTestCase.java
+@@ -159,7 +159,7 @@ protected IndexShard newShard(ShardRouting shardRouting, IndexingOperationListen
+             .build();
+         IndexMetaData.Builder metaData = IndexMetaData.builder(shardRouting.getIndexName())
+             .settings(settings)
+-            .primaryTerm(0, 1);
++            .primaryTerm(0, randomIntBetween(1, 100));
+         return newShard(shardRouting, metaData.build(), listeners);
+     }
+ 

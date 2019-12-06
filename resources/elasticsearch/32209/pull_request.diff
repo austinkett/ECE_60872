@@ -1,0 +1,520 @@
+diff --git a/x-pack/plugin/core/src/main/java/org/elasticsearch/license/LicenseService.java b/x-pack/plugin/core/src/main/java/org/elasticsearch/license/LicenseService.java
+index a39e9f412d76..d5e38fc0cb80 100644
+--- a/x-pack/plugin/core/src/main/java/org/elasticsearch/license/LicenseService.java
++++ b/x-pack/plugin/core/src/main/java/org/elasticsearch/license/LicenseService.java
+@@ -120,7 +120,8 @@ public LicenseService(Settings settings, ClusterService clusterService, Clock cl
+         this.scheduler = new SchedulerEngine(clock);
+         this.licenseState = licenseState;
+         this.operationModeFileWatcher = new OperationModeFileWatcher(resourceWatcherService,
+-                XPackPlugin.resolveConfigFile(env, "license_mode"), logger, () -> updateLicenseState(getLicense()));
++            XPackPlugin.resolveConfigFile(env, "license_mode"), logger,
++            () -> updateLicenseState(getLicensesMetaData()));
+         this.scheduler.register(this);
+         populateExpirationCallbacks();
+     }
+@@ -265,11 +266,11 @@ private static TimeValue days(int days) {
+ 
+     @Override
+     public void triggered(SchedulerEngine.Event event) {
+-        final LicensesMetaData licensesMetaData = clusterService.state().metaData().custom(LicensesMetaData.TYPE);
++        final LicensesMetaData licensesMetaData = getLicensesMetaData();
+         if (licensesMetaData != null) {
+             final License license = licensesMetaData.getLicense();
+             if (event.getJobName().equals(LICENSE_JOB)) {
+-                updateLicenseState(license);
++                updateLicenseState(license, licensesMetaData.getMostRecentTrialVersion());
+             } else if (event.getJobName().startsWith(ExpirationCallback.EXPIRATION_JOB_PREFIX)) {
+                 expirationCallbacks.stream()
+                         .filter(expirationCallback -> expirationCallback.getId().equals(event.getJobName()))
+@@ -311,6 +312,10 @@ public License getLicense() {
+         return license == LicensesMetaData.LICENSE_TOMBSTONE ? null : license;
+     }
+ 
++    private LicensesMetaData getLicensesMetaData() {
++        return this.clusterService.state().metaData().custom(LicensesMetaData.TYPE);
++    }
++
+     void startTrialLicense(PostStartTrialRequest request, final ActionListener<PostStartTrialResponse> listener) {
+         if (VALID_TRIAL_TYPES.contains(request.getType()) == false) {
+             throw new IllegalArgumentException("Cannot start trial of type [" + request.getType() + "]. Valid trial types are "
+@@ -422,10 +427,16 @@ public void clusterChanged(ClusterChangedEvent event) {
+         }
+     }
+ 
+-    protected void updateLicenseState(final License license) {
++    private void updateLicenseState(LicensesMetaData licensesMetaData) {
++        if (licensesMetaData != null) {
++            updateLicenseState(getLicense(licensesMetaData), licensesMetaData.getMostRecentTrialVersion());
++        }
++    }
++
++    protected void updateLicenseState(final License license, Version mostRecentTrialVersion) {
+         if (license == LicensesMetaData.LICENSE_TOMBSTONE) {
+             // implies license has been explicitly deleted
+-            licenseState.update(License.OperationMode.MISSING, false);
++            licenseState.update(License.OperationMode.MISSING, false, mostRecentTrialVersion);
+             return;
+         }
+         if (license != null) {
+@@ -438,7 +449,7 @@ protected void updateLicenseState(final License license) {
+                 // date that is near Long.MAX_VALUE
+                 active = time >= license.issueDate() && time - GRACE_PERIOD_DURATION.getMillis() < license.expiryDate();
+             }
+-            licenseState.update(license.operationMode(), active);
++            licenseState.update(license.operationMode(), active, mostRecentTrialVersion);
+ 
+             if (active) {
+                 if (time < license.expiryDate()) {
+@@ -480,7 +491,7 @@ private void onUpdate(final LicensesMetaData currentLicensesMetaData) {
+                 logger.info("license [{}] mode [{}] - valid", license.uid(),
+                         license.operationMode().name().toLowerCase(Locale.ROOT));
+             }
+-            updateLicenseState(license);
++            updateLicenseState(license, currentLicensesMetaData.getMostRecentTrialVersion());
+         }
+     }
+ 
+diff --git a/x-pack/plugin/core/src/main/java/org/elasticsearch/license/XPackLicenseState.java b/x-pack/plugin/core/src/main/java/org/elasticsearch/license/XPackLicenseState.java
+index ea30e30ae3cd..722c9d0e711a 100644
+--- a/x-pack/plugin/core/src/main/java/org/elasticsearch/license/XPackLicenseState.java
++++ b/x-pack/plugin/core/src/main/java/org/elasticsearch/license/XPackLicenseState.java
+@@ -5,8 +5,11 @@
+  */
+ package org.elasticsearch.license;
+ 
++import org.elasticsearch.Version;
++import org.elasticsearch.common.Nullable;
+ import org.elasticsearch.common.Strings;
+ import org.elasticsearch.common.logging.LoggerMessageFormat;
++import org.elasticsearch.common.logging.Loggers;
+ import org.elasticsearch.common.settings.Settings;
+ import org.elasticsearch.license.License.OperationMode;
+ import org.elasticsearch.xpack.core.XPackField;
+@@ -266,6 +269,7 @@ private static boolean isBasic(OperationMode mode) {
+     private final List<Runnable> listeners = new CopyOnWriteArrayList<>();
+     private final boolean isSecurityEnabled;
+     private final boolean isSecurityExplicitlyEnabled;
++    private volatile boolean isSecurityEnabledByTrialVersion;
+ 
+     public XPackLicenseState(Settings settings) {
+         this.isSecurityEnabled = XPackSettings.SECURITY_ENABLED.get(settings);
+@@ -274,11 +278,30 @@ public XPackLicenseState(Settings settings) {
+         // setting is not explicitly set
+         this.isSecurityExplicitlyEnabled = isSecurityEnabled &&
+             (settings.hasValue(XPackSettings.SECURITY_ENABLED.getKey()) || XPackSettings.TRANSPORT_SSL_ENABLED.get(settings));
++        this.isSecurityEnabledByTrialVersion = false;
+     }
+ 
+-    /** Updates the current state of the license, which will change what features are available. */
+-    void update(OperationMode mode, boolean active) {
++    /**
++     * Updates the current state of the license, which will change what features are available.
++     *
++     * @param mode   The mode (type) of the current license.
++     * @param active True if the current license exists and is within its allowed usage period; false if it is expired or missing.
++     * @param mostRecentTrialVersion If this cluster has, at some point commenced a trial, the most recent version on which they did that.
++     *                               May be {@code null} if they have never generated a trial license on this cluster, or the most recent
++     *                               trial was prior to this metadata being tracked (6.1)
++     */
++    void update(OperationMode mode, boolean active, @Nullable Version mostRecentTrialVersion) {
+         status = new Status(mode, active);
++        if (isSecurityEnabled == true && isSecurityExplicitlyEnabled == false && mode == OperationMode.TRIAL
++            && isSecurityEnabledByTrialVersion == false) {
++            // Before 6.3, Trial licenses would default having security enabled.
++            // If this license was generated before that version, then treat it as if security is explicitly enabled
++            if (mostRecentTrialVersion == null || mostRecentTrialVersion.before(Version.V_6_3_0)) {
++                Loggers.getLogger(getClass()).info("Automatically enabling security for older trial license ({})",
++                    mostRecentTrialVersion == null ? "[pre 6.1.0]" : mostRecentTrialVersion.toString());
++                isSecurityEnabledByTrialVersion = true;
++            }
++        }
+         listeners.forEach(Runnable::run);
+     }
+ 
+@@ -587,6 +610,6 @@ public boolean isSecurityAvailable() {
+ 
+     public boolean isSecurityEnabled() {
+         final OperationMode mode = status.mode;
+-        return mode == OperationMode.TRIAL ? isSecurityExplicitlyEnabled : isSecurityEnabled;
++        return mode == OperationMode.TRIAL ? (isSecurityExplicitlyEnabled || isSecurityEnabledByTrialVersion) : isSecurityEnabled;
+     }
+ }
+diff --git a/x-pack/plugin/core/src/test/java/org/elasticsearch/license/TestUtils.java b/x-pack/plugin/core/src/test/java/org/elasticsearch/license/TestUtils.java
+index d236dacaa4d9..3b7906ae5674 100644
+--- a/x-pack/plugin/core/src/test/java/org/elasticsearch/license/TestUtils.java
++++ b/x-pack/plugin/core/src/test/java/org/elasticsearch/license/TestUtils.java
+@@ -6,6 +6,7 @@
+ package org.elasticsearch.license;
+ 
+ import com.carrotsearch.randomizedtesting.RandomizedTest;
++import org.elasticsearch.Version;
+ import org.elasticsearch.action.ActionListener;
+ import org.elasticsearch.cluster.metadata.MetaData;
+ import org.elasticsearch.common.Strings;
+@@ -353,20 +354,22 @@ public void onFailure(Exception e) {
+     public static class AssertingLicenseState extends XPackLicenseState {
+         public final List<License.OperationMode> modeUpdates = new ArrayList<>();
+         public final List<Boolean> activeUpdates = new ArrayList<>();
++        public final List<Version> trialVersionUpdates = new ArrayList<>();
+ 
+         public AssertingLicenseState() {
+             super(Settings.EMPTY);
+         }
+ 
+         @Override
+-        void update(License.OperationMode mode, boolean active) {
++        void update(License.OperationMode mode, boolean active, Version mostRecentTrialVersion) {
+             modeUpdates.add(mode);
+             activeUpdates.add(active);
++            trialVersionUpdates.add(mostRecentTrialVersion);
+         }
+     }
+ 
+     /**
+-     * A license state that makes the {@link #update(License.OperationMode, boolean)}
++     * A license state that makes the {@link #update(License.OperationMode, boolean, Version)}
+      * method public for use in tests.
+      */
+     public static class UpdatableLicenseState extends XPackLicenseState {
+@@ -379,8 +382,8 @@ public UpdatableLicenseState(Settings settings) {
+         }
+ 
+         @Override
+-        public void update(License.OperationMode mode, boolean active) {
+-            super.update(mode, active);
++        public void update(License.OperationMode mode, boolean active, Version mostRecentTrialVersion) {
++            super.update(mode, active, mostRecentTrialVersion);
+         }
+     }
+ 
+diff --git a/x-pack/plugin/core/src/test/java/org/elasticsearch/license/XPackLicenseStateTests.java b/x-pack/plugin/core/src/test/java/org/elasticsearch/license/XPackLicenseStateTests.java
+index f1503919570e..bb21ddbd1a13 100644
+--- a/x-pack/plugin/core/src/test/java/org/elasticsearch/license/XPackLicenseStateTests.java
++++ b/x-pack/plugin/core/src/test/java/org/elasticsearch/license/XPackLicenseStateTests.java
+@@ -5,9 +5,11 @@
+  */
+ package org.elasticsearch.license;
+ 
++import org.elasticsearch.Version;
+ import org.elasticsearch.common.settings.Settings;
+ import org.elasticsearch.license.License.OperationMode;
+ import org.elasticsearch.test.ESTestCase;
++import org.elasticsearch.test.VersionUtils;
+ import org.elasticsearch.xpack.core.XPackField;
+ import org.elasticsearch.xpack.core.XPackSettings;
+ 
+@@ -31,7 +33,7 @@
+     /** Creates a license state with the given license type and active state, and checks the given method returns expected. */
+     void assertAllowed(OperationMode mode, boolean active, Predicate<XPackLicenseState> predicate, boolean expected) {
+         XPackLicenseState licenseState = new XPackLicenseState(Settings.EMPTY);
+-        licenseState.update(mode, active);
++        licenseState.update(mode, active, null);
+         assertEquals(expected, predicate.test(licenseState));
+     }
+ 
+@@ -102,7 +104,7 @@ public void testSecurityDefaults() {
+     public void testSecurityBasic() {
+         XPackLicenseState licenseState = new XPackLicenseState(randomFrom(Settings.EMPTY,
+                 Settings.builder().put(XPackSettings.SECURITY_ENABLED.getKey(), true).build()));
+-        licenseState.update(BASIC, true);
++        licenseState.update(BASIC, true, null);
+ 
+         assertThat(licenseState.isAuthAllowed(), is(false));
+         assertThat(licenseState.isIpFilteringAllowed(), is(false));
+@@ -116,7 +118,7 @@ public void testSecurityBasic() {
+     public void testSecurityBasicExpired() {
+         XPackLicenseState licenseState = new XPackLicenseState(randomFrom(Settings.EMPTY,
+                 Settings.builder().put(XPackSettings.SECURITY_ENABLED.getKey(), true).build()));
+-        licenseState.update(BASIC, false);
++        licenseState.update(BASIC, false, null);
+ 
+         assertThat(licenseState.isAuthAllowed(), is(false));
+         assertThat(licenseState.isIpFilteringAllowed(), is(false));
+@@ -130,7 +132,7 @@ public void testSecurityBasicExpired() {
+     public void testSecurityStandard() {
+         XPackLicenseState licenseState = new XPackLicenseState(randomFrom(Settings.EMPTY,
+                 Settings.builder().put(XPackSettings.SECURITY_ENABLED.getKey(), true).build()));
+-        licenseState.update(STANDARD, true);
++        licenseState.update(STANDARD, true, null);
+ 
+         assertThat(licenseState.isAuthAllowed(), is(true));
+         assertThat(licenseState.isIpFilteringAllowed(), is(false));
+@@ -144,7 +146,7 @@ public void testSecurityStandard() {
+     public void testSecurityStandardExpired() {
+         XPackLicenseState licenseState = new XPackLicenseState(randomFrom(Settings.EMPTY,
+                 Settings.builder().put(XPackSettings.SECURITY_ENABLED.getKey(), true).build()));
+-        licenseState.update(STANDARD, false);
++        licenseState.update(STANDARD, false, null);
+ 
+         assertThat(licenseState.isAuthAllowed(), is(true));
+         assertThat(licenseState.isIpFilteringAllowed(), is(false));
+@@ -158,7 +160,7 @@ public void testSecurityStandardExpired() {
+     public void testSecurityGold() {
+         XPackLicenseState licenseState = new XPackLicenseState(randomFrom(Settings.EMPTY,
+                 Settings.builder().put(XPackSettings.SECURITY_ENABLED.getKey(), true).build()));
+-        licenseState.update(GOLD, true);
++        licenseState.update(GOLD, true, null);
+ 
+         assertThat(licenseState.isAuthAllowed(), is(true));
+         assertThat(licenseState.isIpFilteringAllowed(), is(true));
+@@ -172,7 +174,7 @@ public void testSecurityGold() {
+     public void testSecurityGoldExpired() {
+         XPackLicenseState licenseState = new XPackLicenseState(randomFrom(Settings.EMPTY,
+                 Settings.builder().put(XPackSettings.SECURITY_ENABLED.getKey(), true).build()));
+-        licenseState.update(GOLD, false);
++        licenseState.update(GOLD, false, null);
+ 
+         assertThat(licenseState.isAuthAllowed(), is(true));
+         assertThat(licenseState.isIpFilteringAllowed(), is(true));
+@@ -186,7 +188,7 @@ public void testSecurityGoldExpired() {
+     public void testSecurityPlatinum() {
+         XPackLicenseState licenseState = new XPackLicenseState(randomFrom(Settings.EMPTY,
+                 Settings.builder().put(XPackSettings.SECURITY_ENABLED.getKey(), true).build()));
+-        licenseState.update(PLATINUM, true);
++        licenseState.update(PLATINUM, true, null);
+ 
+         assertThat(licenseState.isAuthAllowed(), is(true));
+         assertThat(licenseState.isIpFilteringAllowed(), is(true));
+@@ -200,7 +202,7 @@ public void testSecurityPlatinum() {
+     public void testSecurityPlatinumExpired() {
+         XPackLicenseState licenseState = new XPackLicenseState(randomFrom(Settings.EMPTY,
+                 Settings.builder().put(XPackSettings.SECURITY_ENABLED.getKey(), true).build()));
+-        licenseState.update(PLATINUM, false);
++        licenseState.update(PLATINUM, false, null);
+ 
+         assertThat(licenseState.isAuthAllowed(), is(true));
+         assertThat(licenseState.isIpFilteringAllowed(), is(true));
+@@ -211,6 +213,34 @@ public void testSecurityPlatinumExpired() {
+         assertThat(licenseState.isCustomRoleProvidersAllowed(), is(false));
+     }
+ 
++    public void testNewTrialDefaultsSecurityOff() {
++        XPackLicenseState licenseState = new XPackLicenseState(Settings.EMPTY);
++        licenseState.update(TRIAL, true, VersionUtils.randomVersionBetween(random(), Version.V_6_3_0, Version.CURRENT));
++
++        assertThat(licenseState.isSecurityEnabled(), is(false));
++        assertThat(licenseState.isAuthAllowed(), is(true));
++        assertThat(licenseState.isIpFilteringAllowed(), is(true));
++        assertThat(licenseState.isAuditingAllowed(), is(true));
++        assertThat(licenseState.isStatsAndHealthAllowed(), is(true));
++        assertThat(licenseState.isDocumentAndFieldLevelSecurityAllowed(), is(true));
++        assertThat(licenseState.allowedRealmType(), is(XPackLicenseState.AllowedRealmType.ALL));
++        assertThat(licenseState.isCustomRoleProvidersAllowed(), is(true));
++    }
++
++    public void testOldTrialDefaultsSecurityOn() {
++        XPackLicenseState licenseState = new XPackLicenseState(Settings.EMPTY);
++        licenseState.update(TRIAL, true, rarely() ? null : VersionUtils.randomVersionBetween(random(), Version.V_5_6_0, Version.V_6_2_4));
++
++        assertThat(licenseState.isSecurityEnabled(), is(true));
++        assertThat(licenseState.isAuthAllowed(), is(true));
++        assertThat(licenseState.isIpFilteringAllowed(), is(true));
++        assertThat(licenseState.isAuditingAllowed(), is(true));
++        assertThat(licenseState.isStatsAndHealthAllowed(), is(true));
++        assertThat(licenseState.isDocumentAndFieldLevelSecurityAllowed(), is(true));
++        assertThat(licenseState.allowedRealmType(), is(XPackLicenseState.AllowedRealmType.ALL));
++        assertThat(licenseState.isCustomRoleProvidersAllowed(), is(true));
++    }
++
+     public void testSecurityAckBasicToNotGoldOrStandard() {
+         OperationMode toMode = randomFrom(OperationMode.values(), mode -> mode != GOLD && mode != STANDARD);
+         assertAckMesssages(XPackField.SECURITY, BASIC, toMode, 0);
+@@ -354,7 +384,7 @@ public void testSqlDefaults() {
+ 
+     public void testSqlBasic() {
+         XPackLicenseState licenseState = new XPackLicenseState(Settings.EMPTY);
+-        licenseState.update(BASIC, true);
++        licenseState.update(BASIC, true, null);
+ 
+         assertThat(licenseState.isSqlAllowed(), is(true));
+         assertThat(licenseState.isJdbcAllowed(), is(false));
+@@ -362,7 +392,7 @@ public void testSqlBasic() {
+ 
+     public void testSqlBasicExpired() {
+         XPackLicenseState licenseState = new XPackLicenseState(Settings.EMPTY);
+-        licenseState.update(BASIC, false);
++        licenseState.update(BASIC, false, null);
+ 
+         assertThat(licenseState.isSqlAllowed(), is(false));
+         assertThat(licenseState.isJdbcAllowed(), is(false));
+@@ -370,7 +400,7 @@ public void testSqlBasicExpired() {
+ 
+     public void testSqlStandard() {
+         XPackLicenseState licenseState = new XPackLicenseState(Settings.EMPTY);
+-        licenseState.update(STANDARD, true);
++        licenseState.update(STANDARD, true, null);
+ 
+         assertThat(licenseState.isSqlAllowed(), is(true));
+         assertThat(licenseState.isJdbcAllowed(), is(false));
+@@ -378,7 +408,7 @@ public void testSqlStandard() {
+ 
+     public void testSqlStandardExpired() {
+         XPackLicenseState licenseState = new XPackLicenseState(Settings.EMPTY);
+-        licenseState.update(STANDARD, false);
++        licenseState.update(STANDARD, false, null);
+ 
+         assertThat(licenseState.isSqlAllowed(), is(false));
+         assertThat(licenseState.isJdbcAllowed(), is(false));
+@@ -386,7 +416,7 @@ public void testSqlStandardExpired() {
+ 
+     public void testSqlGold() {
+         XPackLicenseState licenseState = new XPackLicenseState(Settings.EMPTY);
+-        licenseState.update(GOLD, true);
++        licenseState.update(GOLD, true, null);
+ 
+         assertThat(licenseState.isSqlAllowed(), is(true));
+         assertThat(licenseState.isJdbcAllowed(), is(false));
+@@ -394,7 +424,7 @@ public void testSqlGold() {
+ 
+     public void testSqlGoldExpired() {
+         XPackLicenseState licenseState = new XPackLicenseState(Settings.EMPTY);
+-        licenseState.update(GOLD, false);
++        licenseState.update(GOLD, false, null);
+ 
+         assertThat(licenseState.isSqlAllowed(), is(false));
+         assertThat(licenseState.isJdbcAllowed(), is(false));
+@@ -402,7 +432,7 @@ public void testSqlGoldExpired() {
+ 
+     public void testSqlPlatinum() {
+         XPackLicenseState licenseState = new XPackLicenseState(Settings.EMPTY);
+-        licenseState.update(PLATINUM, true);
++        licenseState.update(PLATINUM, true, null);
+ 
+         assertThat(licenseState.isSqlAllowed(), is(true));
+         assertThat(licenseState.isJdbcAllowed(), is(true));
+@@ -410,7 +440,7 @@ public void testSqlPlatinum() {
+ 
+     public void testSqlPlatinumExpired() {
+         XPackLicenseState licenseState = new XPackLicenseState(Settings.EMPTY);
+-        licenseState.update(PLATINUM, false);
++        licenseState.update(PLATINUM, false, null);
+ 
+         assertThat(licenseState.isSqlAllowed(), is(false));
+         assertThat(licenseState.isJdbcAllowed(), is(false));
+diff --git a/x-pack/plugin/ml/src/test/java/org/elasticsearch/license/MachineLearningLicensingTests.java b/x-pack/plugin/ml/src/test/java/org/elasticsearch/license/MachineLearningLicensingTests.java
+index 558f76a75369..57a976417914 100644
+--- a/x-pack/plugin/ml/src/test/java/org/elasticsearch/license/MachineLearningLicensingTests.java
++++ b/x-pack/plugin/ml/src/test/java/org/elasticsearch/license/MachineLearningLicensingTests.java
+@@ -99,7 +99,7 @@ public void testMachineLearningOpenJobActionRestricted() throws Exception {
+             PutJobAction.Response response = putJobListener.actionGet();
+             assertNotNull(response);
+         }
+-        
++
+         // Pick a license that does not allow machine learning
+         License.OperationMode mode = randomInvalidLicenseType();
+         enableLicensing(mode);
+@@ -151,7 +151,7 @@ public void testMachineLearningPutDatafeedActionRestricted() throws Exception {
+             PutJobAction.Response putJobResponse = putJobListener.actionGet();
+             assertNotNull(putJobResponse);
+         }
+-        
++
+         // Pick a license that does not allow machine learning
+         License.OperationMode mode = randomInvalidLicenseType();
+         enableLicensing(mode);
+@@ -551,7 +551,7 @@ public static void disableLicensing() {
+ 
+     public static void disableLicensing(License.OperationMode operationMode) {
+         for (XPackLicenseState licenseState : internalCluster().getInstances(XPackLicenseState.class)) {
+-            licenseState.update(operationMode, false);
++            licenseState.update(operationMode, false, null);
+         }
+     }
+ 
+@@ -561,7 +561,7 @@ public static void enableLicensing() {
+ 
+     public static void enableLicensing(License.OperationMode operationMode) {
+         for (XPackLicenseState licenseState : internalCluster().getInstances(XPackLicenseState.class)) {
+-            licenseState.update(operationMode, true);
++            licenseState.update(operationMode, true, null);
+         }
+     }
+ }
+diff --git a/x-pack/plugin/security/src/test/java/org/elasticsearch/license/LicensingTests.java b/x-pack/plugin/security/src/test/java/org/elasticsearch/license/LicensingTests.java
+index f30fe5f8ec81..012050f42598 100644
+--- a/x-pack/plugin/security/src/test/java/org/elasticsearch/license/LicensingTests.java
++++ b/x-pack/plugin/security/src/test/java/org/elasticsearch/license/LicensingTests.java
+@@ -307,7 +307,7 @@ public static void disableLicensing() {
+ 
+     public static void disableLicensing(License.OperationMode operationMode) {
+         for (XPackLicenseState licenseState : internalCluster().getInstances(XPackLicenseState.class)) {
+-            licenseState.update(operationMode, false);
++            licenseState.update(operationMode, false, null);
+         }
+     }
+ 
+@@ -317,7 +317,7 @@ public static void enableLicensing() {
+ 
+     public static void enableLicensing(License.OperationMode operationMode) {
+         for (XPackLicenseState licenseState : internalCluster().getInstances(XPackLicenseState.class)) {
+-            licenseState.update(operationMode, true);
++            licenseState.update(operationMode, true, null);
+         }
+     }
+ }
+diff --git a/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/SecurityTests.java b/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/SecurityTests.java
+index b1d8d4b67bf7..e88b1905a7ab 100644
+--- a/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/SecurityTests.java
++++ b/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/SecurityTests.java
+@@ -399,7 +399,8 @@ public void testGetFieldFilterSecurityEnabledLicenseNoFLS() throws Exception {
+         createComponents(Settings.EMPTY);
+         Function<String, Predicate<String>> fieldFilter = security.getFieldFilter();
+         assertNotSame(MapperPlugin.NOOP_FIELD_FILTER, fieldFilter);
+-        licenseState.update(randomFrom(License.OperationMode.BASIC, License.OperationMode.STANDARD, License.OperationMode.GOLD), true);
++        licenseState.update(
++            randomFrom(License.OperationMode.BASIC, License.OperationMode.STANDARD, License.OperationMode.GOLD), true, null);
+         assertNotSame(MapperPlugin.NOOP_FIELD_FILTER, fieldFilter);
+         assertSame(MapperPlugin.NOOP_FIELD_PREDICATE, fieldFilter.apply(randomAlphaOfLengthBetween(3, 6)));
+     }
+diff --git a/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/authz/store/CompositeRolesStoreTests.java b/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/authz/store/CompositeRolesStoreTests.java
+index b1728fd5f04b..b33e93d0806f 100644
+--- a/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/authz/store/CompositeRolesStoreTests.java
++++ b/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/authz/store/CompositeRolesStoreTests.java
+@@ -409,7 +409,7 @@ public void testCustomRolesProvidersLicensing() {
+ 
+         UpdatableLicenseState xPackLicenseState = new UpdatableLicenseState(SECURITY_ENABLED_SETTINGS);
+         // these licenses don't allow custom role providers
+-        xPackLicenseState.update(randomFrom(OperationMode.BASIC, OperationMode.GOLD, OperationMode.STANDARD), true);
++        xPackLicenseState.update(randomFrom(OperationMode.BASIC, OperationMode.GOLD, OperationMode.STANDARD), true, null);
+         CompositeRolesStore compositeRolesStore = new CompositeRolesStore(
+             Settings.EMPTY, fileRolesStore, nativeRolesStore, reservedRolesStore,
+             Arrays.asList(inMemoryProvider), new ThreadContext(Settings.EMPTY), xPackLicenseState);
+@@ -427,7 +427,7 @@ public void testCustomRolesProvidersLicensing() {
+             Settings.EMPTY, fileRolesStore, nativeRolesStore, reservedRolesStore,
+             Arrays.asList(inMemoryProvider), new ThreadContext(Settings.EMPTY), xPackLicenseState);
+         // these licenses allow custom role providers
+-        xPackLicenseState.update(randomFrom(OperationMode.PLATINUM, OperationMode.TRIAL), true);
++        xPackLicenseState.update(randomFrom(OperationMode.PLATINUM, OperationMode.TRIAL), true, null);
+         roleNames = Sets.newHashSet("roleA");
+         future = new PlainActionFuture<>();
+         fieldPermissionsCache = new FieldPermissionsCache(Settings.EMPTY);
+@@ -441,7 +441,7 @@ public void testCustomRolesProvidersLicensing() {
+         compositeRolesStore = new CompositeRolesStore(
+             Settings.EMPTY, fileRolesStore, nativeRolesStore, reservedRolesStore,
+             Arrays.asList(inMemoryProvider), new ThreadContext(Settings.EMPTY), xPackLicenseState);
+-        xPackLicenseState.update(randomFrom(OperationMode.PLATINUM, OperationMode.TRIAL), false);
++        xPackLicenseState.update(randomFrom(OperationMode.PLATINUM, OperationMode.TRIAL), false, null);
+         roleNames = Sets.newHashSet("roleA");
+         future = new PlainActionFuture<>();
+         fieldPermissionsCache = new FieldPermissionsCache(Settings.EMPTY);
+diff --git a/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/rest/action/saml/SamlBaseRestHandlerTests.java b/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/rest/action/saml/SamlBaseRestHandlerTests.java
+index 5942c206cac9..5b442deacf6e 100644
+--- a/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/rest/action/saml/SamlBaseRestHandlerTests.java
++++ b/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/rest/action/saml/SamlBaseRestHandlerTests.java
+@@ -48,7 +48,7 @@ private SamlBaseRestHandler buildHandler(License.OperationMode licenseMode) {
+                 .put(XPackSettings.SECURITY_ENABLED.getKey(), true)
+                 .build();
+         final TestUtils.UpdatableLicenseState licenseState = new TestUtils.UpdatableLicenseState(settings);
+-        licenseState.update(licenseMode, true);
++        licenseState.update(licenseMode, true, null);
+ 
+         return new SamlBaseRestHandler(settings, licenseState) {
+ 
+@@ -64,4 +64,4 @@ protected RestChannelConsumer innerPrepareRequest(RestRequest request, NodeClien
+         };
+     }
+ 
+-}
+\ No newline at end of file
++}

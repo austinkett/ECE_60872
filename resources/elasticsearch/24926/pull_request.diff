@@ -1,0 +1,135 @@
+diff --git a/core/src/main/java/org/elasticsearch/action/support/replication/ReplicationOperation.java b/core/src/main/java/org/elasticsearch/action/support/replication/ReplicationOperation.java
+index ee8270e911ce..09b6a4d8220d 100644
+--- a/core/src/main/java/org/elasticsearch/action/support/replication/ReplicationOperation.java
++++ b/core/src/main/java/org/elasticsearch/action/support/replication/ReplicationOperation.java
+@@ -20,6 +20,7 @@
+ 
+ import org.apache.logging.log4j.Logger;
+ import org.apache.logging.log4j.message.ParameterizedMessage;
++import org.apache.lucene.store.AlreadyClosedException;
+ import org.elasticsearch.ElasticsearchException;
+ import org.elasticsearch.ExceptionsHelper;
+ import org.elasticsearch.action.ActionListener;
+@@ -185,7 +186,15 @@ private void performOnReplica(final ShardRouting shard, final ReplicaRequest rep
+             @Override
+             public void onResponse(ReplicaResponse response) {
+                 successfulShards.incrementAndGet();
+-                primary.updateLocalCheckpointForShard(response.allocationId(), response.localCheckpoint());
++                try {
++                    primary.updateLocalCheckpointForShard(response.allocationId(), response.localCheckpoint());
++                } catch (final AlreadyClosedException e) {
++                    // okay, the index was deleted or this shard was never activated after a relocation; fallthrough and finish normally
++                } catch (final Exception e) {
++                    // fail the primary but fall through and let the rest of operation processing complete
++                    final String message = String.format(Locale.ROOT, "primary failed updating local checkpoint for replica %s", shard);
++                    primary.failShard(message, e);
++                }
+                 decPendingAndFinishIfNeeded();
+             }
+ 
+@@ -321,7 +330,10 @@ private void finishAsFailed(Exception exception) {
+         ShardRouting routingEntry();
+ 
+         /**
+-         * fail the primary, typically due to the fact that the operation has learned the primary has been demoted by the master
++         * Fail the primary shard.
++         *
++         * @param message   the failure message
++         * @param exception the exception that triggered the failure
+          */
+         void failShard(String message, Exception exception);
+ 
+@@ -335,7 +347,6 @@ private void finishAsFailed(Exception exception) {
+          */
+         PrimaryResultT perform(RequestT request) throws Exception;
+ 
+-
+         /**
+          * Notifies the primary of a local checkpoint for the given allocation.
+          *
+diff --git a/core/src/test/java/org/elasticsearch/action/support/replication/ReplicationOperationTests.java b/core/src/test/java/org/elasticsearch/action/support/replication/ReplicationOperationTests.java
+index 9fcc8c24353b..88cf5769a485 100644
+--- a/core/src/test/java/org/elasticsearch/action/support/replication/ReplicationOperationTests.java
++++ b/core/src/test/java/org/elasticsearch/action/support/replication/ReplicationOperationTests.java
+@@ -20,6 +20,7 @@
+ 
+ import org.apache.logging.log4j.Logger;
+ import org.apache.lucene.index.CorruptIndexException;
++import org.apache.lucene.store.AlreadyClosedException;
+ import org.elasticsearch.ElasticsearchException;
+ import org.elasticsearch.action.ActionListener;
+ import org.elasticsearch.action.UnavailableShardsException;
+@@ -56,7 +57,9 @@
+ import static org.elasticsearch.action.support.replication.ClusterStateCreationUtils.state;
+ import static org.elasticsearch.action.support.replication.ClusterStateCreationUtils.stateWithActivePrimary;
+ import static org.hamcrest.Matchers.arrayWithSize;
++import static org.hamcrest.Matchers.containsString;
+ import static org.hamcrest.Matchers.equalTo;
++import static org.hamcrest.Matchers.hasToString;
+ import static org.hamcrest.Matchers.instanceOf;
+ import static org.hamcrest.Matchers.notNullValue;
+ import static org.hamcrest.Matchers.nullValue;
+@@ -191,8 +194,7 @@ public void failShard(String message, Exception exception) {
+                 assertTrue(primaryFailed.compareAndSet(false, true));
+             }
+         };
+-        final TestReplicationOperation op = new TestReplicationOperation(request, primary, listener, replicasProxy,
+-            () -> finalState);
++        final TestReplicationOperation op = new TestReplicationOperation(request, primary, listener, replicasProxy, () -> finalState);
+         op.execute();
+ 
+         assertThat("request was not processed on primary", request.processedOnPrimary.get(), equalTo(true));
+@@ -299,6 +301,53 @@ public void testWaitForActiveShards() throws Exception {
+         }
+     }
+ 
++    public void testPrimaryFailureHandlingReplicaResponse() throws Exception {
++        final String index = "test";
++        final ShardId shardId = new ShardId(index, "_na_", 0);
++
++        final Request request = new Request(shardId);
++
++        final ClusterState state = stateWithActivePrimary(index, true, 1, 0);
++        final IndexMetaData indexMetaData = state.getMetaData().index(index);
++        final long primaryTerm = indexMetaData.primaryTerm(0);
++        final ShardRouting primaryRouting = state.getRoutingTable().shardRoutingTable(shardId).primaryShard();
++
++        final boolean fatal = randomBoolean();
++        final AtomicBoolean primaryFailed = new AtomicBoolean();
++        final ReplicationOperation.Primary<Request, Request, TestPrimary.Result> primary = new TestPrimary(primaryRouting, primaryTerm) {
++
++            @Override
++            public void failShard(String message, Exception exception) {
++                primaryFailed.set(true);
++            }
++
++            @Override
++            public void updateLocalCheckpointForShard(String allocationId, long checkpoint) {
++                if (primaryRouting.allocationId().getId().equals(allocationId)) {
++                    super.updateLocalCheckpointForShard(allocationId, checkpoint);
++                } else {
++                    if (fatal) {
++                        throw new NullPointerException();
++                    } else {
++                        throw new AlreadyClosedException("already closed");
++                    }
++                }
++            }
++
++        };
++
++        final PlainActionFuture<TestPrimary.Result> listener = new PlainActionFuture<>();
++        final ReplicationOperation.Replicas<Request> replicas = new TestReplicaProxy(Collections.emptyMap());
++        TestReplicationOperation operation = new TestReplicationOperation(request, primary, listener, replicas, () -> state);
++        operation.execute();
++
++        assertThat(primaryFailed.get(), equalTo(fatal));
++        final ShardInfo shardInfo = listener.actionGet().getShardInfo();
++        assertThat(shardInfo.getFailed(), equalTo(0));
++        assertThat(shardInfo.getFailures(), arrayWithSize(0));
++        assertThat(shardInfo.getSuccessful(), equalTo(1 + getExpectedReplicas(shardId, state).size()));
++    }
++
+     private Set<ShardRouting> getExpectedReplicas(ShardId shardId, ClusterState state) {
+         Set<ShardRouting> expectedReplicas = new HashSet<>();
+         String localNodeId = state.nodes().getLocalNodeId();

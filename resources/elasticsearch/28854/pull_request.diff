@@ -1,0 +1,122 @@
+diff --git a/modules/percolator/src/main/java/org/elasticsearch/percolator/QueryAnalyzer.java b/modules/percolator/src/main/java/org/elasticsearch/percolator/QueryAnalyzer.java
+index f07382e3dbad..24b210c29d58 100644
+--- a/modules/percolator/src/main/java/org/elasticsearch/percolator/QueryAnalyzer.java
++++ b/modules/percolator/src/main/java/org/elasticsearch/percolator/QueryAnalyzer.java
+@@ -465,12 +465,17 @@ static Result analyze(Query query, Version indexVersion) {
+         return (query, version) -> {
+             FunctionScoreQuery functionScoreQuery = (FunctionScoreQuery) query;
+             Result result = analyze(functionScoreQuery.getSubQuery(), version);
++
+             // If min_score is specified we can't guarantee upfront that this percolator query matches,
+             // so in that case we set verified to false.
+             // (if it matches with the percolator document matches with the extracted terms.
+             // Min score filters out docs, which is different than the functions, which just influences the score.)
+-            boolean verified = functionScoreQuery.getMinScore() == null;
+-            return new Result(verified, result.extractions, result.minimumShouldMatch);
++            boolean verified = result.verified && functionScoreQuery.getMinScore() == null;
++            if (result.matchAllDocs) {
++                return new Result(result.matchAllDocs, verified);
++            } else {
++                return new Result(verified, result.extractions, result.minimumShouldMatch);
++            }
+         };
+     }
+ 
+diff --git a/modules/percolator/src/test/java/org/elasticsearch/percolator/CandidateQueryTests.java b/modules/percolator/src/test/java/org/elasticsearch/percolator/CandidateQueryTests.java
+index d622af232f2c..80a6fabeca76 100644
+--- a/modules/percolator/src/test/java/org/elasticsearch/percolator/CandidateQueryTests.java
++++ b/modules/percolator/src/test/java/org/elasticsearch/percolator/CandidateQueryTests.java
+@@ -55,6 +55,7 @@
+ import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.search.MatchAllDocsQuery;
+ import org.apache.lucene.search.MatchNoDocsQuery;
++import org.apache.lucene.search.PhraseQuery;
+ import org.apache.lucene.search.PrefixQuery;
+ import org.apache.lucene.search.Query;
+ import org.apache.lucene.search.Scorer;
+@@ -77,6 +78,7 @@
+ import org.elasticsearch.common.bytes.BytesArray;
+ import org.elasticsearch.common.bytes.BytesReference;
+ import org.elasticsearch.common.compress.CompressedXContent;
++import org.elasticsearch.common.lucene.search.function.FunctionScoreQuery;
+ import org.elasticsearch.common.geo.ShapeRelation;
+ import org.elasticsearch.common.settings.Settings;
+ import org.elasticsearch.common.xcontent.XContentFactory;
+@@ -220,6 +222,16 @@ public void testDuel() throws Exception {
+             }
+             return new DisjunctionMaxQuery(clauses, 0.01f);
+         });
++        queryFunctions.add(() -> {
++            Float minScore = randomBoolean() ? null : (float) randomIntBetween(1, 1000);
++            Query innerQuery;
++            if (randomBoolean()) {
++                innerQuery = new TermQuery(new Term(field1, randomFrom(stringContent.get(field1))));
++            } else {
++                innerQuery = new PhraseQuery(field1, randomFrom(stringContent.get(field1)), randomFrom(stringContent.get(field1)));
++            }
++            return new FunctionScoreQuery(innerQuery, minScore, 1f);
++        });
+ 
+         List<ParseContext.Document> documents = new ArrayList<>();
+         for (Supplier<Query> queryFunction : queryFunctions) {
+@@ -679,6 +691,31 @@ public void testPercolateMatchAll() throws Exception {
+         assertEquals(4, topDocs.scoreDocs[2].doc);
+     }
+ 
++    public void testFunctionScoreQuery() throws Exception {
++        List<ParseContext.Document> docs = new ArrayList<>();
++        addQuery(new FunctionScoreQuery(new TermQuery(new Term("field", "value")), null, 1f), docs);
++        addQuery(new FunctionScoreQuery(new TermQuery(new Term("field", "value")), 10f, 1f), docs);
++        addQuery(new FunctionScoreQuery(new MatchAllDocsQuery(), null, 1f), docs);
++        addQuery(new FunctionScoreQuery(new MatchAllDocsQuery(), 10F, 1f), docs);
++
++        indexWriter.addDocuments(docs);
++        indexWriter.close();
++        directoryReader = DirectoryReader.open(directory);
++        IndexSearcher shardSearcher = newSearcher(directoryReader);
++        shardSearcher.setQueryCache(null);
++
++        MemoryIndex memoryIndex = new MemoryIndex();
++        memoryIndex.addField("field", "value", new WhitespaceAnalyzer());
++        IndexSearcher percolateSearcher = memoryIndex.createSearcher();
++        PercolateQuery query = (PercolateQuery) fieldType.percolateQuery("_name", queryStore,
++            Collections.singletonList(new BytesArray("{}")), percolateSearcher, Version.CURRENT);
++        TopDocs topDocs = shardSearcher.search(query, 10, new Sort(SortField.FIELD_DOC), true, true);
++        assertEquals(2L, topDocs.totalHits);
++        assertEquals(2, topDocs.scoreDocs.length);
++        assertEquals(0, topDocs.scoreDocs[0].doc);
++        assertEquals(2, topDocs.scoreDocs[1].doc);
++    }
++
+     public void testPercolateSmallAndLargeDocument() throws Exception {
+         List<ParseContext.Document> docs = new ArrayList<>();
+         BooleanQuery.Builder builder = new BooleanQuery.Builder();
+diff --git a/modules/percolator/src/test/java/org/elasticsearch/percolator/QueryAnalyzerTests.java b/modules/percolator/src/test/java/org/elasticsearch/percolator/QueryAnalyzerTests.java
+index 5b382eb7654b..5968f8c3f832 100644
+--- a/modules/percolator/src/test/java/org/elasticsearch/percolator/QueryAnalyzerTests.java
++++ b/modules/percolator/src/test/java/org/elasticsearch/percolator/QueryAnalyzerTests.java
+@@ -811,6 +811,24 @@ public void testFunctionScoreQuery() {
+         assertTermsEqual(result.extractions, new Term("_field", "_value"));
+     }
+ 
++    public void testFunctionScoreQuery_withMatchAll() {
++        MatchAllDocsQuery innerQuery = new MatchAllDocsQuery();
++        FunctionScoreQuery functionScoreQuery1 = new FunctionScoreQuery(innerQuery, new RandomScoreFunction(0, 0, null));
++        Result result = analyze(functionScoreQuery1, Version.CURRENT);
++        assertThat(result.verified, is(true));
++        assertThat(result.minimumShouldMatch, equalTo(0));
++        assertThat(result.matchAllDocs, is(true));
++        assertThat(result.extractions.isEmpty(), is(true));
++
++        FunctionScoreQuery functionScoreQuery2 =
++            new FunctionScoreQuery(innerQuery, new RandomScoreFunction(0, 0, null), CombineFunction.MULTIPLY, 1f, 10f);
++        result = analyze(functionScoreQuery2, Version.CURRENT);
++        assertThat(result.verified, is(false));
++        assertThat(result.minimumShouldMatch, equalTo(0));
++        assertThat(result.matchAllDocs, is(true));
++        assertThat(result.extractions.isEmpty(), is(true));
++    }
++
+     public void testSelectBestExtraction() {
+         Set<QueryExtraction> queryTerms1 = terms(new int[0], "12", "1234", "12345");
+         Set<QueryAnalyzer.QueryExtraction> queryTerms2 = terms(new int[0], "123", "1234", "12345");

@@ -1,0 +1,244 @@
+diff --git a/server/src/main/java/org/elasticsearch/action/admin/indices/rollover/TransportRolloverAction.java b/server/src/main/java/org/elasticsearch/action/admin/indices/rollover/TransportRolloverAction.java
+index d889b891c1c7..bbd841d4f62f 100644
+--- a/server/src/main/java/org/elasticsearch/action/admin/indices/rollover/TransportRolloverAction.java
++++ b/server/src/main/java/org/elasticsearch/action/admin/indices/rollover/TransportRolloverAction.java
+@@ -23,6 +23,8 @@
+ import org.elasticsearch.action.admin.indices.alias.IndicesAliasesClusterStateUpdateRequest;
+ import org.elasticsearch.action.admin.indices.create.CreateIndexClusterStateUpdateRequest;
+ import org.elasticsearch.action.admin.indices.create.CreateIndexRequest;
++import org.elasticsearch.action.admin.indices.stats.IndicesStatsAction;
++import org.elasticsearch.action.admin.indices.stats.IndicesStatsRequest;
+ import org.elasticsearch.action.admin.indices.stats.IndicesStatsResponse;
+ import org.elasticsearch.action.support.ActionFilters;
+ import org.elasticsearch.action.support.ActiveShardCount;
+@@ -49,6 +51,8 @@
+ import org.elasticsearch.common.settings.Settings;
+ import org.elasticsearch.common.unit.ByteSizeValue;
+ import org.elasticsearch.index.shard.DocsStats;
++import org.elasticsearch.indices.IndexClosedException;
++import org.elasticsearch.tasks.Task;
+ import org.elasticsearch.threadpool.ThreadPool;
+ import org.elasticsearch.transport.TransportService;
+ 
+@@ -107,12 +111,21 @@ protected ClusterBlockException checkBlock(RolloverRequest request, ClusterState
+     }
+ 
+     @Override
+-    protected void masterOperation(final RolloverRequest rolloverRequest, final ClusterState state,
++    protected void masterOperation(RolloverRequest request, ClusterState state,
++                                   ActionListener<RolloverResponse> listener) throws Exception {
++        throw new UnsupportedOperationException("The task parameter is required");
++    }
++
++    @Override
++    protected void masterOperation(Task task, final RolloverRequest rolloverRequest, final ClusterState state,
+                                    final ActionListener<RolloverResponse> listener) {
+         final MetaData metaData = state.metaData();
+         validate(metaData, rolloverRequest);
+         final AliasOrIndex.Alias alias = (AliasOrIndex.Alias) metaData.getAliasAndIndexLookup().get(rolloverRequest.getAlias());
+         final IndexMetaData indexMetaData = alias.getWriteIndex();
++        if (IndexMetaData.State.CLOSE.equals(indexMetaData.getState())) {
++            throw new IndexClosedException(indexMetaData.getIndex());
++        }
+         final boolean explicitWriteIndex = Boolean.TRUE.equals(indexMetaData.getAliases().get(alias.getAliasName()).writeIndex());
+         final String sourceProvidedName = indexMetaData.getSettings().get(IndexMetaData.SETTING_INDEX_PROVIDED_NAME,
+             indexMetaData.getIndex().getName());
+@@ -123,7 +136,12 @@ protected void masterOperation(final RolloverRequest rolloverRequest, final Clus
+         final String rolloverIndexName = indexNameExpressionResolver.resolveDateMathExpression(unresolvedName);
+         MetaDataCreateIndexService.validateIndexName(rolloverIndexName, state); // will fail if the index already exists
+         checkNoDuplicatedAliasInIndexTemplate(metaData, rolloverIndexName, rolloverRequest.getAlias());
+-        client.admin().indices().prepareStats(rolloverRequest.getAlias()).clear().setDocs(true).execute(
++        IndicesStatsRequest statsRequest = new IndicesStatsRequest().indices(rolloverRequest.getAlias())
++            .clear()
++            .indicesOptions(IndicesOptions.fromOptions(true, false, true, true))
++            .docs(true);
++        statsRequest.setParentTask(clusterService.localNode().getId(), task.getId());
++        client.execute(IndicesStatsAction.INSTANCE, statsRequest,
+             new ActionListener<IndicesStatsResponse>() {
+                 @Override
+                 public void onResponse(IndicesStatsResponse statsResponse) {
+diff --git a/server/src/test/java/org/elasticsearch/action/admin/indices/rollover/RolloverIT.java b/server/src/test/java/org/elasticsearch/action/admin/indices/rollover/RolloverIT.java
+index ab039d1427b4..af29a100d6f0 100644
+--- a/server/src/test/java/org/elasticsearch/action/admin/indices/rollover/RolloverIT.java
++++ b/server/src/test/java/org/elasticsearch/action/admin/indices/rollover/RolloverIT.java
+@@ -29,6 +29,7 @@
+ import org.elasticsearch.common.unit.ByteSizeUnit;
+ import org.elasticsearch.common.unit.ByteSizeValue;
+ import org.elasticsearch.common.unit.TimeValue;
++import org.elasticsearch.indices.IndexClosedException;
+ import org.elasticsearch.plugins.Plugin;
+ import org.elasticsearch.test.ESIntegTestCase;
+ import org.elasticsearch.test.InternalSettingsPlugin;
+@@ -40,6 +41,7 @@
+ import java.util.List;
+ import java.util.Set;
+ 
++import static org.elasticsearch.index.mapper.MapperService.SINGLE_MAPPING_NAME;
+ import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;
+ import static org.hamcrest.Matchers.containsInAnyOrder;
+ import static org.hamcrest.Matchers.equalTo;
+@@ -381,4 +383,56 @@ public void testRejectIfAliasFoundInTemplate() throws Exception {
+         assertThat(error.getMessage(), equalTo(
+             "Rollover alias [logs-write] can point to multiple indices, found duplicated alias [[logs-write]] in index template [logs]"));
+     }
++
++    public void testRolloverWithClosedIndexInAlias() throws Exception {
++        final String aliasName = "alias";
++        final String openNonwriteIndex = "open-index-nonwrite";
++        final String closedIndex = "closed-index-nonwrite";
++        final String writeIndexPrefix = "write-index-";
++        assertAcked(prepareCreate(openNonwriteIndex).addAlias(new Alias(aliasName)).get());
++        assertAcked(prepareCreate(closedIndex).addAlias(new Alias(aliasName)).get());
++        assertAcked(prepareCreate(writeIndexPrefix + "000001").addAlias(new Alias(aliasName).writeIndex(true)).get());
++
++        index(closedIndex, SINGLE_MAPPING_NAME, null, "{\"foo\": \"bar\"}");
++        index(aliasName, SINGLE_MAPPING_NAME, null, "{\"foo\": \"bar\"}");
++        index(aliasName, SINGLE_MAPPING_NAME, null, "{\"foo\": \"bar\"}");
++        refresh(aliasName);
++
++        assertAcked(client().admin().indices().prepareClose(closedIndex).get());
++
++        RolloverResponse rolloverResponse = client().admin().indices().prepareRolloverIndex(aliasName)
++            .addMaxIndexDocsCondition(1)
++            .get();
++        assertTrue(rolloverResponse.isRolledOver());
++        assertEquals(writeIndexPrefix + "000001", rolloverResponse.getOldIndex());
++        assertEquals(writeIndexPrefix + "000002", rolloverResponse.getNewIndex());
++    }
++
++    public void testRolloverWithClosedWriteIndex() throws Exception {
++        final String aliasName = "alias";
++        final String openNonwriteIndex = "open-index-nonwrite";
++        final String closedIndex = "closed-index-nonwrite";
++        final String writeIndexPrefix = "write-index-";
++        assertAcked(prepareCreate(openNonwriteIndex).addAlias(new Alias(aliasName)).get());
++        assertAcked(prepareCreate(closedIndex).addAlias(new Alias(aliasName)).get());
++        assertAcked(prepareCreate(writeIndexPrefix + "000001").addAlias(new Alias(aliasName).writeIndex(true)).get());
++
++        index(closedIndex, SINGLE_MAPPING_NAME, null, "{\"foo\": \"bar\"}");
++        index(aliasName, SINGLE_MAPPING_NAME, null, "{\"foo\": \"bar\"}");
++        index(aliasName, SINGLE_MAPPING_NAME, null, "{\"foo\": \"bar\"}");
++        refresh(aliasName);
++
++        assertAcked(client().admin().indices().prepareClose(closedIndex).get());
++        assertAcked(client().admin().indices().prepareClose(writeIndexPrefix + "000001").get());
++        ensureGreen(aliasName);
++
++        try {
++            RolloverResponse rolloverResponse = client().admin().indices().prepareRolloverIndex(aliasName)
++                .addMaxIndexDocsCondition(1)
++                .get();
++            fail("rolling over an alias with a closed write index should have failed");
++        } catch (IndexClosedException ex) {
++            // this is what we expect
++        }
++    }
+ }
+diff --git a/server/src/test/java/org/elasticsearch/action/admin/indices/rollover/TransportRolloverActionTests.java b/server/src/test/java/org/elasticsearch/action/admin/indices/rollover/TransportRolloverActionTests.java
+index 3814a47c6b22..39df0f921bb5 100644
+--- a/server/src/test/java/org/elasticsearch/action/admin/indices/rollover/TransportRolloverActionTests.java
++++ b/server/src/test/java/org/elasticsearch/action/admin/indices/rollover/TransportRolloverActionTests.java
+@@ -25,14 +25,13 @@
+ import org.elasticsearch.action.admin.indices.create.CreateIndexClusterStateUpdateRequest;
+ import org.elasticsearch.action.admin.indices.stats.CommonStats;
+ import org.elasticsearch.action.admin.indices.stats.IndexStats;
+-import org.elasticsearch.action.admin.indices.stats.IndicesStatsRequestBuilder;
++import org.elasticsearch.action.admin.indices.stats.IndicesStatsAction;
++import org.elasticsearch.action.admin.indices.stats.IndicesStatsRequest;
+ import org.elasticsearch.action.admin.indices.stats.IndicesStatsResponse;
+ import org.elasticsearch.action.support.ActionFilters;
+ import org.elasticsearch.action.support.ActiveShardCount;
+ import org.elasticsearch.action.support.PlainActionFuture;
+-import org.elasticsearch.client.AdminClient;
+ import org.elasticsearch.client.Client;
+-import org.elasticsearch.client.IndicesAdminClient;
+ import org.elasticsearch.cluster.ClusterName;
+ import org.elasticsearch.cluster.ClusterState;
+ import org.elasticsearch.cluster.metadata.AliasAction;
+@@ -43,6 +42,7 @@
+ import org.elasticsearch.cluster.metadata.MetaData;
+ import org.elasticsearch.cluster.metadata.MetaDataCreateIndexService;
+ import org.elasticsearch.cluster.metadata.MetaDataIndexAliasesService;
++import org.elasticsearch.cluster.node.DiscoveryNode;
+ import org.elasticsearch.cluster.service.ClusterService;
+ import org.elasticsearch.common.UUIDs;
+ import org.elasticsearch.common.settings.Settings;
+@@ -53,6 +53,7 @@
+ import org.elasticsearch.index.Index;
+ import org.elasticsearch.index.shard.DocsStats;
+ import org.elasticsearch.rest.action.cat.RestIndicesActionTests;
++import org.elasticsearch.tasks.Task;
+ import org.elasticsearch.test.ESTestCase;
+ import org.elasticsearch.threadpool.ThreadPool;
+ import org.elasticsearch.transport.TransportService;
+@@ -345,9 +346,12 @@ public void testRejectDuplicateAlias() {
+         assertThat(ex.getMessage(), containsString("index template [test-template]"));
+     }
+ 
+-    public void testConditionEvaluationWhenAliasToWriteAndReadIndicesConsidersOnlyPrimariesFromWriteIndex() {
++    public void testConditionEvaluationWhenAliasToWriteAndReadIndicesConsidersOnlyPrimariesFromWriteIndex() throws Exception {
+         final TransportService mockTransportService = mock(TransportService.class);
+         final ClusterService mockClusterService = mock(ClusterService.class);
++        final DiscoveryNode mockNode = mock(DiscoveryNode.class);
++        when(mockNode.getId()).thenReturn("mocknode");
++        when(mockClusterService.localNode()).thenReturn(mockNode);
+         final ThreadPool mockThreadPool = mock(ThreadPool.class);
+         final MetaDataCreateIndexService mockCreateIndexService = mock(MetaDataCreateIndexService.class);
+         final IndexNameExpressionResolver mockIndexNameExpressionResolver = mock(IndexNameExpressionResolver.class);
+@@ -356,31 +360,25 @@ public void testConditionEvaluationWhenAliasToWriteAndReadIndicesConsidersOnlyPr
+         final MetaDataIndexAliasesService mdIndexAliasesService = mock(MetaDataIndexAliasesService.class);
+ 
+         final Client mockClient = mock(Client.class);
+-        final AdminClient mockAdminClient = mock(AdminClient.class);
+-        final IndicesAdminClient mockIndicesAdminClient = mock(IndicesAdminClient.class);
+-        when(mockClient.admin()).thenReturn(mockAdminClient);
+-        when(mockAdminClient.indices()).thenReturn(mockIndicesAdminClient);
+ 
+-        final IndicesStatsRequestBuilder mockIndicesStatsBuilder = mock(IndicesStatsRequestBuilder.class);
+-        when(mockIndicesAdminClient.prepareStats(any())).thenReturn(mockIndicesStatsBuilder);
+         final Map<String, IndexStats> indexStats = new HashMap<>();
+         int total = randomIntBetween(500, 1000);
+         indexStats.put("logs-index-000001", createIndexStats(200L, total));
+         indexStats.put("logs-index-000002", createIndexStats(300L, total));
+         final IndicesStatsResponse statsResponse = createAliasToMultipleIndicesStatsResponse(indexStats);
+-        when(mockIndicesStatsBuilder.clear()).thenReturn(mockIndicesStatsBuilder);
+-        when(mockIndicesStatsBuilder.setDocs(true)).thenReturn(mockIndicesStatsBuilder);
+ 
+-        assert statsResponse.getPrimaries().getDocs().getCount() == 500L;
+-        assert statsResponse.getTotal().getDocs().getCount() == (total + total);
+ 
+         doAnswer(invocation -> {
+             Object[] args = invocation.getArguments();
+-            assert args.length == 1;
+-            ActionListener<IndicesStatsResponse> listener = (ActionListener<IndicesStatsResponse>) args[0];
++            assert args.length == 3;
++            @SuppressWarnings("unchecked")
++            ActionListener<IndicesStatsResponse> listener = (ActionListener<IndicesStatsResponse>) args[2];
+             listener.onResponse(statsResponse);
+             return null;
+-        }).when(mockIndicesStatsBuilder).execute(any(ActionListener.class));
++        }).when(mockClient).execute(any(IndicesStatsAction.class), any(IndicesStatsRequest.class), any(ActionListener.class));
++
++        assert statsResponse.getPrimaries().getDocs().getCount() == 500L;
++        assert statsResponse.getTotal().getDocs().getCount() == (total + total);
+ 
+         final IndexMetaData.Builder indexMetaData = IndexMetaData.builder("logs-index-000001")
+                 .putAlias(AliasMetaData.builder("logs-alias").writeIndex(false).build()).settings(settings(Version.CURRENT))
+@@ -401,7 +399,7 @@ public void testConditionEvaluationWhenAliasToWriteAndReadIndicesConsidersOnlyPr
+         RolloverRequest rolloverRequest = new RolloverRequest("logs-alias", "logs-index-000003");
+         rolloverRequest.addMaxIndexDocsCondition(500L);
+         rolloverRequest.dryRun(true);
+-        transportRolloverAction.masterOperation(rolloverRequest, stateBefore, future);
++        transportRolloverAction.masterOperation(mock(Task.class), rolloverRequest, stateBefore, future);
+ 
+         RolloverResponse response = future.actionGet();
+         assertThat(response.getOldIndex(), equalTo("logs-index-000002"));
+@@ -417,7 +415,7 @@ public void testConditionEvaluationWhenAliasToWriteAndReadIndicesConsidersOnlyPr
+         rolloverRequest = new RolloverRequest("logs-alias", "logs-index-000003");
+         rolloverRequest.addMaxIndexDocsCondition(300L);
+         rolloverRequest.dryRun(true);
+-        transportRolloverAction.masterOperation(rolloverRequest, stateBefore, future);
++        transportRolloverAction.masterOperation(mock(Task.class), rolloverRequest, stateBefore, future);
+ 
+         response = future.actionGet();
+         assertThat(response.getOldIndex(), equalTo("logs-index-000002"));

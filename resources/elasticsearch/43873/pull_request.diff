@@ -1,0 +1,328 @@
+diff --git a/server/src/main/java/org/elasticsearch/cluster/metadata/MetaDataDeleteIndexService.java b/server/src/main/java/org/elasticsearch/cluster/metadata/MetaDataDeleteIndexService.java
+index 2b5bb0c94b41..fe71b2beefe2 100644
+--- a/server/src/main/java/org/elasticsearch/cluster/metadata/MetaDataDeleteIndexService.java
++++ b/server/src/main/java/org/elasticsearch/cluster/metadata/MetaDataDeleteIndexService.java
+@@ -38,6 +38,7 @@
+ import org.elasticsearch.common.util.set.Sets;
+ import org.elasticsearch.index.Index;
+ import org.elasticsearch.snapshots.RestoreService;
++import org.elasticsearch.snapshots.SnapshotInProgressException;
+ import org.elasticsearch.snapshots.SnapshotsService;
+ 
+ import java.util.Arrays;
+@@ -90,9 +91,15 @@ public ClusterState execute(final ClusterState currentState) {
+      */
+     public ClusterState deleteIndices(ClusterState currentState, Set<Index> indices) {
+         final MetaData meta = currentState.metaData();
+-        final Set<IndexMetaData> metaDatas = indices.stream().map(i -> meta.getIndexSafe(i)).collect(toSet());
++        final Set<Index> indicesToDelete = indices.stream().map(i -> meta.getIndexSafe(i).getIndex()).collect(toSet());
++
+         // Check if index deletion conflicts with any running snapshots
+-        SnapshotsService.checkIndexDeletion(currentState, metaDatas);
++        Set<Index> snapshottingIndices = SnapshotsService.snapshottingIndices(currentState, indicesToDelete);
++        if (snapshottingIndices.isEmpty() == false) {
++            throw new SnapshotInProgressException("Cannot delete indices that are being snapshotted: " + snapshottingIndices +
++                ". Try again after snapshot finishes or cancel the currently running snapshot.");
++        }
++
+         RoutingTable.Builder routingTableBuilder = RoutingTable.builder(currentState.routingTable());
+         MetaData.Builder metaDataBuilder = MetaData.builder(meta);
+         ClusterBlocks.Builder clusterBlocksBuilder = ClusterBlocks.builder().blocks(currentState.blocks());
+diff --git a/server/src/main/java/org/elasticsearch/cluster/metadata/MetaDataIndexStateService.java b/server/src/main/java/org/elasticsearch/cluster/metadata/MetaDataIndexStateService.java
+index d37a134c0a77..5becb69d615d 100644
+--- a/server/src/main/java/org/elasticsearch/cluster/metadata/MetaDataIndexStateService.java
++++ b/server/src/main/java/org/elasticsearch/cluster/metadata/MetaDataIndexStateService.java
+@@ -68,6 +68,7 @@
+ import org.elasticsearch.indices.IndicesService;
+ import org.elasticsearch.rest.RestStatus;
+ import org.elasticsearch.snapshots.RestoreService;
++import org.elasticsearch.snapshots.SnapshotInProgressException;
+ import org.elasticsearch.snapshots.SnapshotsService;
+ import org.elasticsearch.tasks.TaskId;
+ import org.elasticsearch.threadpool.ThreadPool;
+@@ -86,6 +87,7 @@
+ import java.util.function.Consumer;
+ import java.util.stream.Collectors;
+ 
++import static java.util.Collections.singleton;
+ import static java.util.Collections.unmodifiableMap;
+ 
+ /**
+@@ -230,11 +232,11 @@ static ClusterState addIndexClosedBlocks(final Index[] indices, final Map<Index,
+                                              final ClusterState currentState) {
+         final MetaData.Builder metadata = MetaData.builder(currentState.metaData());
+ 
+-        final Set<IndexMetaData> indicesToClose = new HashSet<>();
++        final Set<Index> indicesToClose = new HashSet<>();
+         for (Index index : indices) {
+             final IndexMetaData indexMetaData = metadata.getSafe(index);
+             if (indexMetaData.getState() != IndexMetaData.State.CLOSE) {
+-                indicesToClose.add(indexMetaData);
++                indicesToClose.add(index);
+             } else {
+                 logger.debug("index {} is already closed, ignoring", index);
+                 assert currentState.blocks().hasIndexBlock(index.getName(), INDEX_CLOSED_BLOCK);
+@@ -246,16 +248,22 @@ static ClusterState addIndexClosedBlocks(final Index[] indices, final Map<Index,
+         }
+ 
+         // Check if index closing conflicts with any running restores
+-        RestoreService.checkIndexClosing(currentState, indicesToClose);
++        Set<Index> restoringIndices = RestoreService.restoringIndices(currentState, indicesToClose);
++        if (restoringIndices.isEmpty() == false) {
++            throw new IllegalArgumentException("Cannot close indices that are being restored: " + restoringIndices);
++        }
++
+         // Check if index closing conflicts with any running snapshots
+-        SnapshotsService.checkIndexClosing(currentState, indicesToClose);
++        Set<Index> snapshottingIndices = SnapshotsService.snapshottingIndices(currentState, indicesToClose);
++        if (snapshottingIndices.isEmpty() == false) {
++            throw new SnapshotInProgressException("Cannot close indices that are being snapshotted: " + snapshottingIndices +
++                ". Try again after snapshot finishes or cancel the currently running snapshot.");
++        }
+ 
+         final ClusterBlocks.Builder blocks = ClusterBlocks.builder().blocks(currentState.blocks());
+         final RoutingTable.Builder routingTable = RoutingTable.builder(currentState.routingTable());
+ 
+-        for (IndexMetaData indexToClose : indicesToClose) {
+-            final Index index = indexToClose.getIndex();
+-
++        for (Index index : indicesToClose) {
+             ClusterBlock indexBlock = null;
+             final Set<ClusterBlock> clusterBlocks = currentState.blocks().indices().get(index.getName());
+             if (clusterBlocks != null) {
+@@ -453,6 +461,24 @@ public void onFailure(Exception e) {
+                     continue;
+                 }
+ 
++                // Check if index closing conflicts with any running restores
++                Set<Index> restoringIndices = RestoreService.restoringIndices(currentState, singleton(index));
++                if (restoringIndices.isEmpty() == false) {
++                    closingResults.put(result.getKey(), new IndexResult(result.getKey(), new IllegalStateException(
++                        "verification of shards before closing " + index + " succeeded but index is being restored in the meantime")));
++                    logger.debug("verification of shards before closing {} succeeded but index is being restored in the meantime", index);
++                    continue;
++                }
++
++                // Check if index closing conflicts with any running snapshots
++                Set<Index> snapshottingIndices = SnapshotsService.snapshottingIndices(currentState, singleton(index));
++                if (snapshottingIndices.isEmpty() == false) {
++                    closingResults.put(result.getKey(), new IndexResult(result.getKey(), new IllegalStateException(
++                        "verification of shards before closing " + index + " succeeded but index is being snapshot in the meantime")));
++                    logger.debug("verification of shards before closing {} succeeded but index is being snapshot in the meantime", index);
++                    continue;
++                }
++
+                 blocks.removeIndexBlockWithId(index.getName(), INDEX_CLOSED_BLOCK_ID);
+                 blocks.addIndexBlock(index.getName(), INDEX_CLOSED_BLOCK);
+                 final IndexMetaData.Builder updatedMetaData = IndexMetaData.builder(indexMetaData).state(IndexMetaData.State.CLOSE);
+diff --git a/server/src/main/java/org/elasticsearch/snapshots/RestoreService.java b/server/src/main/java/org/elasticsearch/snapshots/RestoreService.java
+index f48ea7e41d55..ff26ecf92aaf 100644
+--- a/server/src/main/java/org/elasticsearch/snapshots/RestoreService.java
++++ b/server/src/main/java/org/elasticsearch/snapshots/RestoreService.java
+@@ -83,6 +83,7 @@
+ import java.util.function.Predicate;
+ import java.util.stream.Collectors;
+ 
++import static java.util.Collections.emptySet;
+ import static java.util.Collections.unmodifiableSet;
+ import static org.elasticsearch.cluster.metadata.IndexMetaData.SETTING_AUTO_EXPAND_REPLICAS;
+ import static org.elasticsearch.cluster.metadata.IndexMetaData.SETTING_CREATION_DATE;
+@@ -857,30 +858,26 @@ private static boolean failed(SnapshotInfo snapshot, String index) {
+     }
+ 
+     /**
+-     * Check if any of the indices to be closed are currently being restored from a snapshot and fail closing if such an index
+-     * is found as closing an index that is being restored makes the index unusable (it cannot be recovered).
++     * Returns the indices that are currently being restored and that are contained in the indices-to-check set.
+      */
+-    public static void checkIndexClosing(ClusterState currentState, Set<IndexMetaData> indices) {
+-        RestoreInProgress restore = currentState.custom(RestoreInProgress.TYPE);
+-        if (restore != null) {
+-            Set<Index> indicesToFail = null;
+-            for (RestoreInProgress.Entry entry : restore) {
+-                for (ObjectObjectCursor<ShardId, RestoreInProgress.ShardRestoreStatus> shard : entry.shards()) {
+-                    if (!shard.value.state().completed()) {
+-                        IndexMetaData indexMetaData = currentState.metaData().index(shard.key.getIndex());
+-                        if (indexMetaData != null && indices.contains(indexMetaData)) {
+-                            if (indicesToFail == null) {
+-                                indicesToFail = new HashSet<>();
+-                            }
+-                            indicesToFail.add(shard.key.getIndex());
+-                        }
+-                    }
++    public static Set<Index> restoringIndices(final ClusterState currentState, final Set<Index> indicesToCheck) {
++        final RestoreInProgress restore = currentState.custom(RestoreInProgress.TYPE);
++        if (restore == null) {
++            return emptySet();
++        }
++
++        final Set<Index> indices = new HashSet<>();
++        for (RestoreInProgress.Entry entry : restore) {
++            for (ObjectObjectCursor<ShardId, RestoreInProgress.ShardRestoreStatus> shard : entry.shards()) {
++                Index index = shard.key.getIndex();
++                if (indicesToCheck.contains(index)
++                    && shard.value.state().completed() == false
++                    && currentState.getMetaData().index(index) != null) {
++                    indices.add(index);
+                 }
+             }
+-            if (indicesToFail != null) {
+-                throw new IllegalArgumentException("Cannot close indices that are being restored: " + indicesToFail);
+-            }
+         }
++        return indices;
+     }
+ 
+     @Override
+diff --git a/server/src/main/java/org/elasticsearch/snapshots/SnapshotsService.java b/server/src/main/java/org/elasticsearch/snapshots/SnapshotsService.java
+index 6812c37f4cd3..ce9843d8670b 100644
+--- a/server/src/main/java/org/elasticsearch/snapshots/SnapshotsService.java
++++ b/server/src/main/java/org/elasticsearch/snapshots/SnapshotsService.java
+@@ -86,6 +86,7 @@
+ import java.util.stream.Collectors;
+ import java.util.stream.StreamSupport;
+ 
++import static java.util.Collections.emptySet;
+ import static java.util.Collections.unmodifiableList;
+ import static java.util.Collections.unmodifiableMap;
+ import static org.elasticsearch.cluster.SnapshotsInProgress.completed;
+@@ -1418,62 +1419,37 @@ public void clusterStateProcessed(String source, ClusterState oldState, ClusterS
+     }
+ 
+     /**
+-     * Check if any of the indices to be deleted are currently being snapshotted. Fail as deleting an index that is being
+-     * snapshotted (with partial == false) makes the snapshot fail.
++     * Returns the indices that are currently being snapshotted (with partial == false) and that are contained in the indices-to-check set.
+      */
+-    public static void checkIndexDeletion(ClusterState currentState, Set<IndexMetaData> indices) {
+-        Set<Index> indicesToFail = indicesToFailForCloseOrDeletion(currentState, indices);
+-        if (indicesToFail != null) {
+-            throw new SnapshotInProgressException("Cannot delete indices that are being snapshotted: " + indicesToFail +
+-                ". Try again after snapshot finishes or cancel the currently running snapshot.");
++    public static Set<Index> snapshottingIndices(final ClusterState currentState, final Set<Index> indicesToCheck) {
++        final SnapshotsInProgress snapshots = currentState.custom(SnapshotsInProgress.TYPE);
++        if (snapshots == null) {
++            return emptySet();
+         }
+-    }
+-
+-    /**
+-     * Check if any of the indices to be closed are currently being snapshotted. Fail as closing an index that is being
+-     * snapshotted (with partial == false) makes the snapshot fail.
+-     */
+-    public static void checkIndexClosing(ClusterState currentState, Set<IndexMetaData> indices) {
+-        Set<Index> indicesToFail = indicesToFailForCloseOrDeletion(currentState, indices);
+-        if (indicesToFail != null) {
+-            throw new SnapshotInProgressException("Cannot close indices that are being snapshotted: " + indicesToFail +
+-                ". Try again after snapshot finishes or cancel the currently running snapshot.");
+-        }
+-    }
+ 
+-    private static Set<Index> indicesToFailForCloseOrDeletion(ClusterState currentState, Set<IndexMetaData> indices) {
+-        SnapshotsInProgress snapshots = currentState.custom(SnapshotsInProgress.TYPE);
+-        Set<Index> indicesToFail = null;
+-        if (snapshots != null) {
+-            for (final SnapshotsInProgress.Entry entry : snapshots.entries()) {
+-                if (entry.partial() == false) {
+-                    if (entry.state() == State.INIT) {
+-                        for (IndexId index : entry.indices()) {
+-                            IndexMetaData indexMetaData = currentState.metaData().index(index.getName());
+-                            if (indexMetaData != null && indices.contains(indexMetaData)) {
+-                                if (indicesToFail == null) {
+-                                    indicesToFail = new HashSet<>();
+-                                }
+-                                indicesToFail.add(indexMetaData.getIndex());
+-                            }
++        final Set<Index> indices = new HashSet<>();
++        for (final SnapshotsInProgress.Entry entry : snapshots.entries()) {
++            if (entry.partial() == false) {
++                if (entry.state() == State.INIT) {
++                    for (IndexId index : entry.indices()) {
++                        IndexMetaData indexMetaData = currentState.metaData().index(index.getName());
++                        if (indexMetaData != null && indicesToCheck.contains(indexMetaData.getIndex())) {
++                            indices.add(indexMetaData.getIndex());
+                         }
+-                    } else {
+-                        for (ObjectObjectCursor<ShardId, SnapshotsInProgress.ShardSnapshotStatus> shard : entry.shards()) {
+-                            if (!shard.value.state().completed()) {
+-                                IndexMetaData indexMetaData = currentState.metaData().index(shard.key.getIndex());
+-                                if (indexMetaData != null && indices.contains(indexMetaData)) {
+-                                    if (indicesToFail == null) {
+-                                        indicesToFail = new HashSet<>();
+-                                    }
+-                                    indicesToFail.add(shard.key.getIndex());
+-                                }
+-                            }
++                    }
++                } else {
++                    for (ObjectObjectCursor<ShardId, SnapshotsInProgress.ShardSnapshotStatus> shard : entry.shards()) {
++                        Index index = shard.key.getIndex();
++                        if (indicesToCheck.contains(index)
++                            && shard.value.state().completed() == false
++                            && currentState.getMetaData().index(index) != null) {
++                            indices.add(index);
+                         }
+                     }
+                 }
+             }
+         }
+-        return indicesToFail;
++        return indices;
+     }
+ 
+     /**
+diff --git a/server/src/test/java/org/elasticsearch/cluster/metadata/MetaDataIndexStateServiceTests.java b/server/src/test/java/org/elasticsearch/cluster/metadata/MetaDataIndexStateServiceTests.java
+index 96ce35dda77d..e128c7bc7192 100644
+--- a/server/src/test/java/org/elasticsearch/cluster/metadata/MetaDataIndexStateServiceTests.java
++++ b/server/src/test/java/org/elasticsearch/cluster/metadata/MetaDataIndexStateServiceTests.java
+@@ -63,6 +63,7 @@
+ 
+ import static java.util.Collections.emptyMap;
+ import static java.util.Collections.emptySet;
++import static java.util.Collections.singletonMap;
+ import static java.util.Collections.unmodifiableMap;
+ import static org.elasticsearch.cluster.metadata.IndexMetaData.SETTING_NUMBER_OF_REPLICAS;
+ import static org.elasticsearch.cluster.metadata.IndexMetaData.SETTING_NUMBER_OF_SHARDS;
+@@ -124,6 +125,42 @@ public void testCloseRoutingTable() {
+         }
+     }
+ 
++    public void testCloseRoutingTableWithRestoredIndex() {
++        ClusterState state = ClusterState.builder(new ClusterName("testCloseRoutingTableWithRestoredIndex")).build();
++
++        String indexName = "restored-index";
++        ClusterBlock block = MetaDataIndexStateService.createIndexClosingBlock();
++        state = addRestoredIndex(indexName, randomIntBetween(1, 5), randomIntBetween(0, 5), state);
++        state = ClusterState.builder(state)
++            .blocks(ClusterBlocks.builder().blocks(state.blocks()).addIndexBlock(indexName, block))
++            .build();
++
++        final Index index = state.metaData().index(indexName).getIndex();
++        final ClusterState updatedState =
++            MetaDataIndexStateService.closeRoutingTable(state, singletonMap(index, block), singletonMap(index, new IndexResult(index)))
++                .v1();
++        assertIsOpened(index.getName(), updatedState);
++        assertThat(updatedState.blocks().hasIndexBlockWithId(index.getName(), INDEX_CLOSED_BLOCK_ID), is(true));
++    }
++
++    public void testCloseRoutingTableWithSnapshottedIndex() {
++        ClusterState state = ClusterState.builder(new ClusterName("testCloseRoutingTableWithSnapshottedIndex")).build();
++
++        String indexName = "snapshotted-index";
++        ClusterBlock block = MetaDataIndexStateService.createIndexClosingBlock();
++        state = addSnapshotIndex(indexName, randomIntBetween(1, 5), randomIntBetween(0, 5), state);
++        state = ClusterState.builder(state)
++            .blocks(ClusterBlocks.builder().blocks(state.blocks()).addIndexBlock(indexName, block))
++            .build();
++
++        final Index index = state.metaData().index(indexName).getIndex();
++        final ClusterState updatedState =
++            MetaDataIndexStateService.closeRoutingTable(state, singletonMap(index, block), singletonMap(index, new IndexResult(index)))
++                .v1();
++        assertIsOpened(index.getName(), updatedState);
++        assertThat(updatedState.blocks().hasIndexBlockWithId(index.getName(), INDEX_CLOSED_BLOCK_ID), is(true));
++    }
++
+     public void testCloseRoutingTableRemovesRoutingTable() {
+         final Set<Index> nonBlockedIndices = new HashSet<>();
+         final Map<Index, ClusterBlock> blockedIndices = new HashMap<>();

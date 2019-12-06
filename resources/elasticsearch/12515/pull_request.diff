@@ -1,0 +1,142 @@
+diff --git a/src/main/java/org/elasticsearch/cluster/routing/RoutingService.java b/src/main/java/org/elasticsearch/cluster/routing/RoutingService.java
+index 3172ea0bee55..abec0e9a380c 100644
+--- a/src/main/java/org/elasticsearch/cluster/routing/RoutingService.java
++++ b/src/main/java/org/elasticsearch/cluster/routing/RoutingService.java
+@@ -48,11 +48,15 @@
+  */
+ public class RoutingService extends AbstractLifecycleComponent<RoutingService> implements ClusterStateListener {
+ 
++    public static final String CLUSTER_ROUTING_SERVICE_MINIMUM_DELAY_SETTING = "cluster.routing_service.minimum_reroute_delay";
++
+     private static final String CLUSTER_UPDATE_TASK_SOURCE = "cluster_reroute";
++    private static final TimeValue DEFAULT_ROUTING_SERVICE_MINIMUM_DELAY = TimeValue.timeValueSeconds(5);
+ 
+     final ThreadPool threadPool;
+     private final ClusterService clusterService;
+     private final AllocationService allocationService;
++    private final long minimumRerouteDelayMillis;
+ 
+     private AtomicBoolean rerouting = new AtomicBoolean();
+     private volatile long registeredNextDelaySetting = Long.MAX_VALUE;
+@@ -64,6 +68,8 @@ public RoutingService(Settings settings, ThreadPool threadPool, ClusterService c
+         this.threadPool = threadPool;
+         this.clusterService = clusterService;
+         this.allocationService = allocationService;
++        this.minimumRerouteDelayMillis = settings.getAsTime(CLUSTER_ROUTING_SERVICE_MINIMUM_DELAY_SETTING,
++                DEFAULT_ROUTING_SERVICE_MINIMUM_DELAY).millis();
+         if (clusterService != null) {
+             clusterService.addFirst(this);
+         }
+@@ -108,7 +114,10 @@ public void clusterChanged(ClusterChangedEvent event) {
+             if (nextDelaySetting > 0 && nextDelaySetting < registeredNextDelaySetting) {
+                 FutureUtils.cancel(registeredNextDelayFuture);
+                 registeredNextDelaySetting = nextDelaySetting;
+-                TimeValue nextDelay = TimeValue.timeValueMillis(UnassignedInfo.findNextDelayedAllocationIn(settings, event.state()));
++                long nextDelayMillis = UnassignedInfo.findNextDelayedAllocationIn(settings, event.state());
++                // Schedule the delay at least the minimum time in the future
++                nextDelayMillis = Math.max(this.minimumRerouteDelayMillis, nextDelayMillis);
++                TimeValue nextDelay = TimeValue.timeValueMillis(nextDelayMillis);
+                 logger.info("delaying allocation for [{}] unassigned shards, next check in [{}]", UnassignedInfo.getNumberOfDelayedUnassigned(settings, event.state()), nextDelay);
+                 registeredNextDelayFuture = threadPool.schedule(nextDelay, ThreadPool.Names.SAME, new AbstractRunnable() {
+                     @Override
+diff --git a/src/main/java/org/elasticsearch/cluster/routing/UnassignedInfo.java b/src/main/java/org/elasticsearch/cluster/routing/UnassignedInfo.java
+index b1c381567173..24ffe3f1e13d 100644
+--- a/src/main/java/org/elasticsearch/cluster/routing/UnassignedInfo.java
++++ b/src/main/java/org/elasticsearch/cluster/routing/UnassignedInfo.java
+@@ -190,7 +190,9 @@ public static int getNumberOfDelayedUnassigned(Settings settings, ClusterState s
+             if (shard.primary() == false) {
+                 IndexMetaData indexMetaData = state.metaData().index(shard.getIndex());
+                 long delay = shard.unassignedInfo().getDelayAllocationExpirationIn(settings, indexMetaData.getSettings());
+-                if (delay > 0) {
++                // A negative delay means the shard has already expired (and so
++                // should be considered) and a delay of 0 means there is no delay.
++                if (delay != 0) {
+                     count++;
+                 }
+             }
+diff --git a/src/test/java/org/elasticsearch/cluster/allocation/ClusterRerouteTests.java b/src/test/java/org/elasticsearch/cluster/allocation/ClusterRerouteTests.java
+index e0765eb221b5..2b4d72659d2c 100644
+--- a/src/test/java/org/elasticsearch/cluster/allocation/ClusterRerouteTests.java
++++ b/src/test/java/org/elasticsearch/cluster/allocation/ClusterRerouteTests.java
+@@ -19,11 +19,13 @@
+ 
+ package org.elasticsearch.cluster.allocation;
+ 
++import org.apache.lucene.util.LuceneTestCase;
+ import org.elasticsearch.action.admin.cluster.health.ClusterHealthResponse;
+ import org.elasticsearch.action.admin.cluster.health.ClusterHealthStatus;
+ import org.elasticsearch.action.admin.cluster.reroute.ClusterRerouteResponse;
+ import org.elasticsearch.cluster.ClusterState;
+ import org.elasticsearch.cluster.node.DiscoveryNode;
++import org.elasticsearch.cluster.routing.RoutingService;
+ import org.elasticsearch.cluster.routing.ShardRouting;
+ import org.elasticsearch.cluster.routing.ShardRoutingState;
+ import org.elasticsearch.cluster.routing.allocation.RerouteExplanation;
+@@ -33,15 +35,19 @@
+ import org.elasticsearch.cluster.routing.allocation.decider.Decision;
+ import org.elasticsearch.cluster.routing.allocation.decider.DisableAllocationDecider;
+ import org.elasticsearch.cluster.routing.allocation.decider.EnableAllocationDecider;
++import org.elasticsearch.cluster.routing.allocation.decider.ThrottlingAllocationDecider;
+ import org.elasticsearch.common.Priority;
+ import org.elasticsearch.common.io.FileSystemUtils;
+ import org.elasticsearch.common.logging.ESLogger;
+ import org.elasticsearch.common.logging.Loggers;
+ import org.elasticsearch.common.settings.Settings;
++import org.elasticsearch.common.unit.TimeValue;
+ import org.elasticsearch.env.NodeEnvironment;
+ import org.elasticsearch.index.shard.ShardId;
+ import org.elasticsearch.test.ElasticsearchIntegrationTest;
+ import org.elasticsearch.test.ElasticsearchIntegrationTest.ClusterScope;
++import org.elasticsearch.test.InternalTestCluster;
++import org.elasticsearch.test.junit.annotations.TestLogging;
+ import org.junit.Test;
+ 
+ import java.io.File;
+@@ -162,6 +168,47 @@ public void rerouteWithAllocateLocalGateway_enableAllocationSettings() throws Ex
+         rerouteWithAllocateLocalGateway(commonSettings);
+     }
+ 
++    /**
++     * Test that we don't miss any reroutes when concurrent_recoveries
++     * is set very low and there are a large number of unassigned shards.
++     */
++    @Test
++    @LuceneTestCase.Slow
++    public void testDelayWithALargeAmountOfShards() throws Exception {
++        Settings commonSettings = settingsBuilder()
++                .put("gateway.type", "local")
++                .put(ThrottlingAllocationDecider.CLUSTER_ROUTING_ALLOCATION_CONCURRENT_RECOVERIES, 1)
++                .put(RoutingService.CLUSTER_ROUTING_SERVICE_MINIMUM_DELAY_SETTING,
++                        TimeValue.timeValueSeconds(randomIntBetween(2, 6)))
++                .build();
++        logger.info("--> starting 4 nodes");
++        String node_1 = internalCluster().startNode(commonSettings);
++        internalCluster().startNode(commonSettings);
++        internalCluster().startNode(commonSettings);
++        internalCluster().startNode(commonSettings);
++
++        assertThat(cluster().size(), equalTo(4));
++        ClusterHealthResponse healthResponse = client().admin().cluster().prepareHealth().setWaitForNodes("4").execute().actionGet();
++        assertThat(healthResponse.isTimedOut(), equalTo(false));
++
++        logger.info("--> create indices");
++        for (int i = 0; i < 25; i++) {
++            client().admin().indices().prepareCreate("test" + i)
++                    .setSettings(settingsBuilder()
++                            .put("index.number_of_shards", 5).put("index.number_of_replicas", 1)
++                            .put("index.unassigned.node_left.delayed_timeout", randomIntBetween(4, 15) + "s"))
++                    .execute().actionGet();
++        }
++
++        ensureGreen(TimeValue.timeValueMinutes(1));
++
++        logger.info("--> stopping node1");
++        internalCluster().stopRandomNode(InternalTestCluster.nameFilter(node_1));
++
++        // This might run slowly on older hardware
++        ensureGreen(TimeValue.timeValueMinutes(2));
++    }
++
+     private void rerouteWithAllocateLocalGateway(Settings commonSettings) throws Exception {
+         logger.info("--> starting 2 nodes");
+         String node_1 = internalCluster().startNode(commonSettings);

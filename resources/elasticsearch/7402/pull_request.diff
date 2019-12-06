@@ -1,0 +1,379 @@
+diff --git a/src/main/java/org/elasticsearch/index/mapper/internal/ParentFieldMapper.java b/src/main/java/org/elasticsearch/index/mapper/internal/ParentFieldMapper.java
+index 10cf726256c0..9a1e78074abf 100644
+--- a/src/main/java/org/elasticsearch/index/mapper/internal/ParentFieldMapper.java
++++ b/src/main/java/org/elasticsearch/index/mapper/internal/ParentFieldMapper.java
+@@ -18,6 +18,7 @@
+  */
+ package org.elasticsearch.index.mapper.internal;
+ 
++import com.google.common.base.Objects;
+ import org.apache.lucene.document.Field;
+ import org.apache.lucene.document.FieldType;
+ import org.apache.lucene.index.FieldInfo.IndexOptions;
+@@ -33,8 +34,8 @@
+ import org.elasticsearch.common.lucene.BytesRefs;
+ import org.elasticsearch.common.lucene.Lucene;
+ import org.elasticsearch.common.lucene.search.Queries;
+-import org.elasticsearch.common.settings.ImmutableSettings;
+ import org.elasticsearch.common.settings.Settings;
++import org.elasticsearch.common.settings.loader.SettingsLoader;
+ import org.elasticsearch.common.xcontent.XContentBuilder;
+ import org.elasticsearch.index.codec.postingsformat.PostingsFormatProvider;
+ import org.elasticsearch.index.fielddata.FieldDataType;
+@@ -47,6 +48,9 @@
+ import java.util.List;
+ import java.util.Map;
+ 
++import static org.elasticsearch.common.settings.ImmutableSettings.builder;
++import static org.elasticsearch.common.settings.ImmutableSettings.settingsBuilder;
++import static org.elasticsearch.common.xcontent.support.XContentMapValues.nodeMapValue;
+ import static org.elasticsearch.index.mapper.MapperBuilders.parent;
+ 
+ /**
+@@ -75,14 +79,11 @@
+ 
+     public static class Builder extends Mapper.Builder<Builder, ParentFieldMapper> {
+ 
+-        private static final Settings FIELD_DATA_SETTINGS = ImmutableSettings.settingsBuilder()
+-                .put(Loading.KEY, Loading.EAGER_VALUE)
+-                .build();
+-
+         protected String indexName;
+ 
+         private String type;
+         protected PostingsFormatProvider postingsFormat;
++        protected Settings fieldDataSettings;
+ 
+         public Builder() {
+             super(Defaults.NAME);
+@@ -100,12 +101,17 @@ protected Builder postingsFormat(PostingsFormatProvider postingsFormat) {
+             return builder;
+         }
+ 
++        public Builder fieldDataSettings(Settings settings) {
++            this.fieldDataSettings = settings;
++            return builder;
++        }
++
+         @Override
+         public ParentFieldMapper build(BuilderContext context) {
+             if (type == null) {
+                 throw new MapperParsingException("Parent mapping must contain the parent type");
+             }
+-            return new ParentFieldMapper(name, indexName, type, postingsFormat, FIELD_DATA_SETTINGS, context.indexSettings());
++            return new ParentFieldMapper(name, indexName, type, postingsFormat, fieldDataSettings, context.indexSettings());
+         }
+     }
+ 
+@@ -121,6 +127,13 @@ public ParentFieldMapper build(BuilderContext context) {
+                 } else if (fieldName.equals("postings_format")) {
+                     String postingFormatName = fieldNode.toString();
+                     builder.postingsFormat(parserContext.postingFormatService().get(postingFormatName));
++                } else if (fieldName.equals("fielddata")) {
++                    // Only take over `loading`, since that is the only option now that is configurable:
++                    Map<String, String> fieldDataSettings = SettingsLoader.Helper.loadNestedFromMap(nodeMapValue(fieldNode, "fielddata"));
++                    if (fieldDataSettings.containsKey(Loading.KEY)) {
++                        Settings settings = settingsBuilder().put(Loading.KEY, fieldDataSettings.get(Loading.KEY)).build();
++                        builder.fieldDataSettings(settings);
++                    }
+                 }
+             }
+             return builder;
+@@ -139,6 +152,7 @@ protected ParentFieldMapper(String name, String indexName, String type, Postings
+ 
+     public ParentFieldMapper() {
+         this(Defaults.NAME, Defaults.NAME, null, null, null, null);
++        this.fieldDataType = new FieldDataType("_parent", settingsBuilder().put(Loading.KEY, Loading.LAZY_VALUE));
+     }
+ 
+     public String type() {
+@@ -152,7 +166,7 @@ public FieldType defaultFieldType() {
+ 
+     @Override
+     public FieldDataType defaultFieldDataType() {
+-        return new FieldDataType("_parent");
++        return new FieldDataType("_parent", settingsBuilder().put(Loading.KEY, Loading.EAGER_VALUE));
+     }
+ 
+     @Override
+@@ -333,9 +347,15 @@ public XContentBuilder toXContent(XContentBuilder builder, Params params) throws
+         if (!active()) {
+             return builder;
+         }
++        boolean includeDefaults = params.paramAsBoolean("include_defaults", false);
+ 
+         builder.startObject(CONTENT_TYPE);
+         builder.field("type", type);
++        if (customFieldDataSettings != null) {
++            builder.field("fielddata", (Map) customFieldDataSettings.getAsMap());
++        } else if (includeDefaults) {
++            builder.field("fielddata", (Map) fieldDataType.getSettings().getAsMap());
++        }
+         builder.endObject();
+         return builder;
+     }
+@@ -343,12 +363,20 @@ public XContentBuilder toXContent(XContentBuilder builder, Params params) throws
+     @Override
+     public void merge(Mapper mergeWith, MergeContext mergeContext) throws MergeMappingException {
+         ParentFieldMapper other = (ParentFieldMapper) mergeWith;
+-        if (active() == other.active()) {
+-            return;
++        if (!Objects.equal(type, other.type)) {
++            mergeContext.addConflict("The _parent field's type option can't be changed");
+         }
+ 
+-        if (active() != other.active() || !type.equals(other.type)) {
+-            mergeContext.addConflict("The _parent field can't be added or updated");
++        if (!mergeContext.mergeFlags().simulate()) {
++            ParentFieldMapper fieldMergeWith = (ParentFieldMapper) mergeWith;
++            if (fieldMergeWith.customFieldDataSettings != null) {
++                if (!Objects.equal(fieldMergeWith.customFieldDataSettings, this.customFieldDataSettings)) {
++                    this.customFieldDataSettings = fieldMergeWith.customFieldDataSettings;
++                    this.fieldDataType = new FieldDataType(defaultFieldDataType().getType(),
++                            builder().put(defaultFieldDataType().getSettings()).put(this.customFieldDataSettings)
++                    );
++                }
++            }
+         }
+     }
+ 
+diff --git a/src/main/java/org/elasticsearch/search/SearchService.java b/src/main/java/org/elasticsearch/search/SearchService.java
+index 2104fcc0ba45..a5e0c1360271 100644
+--- a/src/main/java/org/elasticsearch/search/SearchService.java
++++ b/src/main/java/org/elasticsearch/search/SearchService.java
+@@ -48,8 +48,8 @@
+ import org.elasticsearch.common.xcontent.XContentParser;
+ import org.elasticsearch.index.engine.Engine;
+ import org.elasticsearch.index.fielddata.FieldDataType;
++import org.elasticsearch.index.fielddata.IndexFieldData;
+ import org.elasticsearch.index.fielddata.IndexFieldDataService;
+-import org.elasticsearch.index.fielddata.IndexOrdinalsFieldData;
+ import org.elasticsearch.index.mapper.DocumentMapper;
+ import org.elasticsearch.index.mapper.FieldMapper;
+ import org.elasticsearch.index.mapper.FieldMapper.Loading;
+@@ -69,8 +69,11 @@
+ import org.elasticsearch.search.dfs.DfsPhase;
+ import org.elasticsearch.search.dfs.DfsSearchResult;
+ import org.elasticsearch.search.fetch.*;
+-import org.elasticsearch.search.internal.*;
++import org.elasticsearch.search.internal.DefaultSearchContext;
++import org.elasticsearch.search.internal.InternalScrollSearchRequest;
++import org.elasticsearch.search.internal.SearchContext;
+ import org.elasticsearch.search.internal.SearchContext.Lifetime;
++import org.elasticsearch.search.internal.ShardSearchRequest;
+ import org.elasticsearch.search.query.*;
+ import org.elasticsearch.search.warmer.IndexWarmersMetaData;
+ import org.elasticsearch.threadpool.ThreadPool;
+@@ -884,7 +887,7 @@ public TerminationHandle warmTopReader(final IndexShard indexShard, IndexMetaDat
+                     public void run() {
+                         try {
+                             final long start = System.nanoTime();
+-                            IndexOrdinalsFieldData ifd = indexFieldDataService.getForField(fieldMapper);
++                            IndexFieldData.Global ifd = indexFieldDataService.getForField(fieldMapper);
+                             ifd.loadGlobal(context.reader());
+                             if (indexShard.warmerService().logger().isTraceEnabled()) {
+                                 indexShard.warmerService().logger().trace("warmed global ordinals for [{}], took [{}]", fieldMapper.names().name(), TimeValue.timeValueNanos(System.nanoTime() - start));
+diff --git a/src/test/java/org/elasticsearch/search/child/ParentFieldLoadingTest.java b/src/test/java/org/elasticsearch/search/child/ParentFieldLoadingTest.java
+new file mode 100644
+index 000000000000..7e8ab594b9b1
+--- /dev/null
++++ b/src/test/java/org/elasticsearch/search/child/ParentFieldLoadingTest.java
+@@ -0,0 +1,185 @@
++/*
++ * Licensed to Elasticsearch under one or more contributor
++ * license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright
++ * ownership. Elasticsearch licenses this file to you under
++ * the Apache License, Version 2.0 (the "License"); you may
++ * not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++package org.elasticsearch.search.child;
++
++import org.elasticsearch.action.admin.cluster.stats.ClusterStatsResponse;
++import org.elasticsearch.action.admin.indices.mapping.put.PutMappingResponse;
++import org.elasticsearch.cluster.ClusterState;
++import org.elasticsearch.cluster.metadata.IndexMetaData;
++import org.elasticsearch.cluster.routing.ShardRouting;
++import org.elasticsearch.common.settings.ImmutableSettings;
++import org.elasticsearch.common.settings.Settings;
++import org.elasticsearch.common.xcontent.XContentBuilder;
++import org.elasticsearch.index.mapper.DocumentMapper;
++import org.elasticsearch.index.mapper.FieldMapper;
++import org.elasticsearch.index.mapper.MapperService;
++import org.elasticsearch.index.merge.policy.MergePolicyModule;
++import org.elasticsearch.index.service.IndexService;
++import org.elasticsearch.index.shard.service.InternalIndexShard;
++import org.elasticsearch.indices.IndicesService;
++import org.elasticsearch.test.ElasticsearchIntegrationTest;
++import org.elasticsearch.test.junit.annotations.TestLogging;
++import org.elasticsearch.update.UpdateTests;
++import org.junit.Test;
++
++import java.io.IOException;
++
++import static org.elasticsearch.common.xcontent.XContentFactory.jsonBuilder;
++import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;
++import static org.hamcrest.Matchers.equalTo;
++import static org.hamcrest.Matchers.greaterThan;
++
++/**
++ */
++public class ParentFieldLoadingTest extends ElasticsearchIntegrationTest {
++
++    private final Settings indexSettings = ImmutableSettings.builder()
++            .put(IndexMetaData.SETTING_NUMBER_OF_SHARDS, 1)
++            .put(IndexMetaData.SETTING_NUMBER_OF_REPLICAS, 0)
++            .put(InternalIndexShard.INDEX_REFRESH_INTERVAL, -1)
++                    // We never want merges in this test to ensure we have two segments for the last validation
++            .put(MergePolicyModule.MERGE_POLICY_TYPE_KEY, UpdateTests.NoMergePolicyProvider.class)
++            .build();
++
++    @Test
++    @TestLogging("index.warmer:TRACE")
++    public void testEagerParentFieldLoading() throws Exception {
++        logger.info("testing lazy loading...");
++        assertAcked(prepareCreate("test")
++                .setSettings(indexSettings)
++                .addMapping("parent")
++                .addMapping("child", childMapping(FieldMapper.Loading.LAZY)));
++        ensureGreen();
++
++        client().prepareIndex("test", "parent", "1").setSource("{}").get();
++        client().prepareIndex("test", "child", "1").setParent("1").setSource("{}").get();
++        refresh();
++
++        ClusterStatsResponse response = client().admin().cluster().prepareClusterStats().get();
++        assertThat(response.getIndicesStats().getIdCache().getMemorySizeInBytes(), equalTo(0l));
++
++        logger.info("testing default loading...");
++        assertAcked(client().admin().indices().prepareDelete("test").get());
++        assertAcked(prepareCreate("test")
++                .setSettings(indexSettings)
++                .addMapping("parent")
++                .addMapping("child", "_parent", "type=parent"));
++        ensureGreen();
++
++        client().prepareIndex("test", "parent", "1").setSource("{}").get();
++        client().prepareIndex("test", "child", "1").setParent("1").setSource("{}").get();
++        refresh();
++
++        response = client().admin().cluster().prepareClusterStats().get();
++        long idCacheSizeDefault = response.getIndicesStats().getIdCache().getMemorySizeInBytes();
++        assertThat(idCacheSizeDefault, greaterThan(0l));
++
++        logger.info("testing eager loading...");
++        assertAcked(client().admin().indices().prepareDelete("test").get());
++        assertAcked(prepareCreate("test")
++                .setSettings(indexSettings)
++                .addMapping("parent")
++                .addMapping("child", childMapping(FieldMapper.Loading.EAGER)));
++        ensureGreen();
++
++        client().prepareIndex("test", "parent", "1").setSource("{}").get();
++        client().prepareIndex("test", "child", "1").setParent("1").setSource("{}").get();
++        refresh();
++
++        response = client().admin().cluster().prepareClusterStats().get();
++        assertThat(response.getIndicesStats().getIdCache().getMemorySizeInBytes(), equalTo(idCacheSizeDefault));
++
++        logger.info("testing eager global ordinals loading...");
++        assertAcked(client().admin().indices().prepareDelete("test").get());
++        assertAcked(prepareCreate("test")
++                .setSettings(indexSettings)
++                .addMapping("parent")
++                .addMapping("child", childMapping(FieldMapper.Loading.EAGER_GLOBAL_ORDINALS)));
++        ensureGreen();
++
++        // Need to do 2 separate refreshes, otherwise we have 1 segment and then we can't measure if global ordinals
++        // is loaded by the size of the id_cache, because global ordinals on 1 segment shards takes no extra memory.
++        client().prepareIndex("test", "parent", "1").setSource("{}").get();
++        refresh();
++        client().prepareIndex("test", "child", "1").setParent("1").setSource("{}").get();
++        refresh();
++
++        response = client().admin().cluster().prepareClusterStats().get();
++        assertThat(response.getIndicesStats().getIdCache().getMemorySizeInBytes(), greaterThan(idCacheSizeDefault));
++    }
++
++    @Test
++    @TestLogging("index.warmer:TRACE")
++    public void testChangingEagerParentFieldLoadingAtRuntime() throws Exception {
++        assertAcked(prepareCreate("test")
++                .setSettings(indexSettings)
++                .addMapping("parent")
++                .addMapping("child", "_parent", "type=parent"));
++        ensureGreen();
++
++        client().prepareIndex("test", "parent", "1").setSource("{}").get();
++        client().prepareIndex("test", "child", "1").setParent("1").setSource("{}").get();
++        refresh();
++
++        ClusterStatsResponse response = client().admin().cluster().prepareClusterStats().get();
++        long idCacheSizeDefault = response.getIndicesStats().getIdCache().getMemorySizeInBytes();
++        assertThat(idCacheSizeDefault, greaterThan(0l));
++
++        PutMappingResponse putMappingResponse = client().admin().indices().preparePutMapping("test").setType("child")
++                .setSource(childMapping(FieldMapper.Loading.EAGER_GLOBAL_ORDINALS))
++                .get();
++        assertAcked(putMappingResponse);
++        assertBusy(new Runnable() {
++            @Override
++            public void run() {
++                ClusterState clusterState = internalCluster().clusterService().state();
++                ShardRouting shardRouting = clusterState.routingTable().index("test").shard(0).getShards().get(0);
++                String nodeName = clusterState.getNodes().get(shardRouting.currentNodeId()).getName();
++
++                boolean verified = false;
++                IndicesService indicesService = internalCluster().getInstance(IndicesService.class, nodeName);
++                IndexService indexService = indicesService.indexService("test");
++                if (indexService != null) {
++                    MapperService mapperService = indexService.mapperService();
++                    DocumentMapper documentMapper = mapperService.documentMapper("child");
++                    if (documentMapper != null) {
++                        verified = documentMapper.parentFieldMapper().fieldDataType().getLoading() == FieldMapper.Loading.EAGER_GLOBAL_ORDINALS;
++                    }
++                }
++                assertTrue(verified);
++            }
++        });
++
++        // Need to add a new doc otherwise the refresh doesn't trigger a new searcher
++        // Because it ends up in its own segment, but isn't of type parent or child, this doc doesn't contribute to the size of the id_cache
++        client().prepareIndex("test", "dummy", "dummy").setSource("{}").get();
++        refresh();
++        response = client().admin().cluster().prepareClusterStats().get();
++        assertThat(response.getIndicesStats().getIdCache().getMemorySizeInBytes(), greaterThan(idCacheSizeDefault));
++    }
++
++    private XContentBuilder childMapping(FieldMapper.Loading loading) throws IOException {
++        return jsonBuilder().startObject().startObject("child").startObject("_parent")
++                .field("type", "parent")
++                .startObject("fielddata").field(FieldMapper.Loading.KEY, loading).endObject()
++                .endObject().endObject().endObject();
++    }
++
++}
+diff --git a/src/test/java/org/elasticsearch/search/child/SimpleChildQuerySearchTests.java b/src/test/java/org/elasticsearch/search/child/SimpleChildQuerySearchTests.java
+index f2a3026fc724..661b7a2fd774 100644
+--- a/src/test/java/org/elasticsearch/search/child/SimpleChildQuerySearchTests.java
++++ b/src/test/java/org/elasticsearch/search/child/SimpleChildQuerySearchTests.java
+@@ -1521,7 +1521,7 @@ public void testAddingParentToExistingMapping() throws ElasticsearchException, I
+                     .endObject().endObject()).get();
+             fail();
+         } catch (MergeMappingException e) {
+-            assertThat(e.getMessage(), equalTo("Merge failed with failures {[The _parent field can't be added or updated]}"));
++            assertThat(e.getMessage(), equalTo("Merge failed with failures {[The _parent field's type option can't be changed]}"));
+         }
+     }
+ 

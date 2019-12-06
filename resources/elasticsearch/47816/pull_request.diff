@@ -1,0 +1,141 @@
+diff --git a/server/src/main/java/org/elasticsearch/index/shard/IndexShard.java b/server/src/main/java/org/elasticsearch/index/shard/IndexShard.java
+index 828247547e33..4a59b8dcce16 100644
+--- a/server/src/main/java/org/elasticsearch/index/shard/IndexShard.java
++++ b/server/src/main/java/org/elasticsearch/index/shard/IndexShard.java
+@@ -1216,6 +1216,15 @@ public void failShard(String reason, @Nullable Exception e) {
+         getEngine().failEngine(reason, e);
+     }
+ 
++    /**
++     * Acquire the searcher without applying the additional reader wrapper.
++     */
++    public Engine.Searcher acquireSearcherNoWrap(String source) {
++        readAllowed();
++        markSearcherAccessed();
++        return getEngine().acquireSearcher(source, Engine.SearcherScope.EXTERNAL);
++    }
++
+     public Engine.Searcher acquireSearcher(String source) {
+         return acquireSearcher(source, Engine.SearcherScope.EXTERNAL);
+     }
+diff --git a/server/src/main/java/org/elasticsearch/search/SearchService.java b/server/src/main/java/org/elasticsearch/search/SearchService.java
+index bb67c357f4cc..f0818d17b401 100644
+--- a/server/src/main/java/org/elasticsearch/search/SearchService.java
++++ b/server/src/main/java/org/elasticsearch/search/SearchService.java
+@@ -1011,10 +1011,16 @@ public AliasFilter buildAliasFilter(ClusterState state, String index, Set<String
+      */
+     public boolean canMatch(ShardSearchRequest request) throws IOException {
+         assert request.searchType() == SearchType.QUERY_THEN_FETCH : "unexpected search type: " + request.searchType();
+-        try (DefaultSearchContext context = createSearchContext(request, defaultSearchTimeout, false, "can_match")) {
+-            SearchSourceBuilder source = context.request().source();
+-            if (canRewriteToMatchNone(source)) {
+-                QueryBuilder queryBuilder = source.query();
++        IndexService indexService = indicesService.indexServiceSafe(request.shardId().getIndex());
++        IndexShard indexShard = indexService.getShard(request.shardId().getId());
++        // we don't want to use the reader wrapper since it could run costly operations
++        // and we can afford false positives.
++        try (Engine.Searcher searcher = indexShard.acquireSearcherNoWrap("can_match")) {
++            QueryShardContext context = indexService.newQueryShardContext(request.shardId().id(), searcher,
++                request::nowInMillis, request.getClusterAlias());
++            Rewriteable.rewrite(request.getRewriteable(), context, false);
++            if (canRewriteToMatchNone(request.source())) {
++                QueryBuilder queryBuilder = request.source().query();
+                 return queryBuilder instanceof MatchNoneQueryBuilder == false;
+             }
+             return true; // null query means match_all
+diff --git a/server/src/test/java/org/elasticsearch/search/SearchServiceTests.java b/server/src/test/java/org/elasticsearch/search/SearchServiceTests.java
+index a4526d979da6..c689f07cf807 100644
+--- a/server/src/test/java/org/elasticsearch/search/SearchServiceTests.java
++++ b/server/src/test/java/org/elasticsearch/search/SearchServiceTests.java
+@@ -19,6 +19,9 @@
+ package org.elasticsearch.search;
+ 
+ import com.carrotsearch.hppc.IntArrayList;
++import org.apache.lucene.index.DirectoryReader;
++import org.apache.lucene.index.FilterDirectoryReader;
++import org.apache.lucene.index.LeafReader;
+ import org.apache.lucene.search.Query;
+ import org.apache.lucene.store.AlreadyClosedException;
+ import org.elasticsearch.ElasticsearchException;
+@@ -76,6 +79,7 @@
+ import org.elasticsearch.search.internal.ShardSearchRequest;
+ import org.elasticsearch.search.suggest.SuggestBuilder;
+ import org.elasticsearch.test.ESSingleNodeTestCase;
++import org.junit.Before;
+ 
+ import java.io.IOException;
+ import java.util.Collection;
+@@ -88,6 +92,7 @@
+ import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.Semaphore;
+ import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.function.Function;
+ 
+ import static java.util.Collections.singletonList;
+@@ -111,7 +116,42 @@ protected boolean resetNodeAfterTest() {
+ 
+     @Override
+     protected Collection<Class<? extends Plugin>> getPlugins() {
+-        return pluginList(FailOnRewriteQueryPlugin.class, CustomScriptPlugin.class, InternalOrPrivateSettingsPlugin.class);
++        return pluginList(FailOnRewriteQueryPlugin.class, CustomScriptPlugin.class,
++            ReaderWrapperCountPlugin.class, InternalOrPrivateSettingsPlugin.class);
++    }
++
++    public static class ReaderWrapperCountPlugin extends Plugin {
++        @Override
++        public void onIndexModule(IndexModule indexModule) {
++            indexModule.setReaderWrapper(service -> SearchServiceTests::apply);
++        }
++    }
++
++    @Before
++    private void resetCount() {
++        numWrapInvocations = new AtomicInteger(0);
++    }
++
++    private static AtomicInteger numWrapInvocations = new AtomicInteger(0);
++    private static DirectoryReader apply(DirectoryReader directoryReader) throws IOException {
++        numWrapInvocations.incrementAndGet();
++        return new FilterDirectoryReader(directoryReader,
++            new FilterDirectoryReader.SubReaderWrapper() {
++            @Override
++            public LeafReader wrap(LeafReader reader) {
++                return reader;
++            }
++        }) {
++            @Override
++            protected DirectoryReader doWrapDirectoryReader(DirectoryReader in) throws IOException {
++                return in;
++            }
++
++            @Override
++            public CacheHelper getReaderCacheHelper() {
++                return directoryReader.getReaderCacheHelper();
++            }
++        };
+     }
+ 
+     public static class CustomScriptPlugin extends MockScriptPlugin {
+@@ -559,6 +599,7 @@ public void testCanMatch() throws IOException {
+         final IndexService indexService = indicesService.indexServiceSafe(resolveIndex("index"));
+         final IndexShard indexShard = indexService.getShard(0);
+         SearchRequest searchRequest = new SearchRequest().allowPartialSearchResults(true);
++        int numWrapReader = numWrapInvocations.get();
+         assertTrue(service.canMatch(new ShardSearchRequest(OriginalIndices.NONE, searchRequest, indexShard.shardId(), 1,
+             new AliasFilter(null, Strings.EMPTY_ARRAY), 1f, -1, null, null)));
+ 
+@@ -582,6 +623,13 @@ public void testCanMatch() throws IOException {
+         searchRequest.source(new SearchSourceBuilder().query(new MatchNoneQueryBuilder()));
+         assertFalse(service.canMatch(new ShardSearchRequest(OriginalIndices.NONE, searchRequest, indexShard.shardId(), 1,
+             new AliasFilter(null, Strings.EMPTY_ARRAY), 1f, -1, null, null)));
++        assertEquals(numWrapReader, numWrapInvocations.get());
++
++        // make sure that the wrapper is called when the context is actually created
++        service.createContext(new ShardSearchRequest(OriginalIndices.NONE, searchRequest,
++            indexShard.shardId(), 1, new AliasFilter(null, Strings.EMPTY_ARRAY),
++            1f, -1, null, null)).close();
++        assertEquals(numWrapReader+1, numWrapInvocations.get());
+     }
+ 
+     public void testCanRewriteToMatchNone() {

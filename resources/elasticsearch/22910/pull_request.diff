@@ -1,0 +1,918 @@
+diff --git a/core/src/main/java/org/elasticsearch/action/bulk/TransportShardBulkAction.java b/core/src/main/java/org/elasticsearch/action/bulk/TransportShardBulkAction.java
+index de3de0f6d58e..c9b8c1aee5cf 100644
+--- a/core/src/main/java/org/elasticsearch/action/bulk/TransportShardBulkAction.java
++++ b/core/src/main/java/org/elasticsearch/action/bulk/TransportShardBulkAction.java
+@@ -61,6 +61,7 @@
+ import org.elasticsearch.transport.TransportRequestOptions;
+ import org.elasticsearch.transport.TransportService;
+ 
++import java.io.IOException;
+ import java.util.Map;
+ 
+ import static org.elasticsearch.action.support.replication.ReplicationOperation.ignoreReplicaException;
+@@ -375,7 +376,7 @@ private UpdateResultHolder executeUpdateRequest(UpdateRequest updateRequest, Ind
+      * Execute the given {@link IndexRequest} on a replica shard, throwing a
+      * {@link RetryOnReplicaException} if the operation needs to be re-tried.
+      */
+-    public static Engine.IndexResult executeIndexRequestOnReplica(IndexRequest request, IndexShard replica) {
++    public static Engine.IndexResult executeIndexRequestOnReplica(IndexRequest request, IndexShard replica) throws IOException {
+         final ShardId shardId = replica.shardId();
+         SourceToParse sourceToParse = SourceToParse.source(SourceToParse.Origin.REPLICA, shardId.getIndexName(), request.type(), request.id(), request.source())
+                 .routing(request.routing()).parent(request.parent()).timestamp(request.timestamp()).ttl(request.ttl());
+@@ -442,12 +443,12 @@ private UpdateResultHolder executeUpdateRequest(UpdateRequest updateRequest, Ind
+         return result;
+     }
+ 
+-    public static Engine.DeleteResult executeDeleteRequestOnPrimary(DeleteRequest request, IndexShard primary) {
++    public static Engine.DeleteResult executeDeleteRequestOnPrimary(DeleteRequest request, IndexShard primary) throws IOException {
+         final Engine.Delete delete = primary.prepareDeleteOnPrimary(request.type(), request.id(), request.version(), request.versionType());
+         return primary.delete(delete);
+     }
+ 
+-    public static Engine.DeleteResult executeDeleteRequestOnReplica(DeleteRequest request, IndexShard replica) {
++    public static Engine.DeleteResult executeDeleteRequestOnReplica(DeleteRequest request, IndexShard replica) throws IOException {
+         final Engine.Delete delete = replica.prepareDeleteOnReplica(request.type(), request.id(),
+                 request.version(), request.versionType());
+         return replica.delete(delete);
+diff --git a/core/src/main/java/org/elasticsearch/index/engine/Engine.java b/core/src/main/java/org/elasticsearch/index/engine/Engine.java
+index 7a2742cf39a3..906f185df16c 100644
+--- a/core/src/main/java/org/elasticsearch/index/engine/Engine.java
++++ b/core/src/main/java/org/elasticsearch/index/engine/Engine.java
+@@ -281,7 +281,7 @@ public Condition newCondition() {
+      *
+      * Note: engine level failures (i.e. persistent engine failures) are thrown
+      */
+-    public abstract IndexResult index(final Index index);
++    public abstract IndexResult index(final Index index) throws IOException;
+ 
+     /**
+      * Perform document delete operation on the engine
+@@ -291,7 +291,7 @@ public Condition newCondition() {
+      *
+      * Note: engine level failures (i.e. persistent engine failures) are thrown
+      */
+-    public abstract DeleteResult delete(final Delete delete);
++    public abstract DeleteResult delete(final Delete delete) throws IOException;
+ 
+     /**
+      * Base class for index and delete operation results
+diff --git a/core/src/main/java/org/elasticsearch/index/engine/InternalEngine.java b/core/src/main/java/org/elasticsearch/index/engine/InternalEngine.java
+index 6d34d4f49587..afd09c732e82 100644
+--- a/core/src/main/java/org/elasticsearch/index/engine/InternalEngine.java
++++ b/core/src/main/java/org/elasticsearch/index/engine/InternalEngine.java
+@@ -75,6 +75,7 @@
+ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Optional;
+ import java.util.Set;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.AtomicInteger;
+@@ -349,22 +350,36 @@ public GetResult get(Get get, Function<String, Searcher> searcherFactory) throws
+         }
+     }
+ 
+-    private boolean checkVersionConflict(
+-            final Operation op,
+-            final long currentVersion,
+-            final long expectedVersion,
+-            final boolean deleted) {
++    /**
++     * Checks for version conflicts. If a non-critical version conflict exists <code>true</code> is returned. In the case of a critical
++     * version conflict (if operation origin is primary) a {@link VersionConflictEngineException} is thrown.
++     *
++     * @param op              the operation
++     * @param currentVersion  the current version
++     * @param expectedVersion the expected version
++     * @param deleted         {@code true} if the current version is not found or represents a delete
++     * @return <code>true</code> iff a non-critical version conflict (origin recovery or replica) is found otherwise <code>false</code>
++     * @throws VersionConflictEngineException if a critical version conflict was found where the operation origin is primary
++     * @throws IllegalArgumentException if an unsupported version type is used.
++     */
++    private boolean checkVersionConflict(final Operation op, final long currentVersion, final long expectedVersion, final boolean deleted) {
+         if (op.versionType().isVersionConflictForWrites(currentVersion, expectedVersion, deleted)) {
+-            if (op.origin().isRecovery()) {
+-                // version conflict, but okay
+-                return true;
+-            } else {
++            if (op.origin() == Operation.Origin.PRIMARY) {
+                 // fatal version conflict
+-                throw new VersionConflictEngineException(shardId, op.type(), op.id(),
++                throw new VersionConflictEngineException(
++                        shardId,
++                        op.type(),
++                        op.id(),
+                         op.versionType().explainConflictForWrites(currentVersion, expectedVersion, deleted));
++
++            } else {
++                /* Version conflicts during recovery and on replicas are normal due to asynchronous execution; as such, we should return a
++                 * successful result.*/
++                return true;
+             }
++        } else {
++            return false;
+         }
+-        return false;
+     }
+ 
+     private long checkDeletedAndGCed(VersionValue versionValue) {
+@@ -378,7 +393,7 @@ private long checkDeletedAndGCed(VersionValue versionValue) {
+     }
+ 
+     @Override
+-    public IndexResult index(Index index) {
++    public IndexResult index(Index index) throws IOException {
+         IndexResult result;
+         try (ReleasableLock lock = readLock.acquire()) {
+             ensureOpen();
+@@ -390,53 +405,17 @@ public IndexResult index(Index index) {
+                     result = innerIndex(index);
+                 }
+             }
+-        } catch (Exception e) {
+-            result = new IndexResult(checkIfDocumentFailureOrThrow(index, e), index.version());
+-            if (e instanceof AlreadyClosedException) {
+-                throw (AlreadyClosedException)e;
++        } catch (RuntimeException | IOException e) {
++            try {
++                maybeFailEngine("index", e);
++            } catch (Exception inner) {
++                e.addSuppressed(inner);
+             }
++            throw e;
+         }
+         return result;
+     }
+ 
+-    /**
+-     * Inspects exception thrown when executing index or delete operations
+-     *
+-     * @return failure if the failure is a document specific failure (e.g. analysis chain failure)
+-     * or throws Exception if the failure caused the engine to fail (e.g. out of disk, lucene tragic event)
+-     *
+-     * Note: pkg-private for testing
+-     */
+-    final Exception checkIfDocumentFailureOrThrow(final Operation operation, final Exception failure) {
+-        boolean isDocumentFailure;
+-        try {
+-            // When indexing a document into Lucene, Lucene distinguishes between environment related errors
+-            // (like out of disk space) and document specific errors (like analysis chain problems) by setting
+-            // the IndexWriter.getTragicEvent() value for the former. maybeFailEngine checks for these kind of
+-            // errors and returns true if that is the case. We use that to indicate a document level failure
+-            // and set the error in operation.setFailure. In case of environment related errors, the failure
+-            // is bubbled up
+-            isDocumentFailure = maybeFailEngine(operation.operationType().getLowercase(), failure) == false;
+-        } catch (Exception inner) {
+-            // we failed checking whether the failure can fail the engine, treat it as a persistent engine failure
+-            isDocumentFailure = false;
+-            failure.addSuppressed(inner);
+-        }
+-        if (isDocumentFailure) {
+-            return failure;
+-        } else {
+-            // throw original exception in case the exception caused the engine to fail
+-            rethrow(failure);
+-            return null;
+-        }
+-    }
+-
+-    // hack to rethrow original exception in case of engine level failures during index/delete operation
+-    @SuppressWarnings("unchecked")
+-    private static <T extends Throwable> void rethrow(Throwable t) throws T {
+-        throw (T) t;
+-    }
+-
+     private boolean canOptimizeAddDocument(Index index) {
+         if (index.getAutoGeneratedIdTimestamp() != IndexRequest.UNSET_AUTO_GENERATED_TIMESTAMP) {
+             assert index.getAutoGeneratedIdTimestamp() >= 0 : "autoGeneratedIdTimestamp must be positive but was: "
+@@ -462,8 +441,8 @@ private boolean canOptimizeAddDocument(Index index) {
+     }
+ 
+     private IndexResult innerIndex(Index index) throws IOException {
++        // TODO we gotta split this method up it's too big!
+         final Translog.Location location;
+-        final long updatedVersion;
+         try (Releasable ignored = acquireLock(index.uid())) {
+             lastWriteNanos = index.startTime();
+             /* if we have an autoGeneratedID that comes into the engine we can potentially optimize
+@@ -528,25 +507,58 @@ private IndexResult innerIndex(Index index) throws IOException {
+                 }
+             }
+             final long expectedVersion = index.version();
++            Optional<IndexResult> resultOnVersionConflict;
++            try {
++                final boolean isVersionConflict = checkVersionConflict(index, currentVersion, expectedVersion, deleted);
++                resultOnVersionConflict = isVersionConflict ? Optional.of(new IndexResult(currentVersion, false))
++                    : Optional.empty();
++            } catch (IllegalArgumentException | VersionConflictEngineException ex) {
++                resultOnVersionConflict = Optional.of(new IndexResult(ex, currentVersion));
++            }
++
+             final IndexResult indexResult;
+-            if (checkVersionConflict(index, currentVersion, expectedVersion, deleted)) {
++            if (resultOnVersionConflict.isPresent()) {
+                 // skip index operation because of version conflict on recovery
+-                indexResult = new IndexResult(expectedVersion, false);
++                indexResult = resultOnVersionConflict.get();
+             } else {
+-                updatedVersion = index.versionType().updateVersion(currentVersion, expectedVersion);
++                // no version conflict
++                final long updatedVersion = index.versionType().updateVersion(currentVersion, expectedVersion);
+                 index.parsedDoc().version().setLongValue(updatedVersion);
+-                if (currentVersion == Versions.NOT_FOUND && forceUpdateDocument == false) {
+-                    // document does not exists, we can optimize for create, but double check if assertions are running
+-                    assert assertDocDoesNotExist(index, canOptimizeAddDocument == false);
+-                    index(index.docs(), indexWriter);
+-                } else {
+-                    update(index.uid(), index.docs(), indexWriter);
++                IndexResult innerIndexResult;
++                try {
++                    if (currentVersion == Versions.NOT_FOUND && forceUpdateDocument == false) {
++                        // document does not exists, we can optimize for create, but double check if assertions are running
++                        assert assertDocDoesNotExist(index, canOptimizeAddDocument == false);
++                        index(index.docs(), indexWriter);
++                    } else {
++                        update(index.uid(), index.docs(), indexWriter);
++                    }
++                    versionMap.putUnderLock(index.uid().bytes(), new VersionValue(updatedVersion));
++                    innerIndexResult = new IndexResult(updatedVersion, deleted);
++                } catch (Exception ex) {
++                    if (indexWriter.getTragicException() == null) {
++                        /* There is no tragic event recorded so this must be a document failure.
++                         *
++                         * The handling inside IW doesn't guarantee that an tragic / aborting exception
++                         * will be used as THE tragicEventException since if there are multiple exceptions causing an abort in IW
++                         * only one wins. Yet, only the one that wins will also close the IW and in turn fail the engine such that
++                         * we can potentially handle the exception before the engine is failed.
++                         * Bottom line is that we can only rely on the fact that if it's a document failure then
++                         * `indexWriter.getTragicException()` will be null otherwise we have to rethrow and treat it as fatal or rather
++                         * non-document failure
++                         */
++                        innerIndexResult = new IndexResult(ex, currentVersion);
++                    } else {
++                        throw ex;
++                    }
+                 }
+-                indexResult = new IndexResult(updatedVersion, deleted);
++                assert innerIndexResult != null;
++                indexResult = innerIndexResult;
++            }
++            if (indexResult.hasFailure() == false) {
+                 location = index.origin() != Operation.Origin.LOCAL_TRANSLOG_RECOVERY
+                         ? translog.add(new Translog.Index(index, indexResult))
+                         : null;
+-                versionMap.putUnderLock(index.uid().bytes(), new VersionValue(updatedVersion));
+                 indexResult.setTranslogLocation(location);
+             }
+             indexResult.setTook(System.nanoTime() - index.startTime());
+@@ -592,17 +604,19 @@ private static void update(final Term uid, final List<ParseContext.Document> doc
+     }
+ 
+     @Override
+-    public DeleteResult delete(Delete delete) {
++    public DeleteResult delete(Delete delete) throws IOException {
+         DeleteResult result;
+         try (ReleasableLock lock = readLock.acquire()) {
+             ensureOpen();
+             // NOTE: we don't throttle this when merges fall behind because delete-by-id does not create new segments:
+             result = innerDelete(delete);
+-        } catch (Exception e) {
+-            result = new DeleteResult(checkIfDocumentFailureOrThrow(delete, e), delete.version());
+-            if (e instanceof AlreadyClosedException) {
+-                throw (AlreadyClosedException)e;
++        } catch (RuntimeException | IOException e) {
++            try {
++                maybeFailEngine("index", e);
++            } catch (Exception inner) {
++                e.addSuppressed(inner);
+             }
++            throw e;
+         }
+         maybePruneDeletedTombstones();
+         return result;
+@@ -635,19 +649,28 @@ private DeleteResult innerDelete(Delete delete) throws IOException {
+             }
+ 
+             final long expectedVersion = delete.version();
++            Optional<DeleteResult> resultOnVersionConflict;
++            try {
++                final boolean isVersionConflict = checkVersionConflict(delete, currentVersion, expectedVersion, deleted);
++                resultOnVersionConflict = isVersionConflict ? Optional.of(new DeleteResult(expectedVersion, true))
++                    : Optional.empty();
++            } catch (IllegalArgumentException | VersionConflictEngineException ex) {
++                resultOnVersionConflict = Optional.of(new DeleteResult(ex, expectedVersion));
++            }
+             final DeleteResult deleteResult;
+-            if (checkVersionConflict(delete, currentVersion, expectedVersion, deleted)) {
+-                // skip executing delete because of version conflict on recovery
+-                deleteResult = new DeleteResult(expectedVersion, true);
++            if (resultOnVersionConflict.isPresent()) {
++                deleteResult = resultOnVersionConflict.get();
+             } else {
+                 updatedVersion = delete.versionType().updateVersion(currentVersion, expectedVersion);
+                 found = deleteIfFound(delete.uid(), currentVersion, deleted, versionValue);
+                 deleteResult = new DeleteResult(updatedVersion, found);
++                versionMap.putUnderLock(delete.uid().bytes(),
++                        new DeleteVersionValue(updatedVersion, engineConfig.getThreadPool().estimatedTimeInMillis()));
++            }
++            if (deleteResult.hasFailure() == false) {
+                 location = delete.origin() != Operation.Origin.LOCAL_TRANSLOG_RECOVERY
+                         ? translog.add(new Translog.Delete(delete, deleteResult))
+                         : null;
+-                versionMap.putUnderLock(delete.uid().bytes(),
+-                        new DeleteVersionValue(updatedVersion, engineConfig.getThreadPool().estimatedTimeInMillis()));
+                 deleteResult.setTranslogLocation(location);
+             }
+             deleteResult.setTook(System.nanoTime() - delete.startTime());
+@@ -657,6 +680,7 @@ private DeleteResult innerDelete(Delete delete) throws IOException {
+     }
+ 
+     private boolean deleteIfFound(Term uid, long currentVersion, boolean deleted, VersionValue versionValue) throws IOException {
++        assert uid != null : "uid must not be null";
+         final boolean found;
+         if (currentVersion == Versions.NOT_FOUND) {
+             // doc does not exist and no prior deletes
+@@ -666,6 +690,8 @@ private boolean deleteIfFound(Term uid, long currentVersion, boolean deleted, Ve
+             found = false;
+         } else {
+             // we deleted a currently existing document
++            // any exception that comes from this is a either an ACE or a fatal exception there can't be any document failures coming
++            // from this.
+             indexWriter.deleteDocuments(uid);
+             found = true;
+         }
+diff --git a/core/src/main/java/org/elasticsearch/index/shard/IndexShard.java b/core/src/main/java/org/elasticsearch/index/shard/IndexShard.java
+index 3603d1b8a36b..b88e5a0c6724 100644
+--- a/core/src/main/java/org/elasticsearch/index/shard/IndexShard.java
++++ b/core/src/main/java/org/elasticsearch/index/shard/IndexShard.java
+@@ -539,13 +539,13 @@ private IndexShardState changeState(IndexShardState newState, String reason) {
+         return new Engine.Index(uid, doc, version, versionType, origin, startTime, autoGeneratedIdTimestamp, isRetry);
+     }
+ 
+-    public Engine.IndexResult index(Engine.Index index) {
++    public Engine.IndexResult index(Engine.Index index) throws IOException {
+         ensureWriteAllowed(index);
+         Engine engine = getEngine();
+         return index(engine, index);
+     }
+ 
+-    private Engine.IndexResult index(Engine engine, Engine.Index index) {
++    private Engine.IndexResult index(Engine engine, Engine.Index index) throws IOException {
+         active.set(true);
+         final Engine.IndexResult result;
+         index = indexingOperationListeners.preIndex(shardId, index);
+@@ -584,13 +584,13 @@ private IndexShardState changeState(IndexShardState newState, String reason) {
+         return new Engine.Delete(type, id, uid, version, versionType, origin, startTime);
+     }
+ 
+-    public Engine.DeleteResult delete(Engine.Delete delete) {
++    public Engine.DeleteResult delete(Engine.Delete delete) throws IOException {
+         ensureWriteAllowed(delete);
+         Engine engine = getEngine();
+         return delete(engine, delete);
+     }
+ 
+-    private Engine.DeleteResult delete(Engine engine, Engine.Delete delete) {
++    private Engine.DeleteResult delete(Engine engine, Engine.Delete delete) throws IOException {
+         active.set(true);
+         final Engine.DeleteResult result;
+         delete = indexingOperationListeners.preDelete(shardId, delete);
+@@ -1834,12 +1834,12 @@ public int recoveryFromSnapshot(Engine engine, Translog.Snapshot snapshot) throw
+         }
+ 
+         @Override
+-        protected void index(Engine engine, Engine.Index engineIndex) {
++        protected void index(Engine engine, Engine.Index engineIndex) throws IOException {
+             IndexShard.this.index(engine, engineIndex);
+         }
+ 
+         @Override
+-        protected void delete(Engine engine, Engine.Delete engineDelete) {
++        protected void delete(Engine engine, Engine.Delete engineDelete) throws IOException {
+             IndexShard.this.delete(engine, engineDelete);
+         }
+     }
+diff --git a/core/src/main/java/org/elasticsearch/index/shard/TranslogRecoveryPerformer.java b/core/src/main/java/org/elasticsearch/index/shard/TranslogRecoveryPerformer.java
+index 5e5d2a841313..a7d66aa88e43 100644
+--- a/core/src/main/java/org/elasticsearch/index/shard/TranslogRecoveryPerformer.java
++++ b/core/src/main/java/org/elasticsearch/index/shard/TranslogRecoveryPerformer.java
+@@ -146,7 +146,7 @@ private void maybeAddMappingUpdate(String type, Mapping update, String docId, bo
+      *                            cause a {@link MapperException} to be thrown if an update
+      *                            is encountered.
+      */
+-    private void performRecoveryOperation(Engine engine, Translog.Operation operation, boolean allowMappingUpdates, Engine.Operation.Origin origin) {
++    private void performRecoveryOperation(Engine engine, Translog.Operation operation, boolean allowMappingUpdates, Engine.Operation.Origin origin) throws IOException {
+ 
+         try {
+             switch (operation.opType()) {
+@@ -197,11 +197,11 @@ private void performRecoveryOperation(Engine engine, Translog.Operation operatio
+         operationProcessed();
+     }
+ 
+-    protected void index(Engine engine, Engine.Index engineIndex) {
++    protected void index(Engine engine, Engine.Index engineIndex) throws IOException {
+         engine.index(engineIndex);
+     }
+ 
+-    protected void delete(Engine engine, Engine.Delete engineDelete) {
++    protected void delete(Engine engine, Engine.Delete engineDelete) throws IOException {
+         engine.delete(engineDelete);
+     }
+ 
+diff --git a/core/src/test/java/org/elasticsearch/index/engine/InternalEngineTests.java b/core/src/test/java/org/elasticsearch/index/engine/InternalEngineTests.java
+index 11bce709c226..f1e58bc8cf2b 100644
+--- a/core/src/test/java/org/elasticsearch/index/engine/InternalEngineTests.java
++++ b/core/src/test/java/org/elasticsearch/index/engine/InternalEngineTests.java
+@@ -32,9 +32,12 @@
+ import org.apache.lucene.codecs.Codec;
+ import org.apache.lucene.document.Field;
+ import org.apache.lucene.document.NumericDocValuesField;
++import org.apache.lucene.document.StoredField;
+ import org.apache.lucene.document.TextField;
+ import org.apache.lucene.index.DirectoryReader;
++import org.apache.lucene.index.IndexWriter;
+ import org.apache.lucene.index.IndexWriterConfig;
++import org.apache.lucene.index.IndexableField;
+ import org.apache.lucene.index.KeepOnlyLastCommitDeletionPolicy;
+ import org.apache.lucene.index.LiveIndexWriterConfig;
+ import org.apache.lucene.index.LogByteSizeMergePolicy;
+@@ -53,6 +56,7 @@
+ import org.apache.lucene.store.AlreadyClosedException;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.MockDirectoryWrapper;
++import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.IOUtils;
+ import org.apache.lucene.util.TestUtil;
+ import org.elasticsearch.ElasticsearchException;
+@@ -116,6 +120,7 @@
+ 
+ import java.io.IOException;
+ import java.io.InputStream;
++import java.io.UncheckedIOException;
+ import java.nio.charset.Charset;
+ import java.nio.file.DirectoryStream;
+ import java.nio.file.Files;
+@@ -133,10 +138,12 @@
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.concurrent.atomic.AtomicReference;
++import java.util.function.Supplier;
+ 
+ import static java.util.Collections.emptyMap;
+ import static org.elasticsearch.index.engine.Engine.Operation.Origin.PRIMARY;
+ import static org.elasticsearch.index.engine.Engine.Operation.Origin.REPLICA;
++import static org.hamcrest.Matchers.containsString;
+ import static org.hamcrest.Matchers.equalTo;
+ import static org.hamcrest.Matchers.everyItem;
+ import static org.hamcrest.Matchers.greaterThan;
+@@ -292,8 +299,23 @@ protected InternalEngine createEngine(Store store, Path translogPath) throws IOE
+     }
+ 
+     protected InternalEngine createEngine(IndexSettings indexSettings, Store store, Path translogPath, MergePolicy mergePolicy) throws IOException {
++        return createEngine(indexSettings, store, translogPath, mergePolicy, null);
++    }
++
++    protected InternalEngine createEngine(
++            IndexSettings indexSettings,
++            Store store,
++            Path translogPath,
++            MergePolicy mergePolicy,
++            Supplier<IndexWriter> indexWriterSupplier) throws IOException {
+         EngineConfig config = config(indexSettings, store, translogPath, mergePolicy, IndexRequest.UNSET_AUTO_GENERATED_TIMESTAMP, null);
+-        InternalEngine internalEngine = new InternalEngine(config);
++        InternalEngine internalEngine = new InternalEngine(config) {
++            @Override
++            IndexWriter createWriter(boolean create) throws IOException {
++                return (indexWriterSupplier != null) ? indexWriterSupplier.get() : super.createWriter(create);
++            }
++
++        };
+         if (config.getOpenMode() == EngineConfig.OpenMode.OPEN_INDEX_AND_TRANSLOG) {
+             internalEngine.recoverFromTranslog();
+         }
+@@ -557,7 +579,7 @@ public void testSegmentsStatsIncludingFileSizes() throws Exception {
+         }
+     }
+ 
+-    public void testCommitStats() {
++    public void testCommitStats() throws Exception {
+         Document document = testDocumentWithTextField();
+         document.add(new Field(SourceFieldMapper.NAME, BytesReference.toBytes(B_1), SourceFieldMapper.Defaults.FIELD_TYPE));
+         ParsedDocument doc = testParsedDocument("1", "test", null, -1, -1, document, B_1, null);
+@@ -1044,7 +1066,7 @@ public void testSycnedFlushVanishesOnReplay() throws IOException {
+         assertNull("Sync ID must be gone since we have a document to replay", engine.getLastCommittedSegmentInfos().getUserData().get(Engine.SYNC_COMMIT_ID));
+     }
+ 
+-    public void testVersioningNewCreate() {
++    public void testVersioningNewCreate() throws IOException {
+         ParsedDocument doc = testParsedDocument("1", "test", null, -1, -1, testDocument(), B_1, null);
+         Engine.Index create = new Engine.Index(newUid(doc), doc, Versions.MATCH_DELETED);
+         Engine.IndexResult indexResult = engine.index(create);
+@@ -1055,7 +1077,7 @@ public void testVersioningNewCreate() {
+         assertThat(replicaResult.getVersion(), equalTo(1L));
+     }
+ 
+-    public void testVersioningNewIndex() {
++    public void testVersioningNewIndex() throws IOException {
+         ParsedDocument doc = testParsedDocument("1", "test", null, -1, -1, testDocument(), B_1, null);
+         Engine.Index index = indexForDoc(doc);
+         Engine.IndexResult indexResult = engine.index(index);
+@@ -1066,7 +1088,7 @@ public void testVersioningNewIndex() {
+         assertThat(replicaResult.getVersion(), equalTo(1L));
+     }
+ 
+-    public void testExternalVersioningNewIndex() {
++    public void testExternalVersioningNewIndex() throws IOException {
+         ParsedDocument doc = testParsedDocument("1", "test", null, -1, -1, testDocument(), B_1, null);
+         Engine.Index index = new Engine.Index(newUid(doc), doc, 12, VersionType.EXTERNAL, PRIMARY, 0, -1, false);
+         Engine.IndexResult indexResult = engine.index(index);
+@@ -1077,7 +1099,7 @@ public void testExternalVersioningNewIndex() {
+         assertThat(replicaResult.getVersion(), equalTo(12L));
+     }
+ 
+-    public void testVersioningIndexConflict() {
++    public void testVersioningIndexConflict() throws IOException {
+         ParsedDocument doc = testParsedDocument("1", "test", null, -1, -1, testDocument(), B_1, null);
+         Engine.Index index = indexForDoc(doc);
+         Engine.IndexResult indexResult = engine.index(index);
+@@ -1099,7 +1121,7 @@ public void testVersioningIndexConflict() {
+         assertThat(indexResult.getFailure(), instanceOf(VersionConflictEngineException.class));
+     }
+ 
+-    public void testExternalVersioningIndexConflict() {
++    public void testExternalVersioningIndexConflict() throws IOException {
+         ParsedDocument doc = testParsedDocument("1", "test", null, -1, -1, testDocument(), B_1, null);
+         Engine.Index index = new Engine.Index(newUid(doc), doc, 12, VersionType.EXTERNAL, PRIMARY, 0, -1, false);
+         Engine.IndexResult indexResult = engine.index(index);
+@@ -1114,7 +1136,7 @@ public void testExternalVersioningIndexConflict() {
+         assertThat(indexResult.getFailure(), instanceOf(VersionConflictEngineException.class));
+     }
+ 
+-    public void testVersioningIndexConflictWithFlush() {
++    public void testVersioningIndexConflictWithFlush() throws IOException {
+         ParsedDocument doc = testParsedDocument("1", "test", null, -1, -1, testDocument(), B_1, null);
+         Engine.Index index = indexForDoc(doc);
+         Engine.IndexResult indexResult = engine.index(index);
+@@ -1138,7 +1160,7 @@ public void testVersioningIndexConflictWithFlush() {
+         assertThat(indexResult.getFailure(), instanceOf(VersionConflictEngineException.class));
+     }
+ 
+-    public void testExternalVersioningIndexConflictWithFlush() {
++    public void testExternalVersioningIndexConflictWithFlush() throws IOException {
+         ParsedDocument doc = testParsedDocument("1", "test", null, -1, -1, testDocument(), B_1, null);
+         Engine.Index index = new Engine.Index(newUid(doc), doc, 12, VersionType.EXTERNAL, PRIMARY, 0, -1, false);
+         Engine.IndexResult indexResult = engine.index(index);
+@@ -1233,6 +1255,8 @@ public void run() {
+                             }
+                         } catch (AlreadyClosedException ex) {
+                             // fine
++                        } catch (IOException e) {
++                            throw new AssertionError(e);
+                         }
+                     }
+                 };
+@@ -1251,7 +1275,7 @@ public void run() {
+ 
+     }
+ 
+-    public void testVersioningDeleteConflict() {
++    public void testVersioningDeleteConflict() throws IOException {
+         ParsedDocument doc = testParsedDocument("1", "test", null, -1, -1, testDocument(), B_1, null);
+         Engine.Index index = indexForDoc(doc);
+         Engine.IndexResult indexResult = engine.index(index);
+@@ -1285,7 +1309,7 @@ public void testVersioningDeleteConflict() {
+ 
+     }
+ 
+-    public void testVersioningDeleteConflictWithFlush() {
++    public void testVersioningDeleteConflictWithFlush() throws IOException {
+         ParsedDocument doc = testParsedDocument("1", "test", null, -1, -1, testDocument(), B_1, null);
+         Engine.Index index = indexForDoc(doc);
+         Engine.IndexResult indexResult = engine.index(index);
+@@ -1324,7 +1348,7 @@ public void testVersioningDeleteConflictWithFlush() {
+         assertThat(indexResult.getFailure(), instanceOf(VersionConflictEngineException.class));
+     }
+ 
+-    public void testVersioningCreateExistsException() {
++    public void testVersioningCreateExistsException() throws IOException {
+         ParsedDocument doc = testParsedDocument("1", "test", null, -1, -1, testDocument(), B_1, null);
+         Engine.Index create = new Engine.Index(newUid(doc), doc, Versions.MATCH_DELETED, VersionType.INTERNAL, PRIMARY, 0, -1, false);
+         Engine.IndexResult indexResult = engine.index(create);
+@@ -1336,7 +1360,7 @@ public void testVersioningCreateExistsException() {
+         assertThat(result.getFailure(), instanceOf(VersionConflictEngineException.class));
+     }
+ 
+-    public void testVersioningCreateExistsExceptionWithFlush() {
++    public void testVersioningCreateExistsExceptionWithFlush() throws IOException {
+         ParsedDocument doc = testParsedDocument("1", "test", null, -1, -1, testDocument(), B_1, null);
+         Engine.Index create = new Engine.Index(newUid(doc), doc, Versions.MATCH_DELETED, VersionType.INTERNAL, PRIMARY, 0, -1, false);
+         Engine.IndexResult indexResult = engine.index(create);
+@@ -1350,8 +1374,8 @@ public void testVersioningCreateExistsExceptionWithFlush() {
+         assertThat(result.getFailure(), instanceOf(VersionConflictEngineException.class));
+     }
+ 
+-    public void testVersioningReplicaConflict1() {
+-        ParsedDocument doc = testParsedDocument("1", "test", null, -1, -1, testDocument(), B_1, null);
++    public void testVersioningReplicaConflict1() throws IOException {
++        final ParsedDocument doc = testParsedDocument("1", "test", null, -1, -1, testDocument(), B_1, null);
+         Engine.Index index = indexForDoc(doc);
+         Engine.IndexResult indexResult = engine.index(index);
+         assertThat(indexResult.getVersion(), equalTo(1L));
+@@ -1365,22 +1389,24 @@ public void testVersioningReplicaConflict1() {
+         Engine.IndexResult replicaResult = replicaEngine.index(index);
+         assertThat(replicaResult.getVersion(), equalTo(2L));
+ 
+-        // now, the old one should not work
++        // now, the old one should produce an indexing result
+         index = new Engine.Index(newUid(doc), doc, 1L, VersionType.INTERNAL.versionTypeForReplicationAndRecovery(), REPLICA, 0, -1, false);
+         Engine.IndexResult result = replicaEngine.index(index);
+-        assertTrue(result.hasFailure());
+-        assertThat(result.getFailure(), instanceOf(VersionConflictEngineException.class));
++        assertFalse(result.hasFailure());
++        assertFalse(result.isCreated());
++        assertThat(result.getVersion(), equalTo(2L));
+ 
+         // second version on replica should fail as well
+         index = new Engine.Index(newUid(doc), doc, 2L
+                 , VersionType.INTERNAL.versionTypeForReplicationAndRecovery(), REPLICA, 0, -1, false);
+         result = replicaEngine.index(index);
+-        assertTrue(result.hasFailure());
+-        assertThat(result.getFailure(), instanceOf(VersionConflictEngineException.class));
++        assertFalse(result.hasFailure());
++        assertFalse(result.isCreated());
++        assertThat(result.getVersion(), equalTo(2L));
+     }
+ 
+-    public void testVersioningReplicaConflict2() {
+-        ParsedDocument doc = testParsedDocument("1", "test", null, -1, -1, testDocument(), B_1, null);
++    public void testVersioningReplicaConflict2() throws IOException {
++        final ParsedDocument doc = testParsedDocument("1", "test", null, -1, -1, testDocument(), B_1, null);
+         Engine.Index index = indexForDoc(doc);
+         Engine.IndexResult indexResult = engine.index(index);
+         assertThat(indexResult.getVersion(), equalTo(1L));
+@@ -1405,23 +1431,19 @@ public void testVersioningReplicaConflict2() {
+         delete = new Engine.Delete("test", "1", newUid(doc), 3L
+                 , VersionType.INTERNAL.versionTypeForReplicationAndRecovery(), REPLICA, 0);
+         deleteResult = replicaEngine.delete(delete);
++        assertFalse(deleteResult.hasFailure());
++        assertTrue(deleteResult.isFound());
+         assertThat(deleteResult.getVersion(), equalTo(3L));
+ 
+-        // second time delete with same version should fail
+-        delete = new Engine.Delete("test", "1", newUid(doc), 3L
+-                , VersionType.INTERNAL.versionTypeForReplicationAndRecovery(), REPLICA, 0);
+-        Engine.DeleteResult result = replicaEngine.delete(delete);
+-        assertTrue(result.hasFailure());
+-        assertThat(result.getFailure(), instanceOf(VersionConflictEngineException.class));
+-
+         // now do the second index on the replica, it should fail
+         index = new Engine.Index(newUid(doc), doc, 2L, VersionType.INTERNAL.versionTypeForReplicationAndRecovery(), REPLICA, 0, -1, false);
+         indexResult = replicaEngine.index(index);
+-        assertTrue(indexResult.hasFailure());
+-        assertThat(indexResult.getFailure(), instanceOf(VersionConflictEngineException.class));
++        assertFalse(indexResult.hasFailure());
++        assertFalse(indexResult.isCreated());
++        assertThat(indexResult.getVersion(), equalTo(3L));
+     }
+ 
+-    public void testBasicCreatedFlag() {
++    public void testBasicCreatedFlag() throws IOException {
+         ParsedDocument doc = testParsedDocument("1", "test", null, -1, -1, testDocument(), B_1, null);
+         Engine.Index index = indexForDoc(doc);
+         Engine.IndexResult indexResult = engine.index(index);
+@@ -1438,7 +1460,7 @@ public void testBasicCreatedFlag() {
+         assertTrue(indexResult.isCreated());
+     }
+ 
+-    public void testCreatedFlagAfterFlush() {
++    public void testCreatedFlagAfterFlush() throws IOException {
+         ParsedDocument doc = testParsedDocument("1", "test", null, -1, -1, testDocument(), B_1, null);
+         Engine.Index index = indexForDoc(doc);
+         Engine.IndexResult indexResult = engine.index(index);
+@@ -1480,7 +1502,7 @@ public void append(LogEvent event) {
+     // #5891: make sure IndexWriter's infoStream output is
+     // sent to lucene.iw with log level TRACE:
+ 
+-    public void testIndexWriterInfoStream() throws IllegalAccessException {
++    public void testIndexWriterInfoStream() throws IllegalAccessException, IOException {
+         assumeFalse("who tests the tester?", VERBOSE);
+         MockAppender mockAppender = new MockAppender("testIndexWriterInfoStream");
+         mockAppender.start();
+@@ -1512,7 +1534,7 @@ public void testIndexWriterInfoStream() throws IllegalAccessException {
+     }
+ 
+     // #8603: make sure we can separately log IFD's messages
+-    public void testIndexWriterIFDInfoStream() throws IllegalAccessException {
++    public void testIndexWriterIFDInfoStream() throws IllegalAccessException, IOException {
+         assumeFalse("who tests the tester?", VERBOSE);
+         MockAppender mockAppender = new MockAppender("testIndexWriterIFDInfoStream");
+         mockAppender.start();
+@@ -2121,6 +2143,115 @@ public void testCurrentTranslogIDisCommitted() throws IOException {
+         }
+     }
+ 
++    private static class ThrowingIndexWriter extends IndexWriter {
++        private AtomicReference<Supplier<Exception>> failureToThrow = new AtomicReference<>();
++
++        public ThrowingIndexWriter(Directory d, IndexWriterConfig conf) throws IOException {
++            super(d, conf);
++        }
++
++        @Override
++        public long addDocument(Iterable<? extends IndexableField> doc) throws IOException {
++            maybeThrowFailure();
++            return super.addDocument(doc);
++        }
++
++        private void maybeThrowFailure() throws IOException {
++            if (failureToThrow.get() != null) {
++                Exception failure = failureToThrow.get().get();
++                if (failure instanceof RuntimeException) {
++                    throw (RuntimeException) failure;
++                } else if (failure instanceof IOException) {
++                    throw (IOException) failure;
++                } else {
++                    assert false: "unsupported failure class: " + failure.getClass().getCanonicalName();
++                }
++            }
++        }
++
++        @Override
++        public long deleteDocuments(Term... terms) throws IOException {
++            maybeThrowFailure();
++            return super.deleteDocuments(terms);
++        }
++
++        public void setThrowFailure(Supplier<Exception> failureSupplier) {
++            failureToThrow.set(failureSupplier);
++        }
++
++        public void clearFailure() {
++            failureToThrow.set(null);
++        }
++    }
++
++    public void testHandleDocumentFailure() throws Exception {
++        try (Store store = createStore()) {
++            final ParsedDocument doc1 = testParsedDocument("1", "test", null, -1, -1, testDocumentWithTextField(), B_1, null);
++            final ParsedDocument doc2 = testParsedDocument("2", "test", null, -1, -1, testDocumentWithTextField(), B_1, null);
++            final ParsedDocument doc3 = testParsedDocument("3", "test", null, -1, -1, testDocumentWithTextField(), B_1, null);
++
++            ThrowingIndexWriter throwingIndexWriter = new ThrowingIndexWriter(store.directory(), new IndexWriterConfig());
++            try (Engine engine = createEngine(defaultSettings, store, createTempDir(), NoMergePolicy.INSTANCE, () -> throwingIndexWriter)) {
++                // test document failure while indexing
++                if (randomBoolean()) {
++                    throwingIndexWriter.setThrowFailure(() -> new IOException("simulated"));
++                } else {
++                    throwingIndexWriter.setThrowFailure(() -> new IllegalArgumentException("simulated max token length"));
++                }
++                Engine.IndexResult indexResult = engine.index(indexForDoc(doc1));
++                assertNotNull(indexResult.getFailure());
++
++                throwingIndexWriter.clearFailure();
++                indexResult = engine.index(indexForDoc(doc1));
++                assertNull(indexResult.getFailure());
++                engine.index(indexForDoc(doc2));
++
++                // test failure while deleting
++                // all these simulated exceptions are not fatal to the IW so we treat them as document failures
++                if (randomBoolean()) {
++                    throwingIndexWriter.setThrowFailure(() -> new IOException("simulated"));
++                    expectThrows(IOException.class, () -> engine.delete(new Engine.Delete("test", "1", newUid(doc1))));
++                } else {
++                    throwingIndexWriter.setThrowFailure(() -> new IllegalArgumentException("simulated max token length"));
++                    expectThrows(IllegalArgumentException.class, () -> engine.delete(new Engine.Delete("test", "1", newUid(doc1))));
++                }
++
++                // test non document level failure is thrown
++                if (randomBoolean()) {
++                    // simulate close by corruption
++                    throwingIndexWriter.setThrowFailure(null);
++                    UncheckedIOException uncheckedIOException = expectThrows(UncheckedIOException.class, () -> {
++                        Engine.Index index = indexForDoc(doc3);
++                        index.parsedDoc().rootDoc().add(new StoredField("foo", "bar") {
++                            // this is a hack to add a failure during store document which triggers a tragic event
++                            // and in turn fails the engine
++                            @Override
++                            public BytesRef binaryValue() {
++                                throw new UncheckedIOException(new MockDirectoryWrapper.FakeIOException());
++                            }
++                        });
++                        engine.index(index);
++                    });
++                    assertTrue(uncheckedIOException.getCause() instanceof MockDirectoryWrapper.FakeIOException);
++                } else {
++                    // normal close
++                    engine.close();
++                }
++                // now the engine is closed check we respond correctly
++                try {
++                    if (randomBoolean()) {
++                        engine.index(indexForDoc(doc1));
++                    } else {
++                        engine.delete(new Engine.Delete("test", "", newUid(doc1)));
++                    }
++                    fail("engine should be closed");
++                } catch (Exception e) {
++                    assertThat(e, instanceOf(AlreadyClosedException.class));
++                }
++            }
++        }
++    }
++
+     public void testDoubleDelivery() throws IOException {
+         final ParsedDocument doc = testParsedDocument("1", "test", null, 100, -1, testDocumentWithTextField(), new BytesArray("{}".getBytes(Charset.defaultCharset())), null);
+         Engine.Index operation = randomAppendOnly(doc, false, 1);
+@@ -2274,7 +2405,11 @@ public void testRetryConcurrently() throws InterruptedException, IOException {
+                 }
+                 int docOffset;
+                 while ((docOffset = offset.incrementAndGet()) < docs.size()) {
+-                    engine.index(docs.get(docOffset));
++                    try {
++                        engine.index(docs.get(docOffset));
++                    } catch (IOException e) {
++                        throw new AssertionError(e);
++                    }
+                 }
+             });
+             thread[i].start();
+@@ -2334,7 +2469,11 @@ public void run() {
+                     }
+                     int docOffset;
+                     while ((docOffset = offset.incrementAndGet()) < docs.size()) {
+-                        engine.index(docs.get(docOffset));
++                        try {
++                            engine.index(docs.get(docOffset));
++                        } catch (IOException e) {
++                            throw new AssertionError(e);
++                        }
+                     }
+                 }
+             };
+diff --git a/core/src/test/java/org/elasticsearch/index/engine/ShadowEngineTests.java b/core/src/test/java/org/elasticsearch/index/engine/ShadowEngineTests.java
+index ccff286fcf98..b20846b89e57 100644
+--- a/core/src/test/java/org/elasticsearch/index/engine/ShadowEngineTests.java
++++ b/core/src/test/java/org/elasticsearch/index/engine/ShadowEngineTests.java
+@@ -267,7 +267,7 @@ protected Term newUid(ParsedDocument doc) {
+     protected static final BytesReference B_2 = new BytesArray(new byte[]{2});
+     protected static final BytesReference B_3 = new BytesArray(new byte[]{3});
+ 
+-    public void testCommitStats() {
++    public void testCommitStats() throws IOException {
+         // create a doc and refresh
+         ParsedDocument doc = testParsedDocument("1", "test", null, -1, -1, testDocumentWithTextField(), B_1, null);
+         primaryEngine.index(indexForDoc(doc));
+@@ -846,7 +846,7 @@ public void testSearchResultRelease() throws Exception {
+         searchResult.close();
+     }
+ 
+-    public void testFailEngineOnCorruption() {
++    public void testFailEngineOnCorruption() throws IOException {
+         ParsedDocument doc = testParsedDocument("1", "test", null, -1,-1, testDocumentWithTextField(), B_1, null);
+         primaryEngine.index(indexForDoc(doc));
+         primaryEngine.flush();
+diff --git a/core/src/test/java/org/elasticsearch/index/shard/RefreshListenersTests.java b/core/src/test/java/org/elasticsearch/index/shard/RefreshListenersTests.java
+index a879131d9458..b7ffb17fae6d 100644
+--- a/core/src/test/java/org/elasticsearch/index/shard/RefreshListenersTests.java
++++ b/core/src/test/java/org/elasticsearch/index/shard/RefreshListenersTests.java
+@@ -324,11 +324,11 @@ public void testLotsOfThreads() throws Exception {
+         refresher.cancel();
+     }
+ 
+-    private Engine.IndexResult index(String id) {
++    private Engine.IndexResult index(String id) throws IOException {
+         return index(id, "test");
+     }
+ 
+-    private Engine.IndexResult index(String id, String testFieldValue) {
++    private Engine.IndexResult index(String id, String testFieldValue) throws IOException {
+         String type = "test";
+         Document document = new Document();
+         document.add(new TextField("test", testFieldValue, Field.Store.YES));
+diff --git a/test/framework/src/main/java/org/elasticsearch/index/shard/IndexShardTestCase.java b/test/framework/src/main/java/org/elasticsearch/index/shard/IndexShardTestCase.java
+index 3589a2b74154..89533c40d11e 100644
+--- a/test/framework/src/main/java/org/elasticsearch/index/shard/IndexShardTestCase.java
++++ b/test/framework/src/main/java/org/elasticsearch/index/shard/IndexShardTestCase.java
+@@ -434,11 +434,11 @@ protected void assertDocs(IndexShard shard, Uid... uids) throws IOException {
+     }
+ 
+ 
+-    protected Engine.Index indexDoc(IndexShard shard, String type, String id) {
++    protected Engine.Index indexDoc(IndexShard shard, String type, String id) throws IOException {
+         return indexDoc(shard, type, id, "{}");
+     }
+ 
+-    protected Engine.Index indexDoc(IndexShard shard, String type, String id, String source) {
++    protected Engine.Index indexDoc(IndexShard shard, String type, String id, String source) throws IOException {
+         final Engine.Index index;
+         if (shard.routingEntry().primary()) {
+             index = shard.prepareIndexOnPrimary(
+@@ -453,7 +453,7 @@ protected void assertDocs(IndexShard shard, Uid... uids) throws IOException {
+         return index;
+     }
+ 
+-    protected Engine.Delete deleteDoc(IndexShard shard, String type, String id) {
++    protected Engine.Delete deleteDoc(IndexShard shard, String type, String id) throws IOException {
+         final Engine.Delete delete;
+         if (shard.routingEntry().primary()) {
+             delete = shard.prepareDeleteOnPrimary(type, id, Versions.MATCH_ANY, VersionType.INTERNAL);

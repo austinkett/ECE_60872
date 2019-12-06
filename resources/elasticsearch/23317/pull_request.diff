@@ -1,0 +1,187 @@
+diff --git a/modules/transport-netty4/src/main/java/org/elasticsearch/http/netty4/Netty4HttpChannel.java b/modules/transport-netty4/src/main/java/org/elasticsearch/http/netty4/Netty4HttpChannel.java
+index 1eea2a0de6fa..a4259b41fd82 100644
+--- a/modules/transport-netty4/src/main/java/org/elasticsearch/http/netty4/Netty4HttpChannel.java
++++ b/modules/transport-netty4/src/main/java/org/elasticsearch/http/netty4/Netty4HttpChannel.java
+@@ -135,7 +135,7 @@ public void sendResponse(RestResponse response) {
+ 
+             final Object msg;
+             if (pipelinedRequest != null) {
+-                msg = pipelinedRequest.createHttpResponse(resp);
++                msg = pipelinedRequest.createHttpResponse(resp, promise);
+             } else {
+                 msg = resp;
+             }
+diff --git a/modules/transport-netty4/src/main/java/org/elasticsearch/http/netty4/pipelining/HttpPipelinedRequest.java b/modules/transport-netty4/src/main/java/org/elasticsearch/http/netty4/pipelining/HttpPipelinedRequest.java
+index f53d21b882f2..be1669c60c29 100644
+--- a/modules/transport-netty4/src/main/java/org/elasticsearch/http/netty4/pipelining/HttpPipelinedRequest.java
++++ b/modules/transport-netty4/src/main/java/org/elasticsearch/http/netty4/pipelining/HttpPipelinedRequest.java
+@@ -19,6 +19,7 @@
+ 
+ package org.elasticsearch.http.netty4.pipelining;
+ 
++import io.netty.channel.ChannelPromise;
+ import io.netty.handler.codec.http.FullHttpResponse;
+ import io.netty.handler.codec.http.LastHttpContent;
+ import io.netty.util.ReferenceCounted;
+@@ -32,7 +33,6 @@
+     private final LastHttpContent last;
+     private final int sequence;
+ 
+-
+     public HttpPipelinedRequest(final LastHttpContent last, final int sequence) {
+         this.last = last;
+         this.sequence = sequence;
+@@ -42,8 +42,8 @@ public LastHttpContent last() {
+         return last;
+     }
+ 
+-    public HttpPipelinedResponse createHttpResponse(final FullHttpResponse response) {
+-        return new HttpPipelinedResponse(response, sequence);
++    public HttpPipelinedResponse createHttpResponse(final FullHttpResponse response, final ChannelPromise promise) {
++        return new HttpPipelinedResponse(response, promise, sequence);
+     }
+ 
+     @Override
+diff --git a/modules/transport-netty4/src/main/java/org/elasticsearch/http/netty4/pipelining/HttpPipelinedResponse.java b/modules/transport-netty4/src/main/java/org/elasticsearch/http/netty4/pipelining/HttpPipelinedResponse.java
+index 7095994eca6e..6b6db94d69a5 100644
+--- a/modules/transport-netty4/src/main/java/org/elasticsearch/http/netty4/pipelining/HttpPipelinedResponse.java
++++ b/modules/transport-netty4/src/main/java/org/elasticsearch/http/netty4/pipelining/HttpPipelinedResponse.java
+@@ -19,16 +19,19 @@
+  * under the License.
+  */
+ 
++import io.netty.channel.ChannelPromise;
+ import io.netty.handler.codec.http.FullHttpResponse;
+ import io.netty.util.ReferenceCounted;
+ 
+ class HttpPipelinedResponse implements Comparable<HttpPipelinedResponse>, ReferenceCounted {
+ 
+     private final FullHttpResponse response;
++    private final ChannelPromise promise;
+     private final int sequence;
+ 
+-    HttpPipelinedResponse(FullHttpResponse response, int sequence) {
++    HttpPipelinedResponse(FullHttpResponse response, ChannelPromise promise, int sequence) {
+         this.response = response;
++        this.promise = promise;
+         this.sequence = sequence;
+     }
+ 
+@@ -36,6 +39,10 @@ public FullHttpResponse response() {
+         return response;
+     }
+ 
++    public ChannelPromise promise() {
++        return promise;
++    }
++
+     public int sequence() {
+         return sequence;
+     }
+diff --git a/modules/transport-netty4/src/main/java/org/elasticsearch/http/netty4/pipelining/HttpPipeliningHandler.java b/modules/transport-netty4/src/main/java/org/elasticsearch/http/netty4/pipelining/HttpPipeliningHandler.java
+index 9504d4c7d917..89ad2c70d6d2 100644
+--- a/modules/transport-netty4/src/main/java/org/elasticsearch/http/netty4/pipelining/HttpPipeliningHandler.java
++++ b/modules/transport-netty4/src/main/java/org/elasticsearch/http/netty4/pipelining/HttpPipeliningHandler.java
+@@ -71,23 +71,37 @@ public void channelRead(final ChannelHandlerContext ctx, final Object msg) throw
+     @Override
+     public void write(final ChannelHandlerContext ctx, final Object msg, final ChannelPromise promise) throws Exception {
+         if (msg instanceof HttpPipelinedResponse) {
++            final HttpPipelinedResponse current = (HttpPipelinedResponse) msg;
++            /*
++             * We attach the promise to the response. When we invoke a write on the channel with the response, we must ensure that we invoke
++             * the write methods that accept the same promise that we have attached to the response otherwise as the response proceeds
++             * through the handler pipeline a different promise will be used until reaching this handler. Therefore, we assert here that the
++             * attached promise is identical to the provided promise as a safety mechanism that we are respecting this.
++             */
++            assert current.promise() == promise;
++
+             boolean channelShouldClose = false;
+ 
+             synchronized (holdingQueue) {
+                 if (holdingQueue.size() < maxEventsHeld) {
+-                    holdingQueue.add((HttpPipelinedResponse) msg);
++                    holdingQueue.add(current);
+ 
+                     while (!holdingQueue.isEmpty()) {
+                         /*
+                          * Since the response with the lowest sequence number is the top of the priority queue, we know if its sequence
+-                         * number does not match the current write sequence then we have not processed all preceding responses yet.
++                         * number does not match the current write sequence number then we have not processed all preceding responses yet.
+                          */
+-                        final HttpPipelinedResponse response = holdingQueue.peek();
+-                        if (response.sequence() != writeSequence) {
++                        final HttpPipelinedResponse top = holdingQueue.peek();
++                        if (top.sequence() != writeSequence) {
+                             break;
+                         }
+                         holdingQueue.remove();
+-                        ctx.write(response.response(), promise);
++                        /*
++                         * We must use the promise attached to the response; this is necessary since are going to hold a response until all
++                         * responses that precede it in the pipeline are written first. Note that the promise from the method invocation is
++                         * not ignored, it will already be attached to an existing response and consumed when that response is drained.
++                         */
++                        ctx.write(top.response(), top.promise());
+                         writeSequence++;
+                     }
+                 } else {
+@@ -99,7 +113,7 @@ public void write(final ChannelHandlerContext ctx, final Object msg, final Chann
+                 try {
+                     Netty4Utils.closeChannels(Collections.singletonList(ctx.channel()));
+                 } finally {
+-                    ((HttpPipelinedResponse) msg).release();
++                    current.release();
+                     promise.setSuccess();
+                 }
+             }
+diff --git a/modules/transport-netty4/src/test/java/org/elasticsearch/http/netty4/Netty4HttpServerPipeliningTests.java b/modules/transport-netty4/src/test/java/org/elasticsearch/http/netty4/Netty4HttpServerPipeliningTests.java
+index 309d3fa04688..d384479b4e5b 100644
+--- a/modules/transport-netty4/src/test/java/org/elasticsearch/http/netty4/Netty4HttpServerPipeliningTests.java
++++ b/modules/transport-netty4/src/test/java/org/elasticsearch/http/netty4/Netty4HttpServerPipeliningTests.java
+@@ -24,6 +24,7 @@
+ import io.netty.channel.Channel;
+ import io.netty.channel.ChannelHandler;
+ import io.netty.channel.ChannelHandlerContext;
++import io.netty.channel.ChannelPromise;
+ import io.netty.channel.SimpleChannelInboundHandler;
+ import io.netty.handler.codec.http.DefaultFullHttpResponse;
+ import io.netty.handler.codec.http.FullHttpRequest;
+@@ -255,11 +256,14 @@ public void run() {
+                 assert uri.matches("/\\d+");
+             }
+ 
++            final ChannelPromise promise = ctx.newPromise();
++            final Object msg;
+             if (pipelinedRequest != null) {
+-                ctx.writeAndFlush(pipelinedRequest.createHttpResponse(httpResponse));
++                msg = pipelinedRequest.createHttpResponse(httpResponse, promise);
+             } else {
+-                ctx.writeAndFlush(httpResponse);
++                msg = httpResponse;
+             }
++            ctx.writeAndFlush(msg, promise);
+         }
+ 
+     }
+diff --git a/modules/transport-netty4/src/test/java/org/elasticsearch/http/netty4/pipelining/Netty4HttpPipeliningHandlerTests.java b/modules/transport-netty4/src/test/java/org/elasticsearch/http/netty4/pipelining/Netty4HttpPipeliningHandlerTests.java
+index 302a4f1878ab..ce8e840e246c 100644
+--- a/modules/transport-netty4/src/test/java/org/elasticsearch/http/netty4/pipelining/Netty4HttpPipeliningHandlerTests.java
++++ b/modules/transport-netty4/src/test/java/org/elasticsearch/http/netty4/pipelining/Netty4HttpPipeliningHandlerTests.java
+@@ -23,6 +23,7 @@
+ import io.netty.buffer.ByteBufUtil;
+ import io.netty.buffer.Unpooled;
+ import io.netty.channel.ChannelHandlerContext;
++import io.netty.channel.ChannelPromise;
+ import io.netty.channel.SimpleChannelInboundHandler;
+ import io.netty.channel.embedded.EmbeddedChannel;
+ import io.netty.handler.codec.http.DefaultFullHttpRequest;
+@@ -246,7 +247,8 @@ protected void channelRead0(final ChannelHandlerContext ctx, final HttpPipelined
+             executorService.submit(() -> {
+                 try {
+                     waitingLatch.await(1000, TimeUnit.SECONDS);
+-                    ctx.write(pipelinedRequest.createHttpResponse(httpResponse), ctx.newPromise());
++                    final ChannelPromise promise = ctx.newPromise();
++                    ctx.write(pipelinedRequest.createHttpResponse(httpResponse, promise), promise);
+                     finishingLatch.countDown();
+                 } catch (InterruptedException e) {
+                     fail(e.toString());

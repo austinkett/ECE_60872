@@ -1,0 +1,198 @@
+diff --git a/core/src/main/java/org/elasticsearch/action/admin/indices/flush/TransportShardFlushAction.java b/core/src/main/java/org/elasticsearch/action/admin/indices/flush/TransportShardFlushAction.java
+index 8ead871d11f3..186f14e395fe 100644
+--- a/core/src/main/java/org/elasticsearch/action/admin/indices/flush/TransportShardFlushAction.java
++++ b/core/src/main/java/org/elasticsearch/action/admin/indices/flush/TransportShardFlushAction.java
+@@ -19,6 +19,7 @@
+ 
+ package org.elasticsearch.action.admin.indices.flush;
+ 
++import org.elasticsearch.ExceptionsHelper;
+ import org.elasticsearch.action.ActionWriteResponse;
+ import org.elasticsearch.action.support.ActionFilters;
+ import org.elasticsearch.action.support.replication.TransportReplicationAction;
+@@ -31,6 +32,7 @@
+ import org.elasticsearch.common.collect.Tuple;
+ import org.elasticsearch.common.inject.Inject;
+ import org.elasticsearch.common.settings.Settings;
++import org.elasticsearch.index.engine.FlushNotAllowedEngineException;
+ import org.elasticsearch.index.shard.IndexShard;
+ import org.elasticsearch.indices.IndicesService;
+ import org.elasticsearch.threadpool.ThreadPool;
+@@ -91,4 +93,15 @@ protected ClusterBlockLevel indexBlockLevel() {
+     protected boolean shouldExecuteReplication(Settings settings) {
+         return true;
+     }
++
++    @Override
++    protected boolean mustFailReplica(Throwable e) {
++        // if we are running flush ith wait_if_ongoing=false (default) we might get a FlushNotAllowedEngineException from the
++        // replica that is a signal that there is another flush ongoing and we stepped out. This behavior has changed in 5.x
++        // where we don't throw an exception anymore. In such a case we ignore the exception an do NOT fail the replica.
++        if (ExceptionsHelper.unwrapCause(e).getClass() == FlushNotAllowedEngineException.class) {
++            return false;
++        }
++        return super.mustFailReplica(e);
++    }
+ }
+diff --git a/core/src/main/java/org/elasticsearch/action/support/replication/TransportReplicationAction.java b/core/src/main/java/org/elasticsearch/action/support/replication/TransportReplicationAction.java
+index e6288f5175d2..24c19865f13b 100644
+--- a/core/src/main/java/org/elasticsearch/action/support/replication/TransportReplicationAction.java
++++ b/core/src/main/java/org/elasticsearch/action/support/replication/TransportReplicationAction.java
+@@ -205,6 +205,14 @@ protected boolean ignoreReplicaException(Throwable e) {
+         return false;
+     }
+ 
++    /**
++     * Returns <code>true</code> iff the replica must be failed if it threw the given exception.
++     * This defaults to the inverse of {@link #ignoreReplicaException(Throwable)}
++     */
++    protected boolean mustFailReplica(Throwable e) {
++        return ignoreReplicaException(e) == false;
++    }
++
+     protected boolean isConflictException(Throwable e) {
+         Throwable cause = ExceptionsHelper.unwrapCause(e);
+         // on version conflict or document missing, it means
+@@ -360,7 +368,8 @@ private void failReplicaIfNeeded(Throwable t) {
+             String index = request.shardId().getIndex();
+             int shardId = request.shardId().id();
+             logger.trace("failure on replica [{}][{}], action [{}], request [{}]", t, index, shardId, actionName, request);
+-            if (ignoreReplicaException(t) == false) {
++            if (mustFailReplica(t)) {
++                assert ignoreReplicaException(t) == false;
+                 IndexService indexService = indicesService.indexService(index);
+                 if (indexService == null) {
+                     logger.debug("ignoring failed replica [{}][{}] because index was already removed.", index, shardId);
+@@ -927,7 +936,8 @@ public void handleResponse(TransportResponse.Empty vResponse) {
+                     public void handleException(TransportException exp) {
+                         onReplicaFailure(nodeId, exp);
+                         logger.trace("[{}] transport failure during replica request [{}], action [{}]", exp, node, replicaRequest, transportReplicaAction);
+-                        if (ignoreReplicaException(exp) == false) {
++                        if (mustFailReplica(exp)) {
++                            assert ignoreReplicaException(exp) == false;
+                             logger.warn("{} failed to perform {} on node {}", exp, shardId, transportReplicaAction, node);
+                             shardStateAction.shardFailed(shard, indexUUID, "failed to perform " + actionName + " on replica on node " + node, exp);
+                         }
+diff --git a/core/src/test/java/org/elasticsearch/indices/flush/FlushIT.java b/core/src/test/java/org/elasticsearch/indices/flush/FlushIT.java
+index 3b21bc196c73..c56ecddc65d1 100644
+--- a/core/src/test/java/org/elasticsearch/indices/flush/FlushIT.java
++++ b/core/src/test/java/org/elasticsearch/indices/flush/FlushIT.java
+@@ -19,17 +19,25 @@
+ package org.elasticsearch.indices.flush;
+ 
+ import org.elasticsearch.action.ActionListener;
++import org.elasticsearch.action.admin.cluster.state.ClusterStateResponse;
++import org.elasticsearch.action.admin.indices.flush.FlushRequest;
+ import org.elasticsearch.action.admin.indices.flush.FlushResponse;
+ import org.elasticsearch.action.admin.indices.flush.SyncedFlushResponse;
+ import org.elasticsearch.action.admin.indices.stats.IndexStats;
+ import org.elasticsearch.action.admin.indices.stats.ShardStats;
+ import org.elasticsearch.cluster.ClusterState;
+ import org.elasticsearch.cluster.metadata.IndexMetaData;
++import org.elasticsearch.cluster.node.DiscoveryNode;
++import org.elasticsearch.cluster.routing.IndexRoutingTable;
+ import org.elasticsearch.cluster.routing.ShardRouting;
++import org.elasticsearch.cluster.routing.ShardRoutingState;
+ import org.elasticsearch.cluster.routing.allocation.command.MoveAllocationCommand;
+ import org.elasticsearch.common.settings.Settings;
++import org.elasticsearch.index.IndexService;
+ import org.elasticsearch.index.engine.Engine;
++import org.elasticsearch.index.shard.IndexShard;
+ import org.elasticsearch.index.shard.ShardId;
++import org.elasticsearch.indices.IndicesService;
+ import org.elasticsearch.test.ESIntegTestCase;
+ import org.elasticsearch.test.junit.annotations.TestLogging;
+ import org.junit.Test;
+@@ -53,6 +61,7 @@
+     public void testWaitIfOngoing() throws InterruptedException {
+         createIndex("test");
+         ensureGreen("test");
++        ClusterStateResponse beforeTestResponse = client().admin().cluster().prepareState().get();
+         final int numIters = scaledRandomIntBetween(10, 30);
+         for (int i = 0; i < numIters; i++) {
+             for (int j = 0; j < 10; j++) {
+@@ -84,6 +93,84 @@ public void onFailure(Throwable e) {
+             latch.await();
+             assertThat(errors, emptyIterable());
+         }
++        ClusterStateResponse afterTestResponse = client().admin().cluster().prepareState().get();
++        IndexRoutingTable afterRoutingTable = afterTestResponse.getState().getRoutingTable().index("test");
++        IndexRoutingTable beforeRoutingTable = beforeTestResponse.getState().getRoutingTable().index("test");
++        assertEquals(afterRoutingTable, beforeRoutingTable);
++
++    }
++
++    /**
++     * We test here that failing with FlushNotAllowedEngineException doesn't fail the shards since it's whitelisted.
++     * see #20632
++     * @throws InterruptedException
++     */
++    @Test
++    public void testDontWaitIfOngoing() throws InterruptedException {
++        internalCluster().ensureAtLeastNumDataNodes(2);
++        prepareCreate("test").setSettings(IndexMetaData.SETTING_NUMBER_OF_REPLICAS, 1).get();
++        ensureGreen("test");
++        ClusterStateResponse beforeTestResponse = client().admin().cluster().prepareState().get();
++        List<ShardRouting> shardRoutings = beforeTestResponse.getState().getRoutingTable().index("test")
++            .shardsWithState(ShardRoutingState.STARTED);
++        ShardRouting theReplica = null;
++        for (ShardRouting shardRouting : shardRoutings) {
++            if (shardRouting.primary() == false) {
++                theReplica = shardRouting;
++                break;
++            }
++        }
++        assertNotNull(theReplica);
++        DiscoveryNode discoveryNode = beforeTestResponse.getState().nodes().get(theReplica.currentNodeId());
++        final IndicesService instance = internalCluster().getInstance(IndicesService.class, discoveryNode.getName());
++        final ShardRouting routing = theReplica;
++        final AtomicBoolean run = new AtomicBoolean(true);
++        Thread t = new Thread() {
++            @Override
++            public void run() {
++                IndexService indexService = instance.indexService(routing.index());
++                IndexShard shard = indexService.shard(routing.id());
++                while(run.get()) {
++                    shard.flush(new FlushRequest().waitIfOngoing(true));
++                }
++            }
++        };
++        t.start();
++        final int numIters = scaledRandomIntBetween(10, 30);
++        for (int i = 0; i < numIters; i++) {
++            for (int j = 0; j < 10; j++) {
++                client().prepareIndex("test", "test").setSource("{}").get();
++            }
++            final CountDownLatch latch = new CountDownLatch(10);
++            final CopyOnWriteArrayList<Throwable> errors = new CopyOnWriteArrayList<>();
++            for (int j = 0; j < 10; j++) {
++                client().admin().indices().prepareFlush("test").setWaitIfOngoing(false).execute(new ActionListener<FlushResponse>() {
++                    @Override
++                    public void onResponse(FlushResponse flushResponse) {
++                        try {
++                            latch.countDown();
++                        } catch (Throwable ex) {
++                            onFailure(ex);
++                        }
++                    }
++
++                    @Override
++                    public void onFailure(Throwable e) {
++                        errors.add(e);
++                        latch.countDown();
++                    }
++                });
++            }
++            latch.await();
++            assertThat(errors, emptyIterable());
++        }
++        run.set(false);
++        t.join();
++        ClusterStateResponse afterTestResponse = client().admin().cluster().prepareState().get();
++        IndexRoutingTable afterRoutingTable = afterTestResponse.getState().getRoutingTable().index("test");
++        IndexRoutingTable beforeRoutingTable = beforeTestResponse.getState().getRoutingTable().index("test");
++        assertEquals(afterRoutingTable, beforeRoutingTable);
++
+     }
+ 
+     public void testSyncedFlush() throws ExecutionException, InterruptedException, IOException {

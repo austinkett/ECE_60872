@@ -1,0 +1,260 @@
+diff --git a/core/src/main/java/org/elasticsearch/action/admin/cluster/shards/ClusterSearchShardsResponse.java b/core/src/main/java/org/elasticsearch/action/admin/cluster/shards/ClusterSearchShardsResponse.java
+index 3ee5f56ebdc7..c2fb90434e57 100644
+--- a/core/src/main/java/org/elasticsearch/action/admin/cluster/shards/ClusterSearchShardsResponse.java
++++ b/core/src/main/java/org/elasticsearch/action/admin/cluster/shards/ClusterSearchShardsResponse.java
+@@ -29,6 +29,7 @@
+ import org.elasticsearch.search.internal.AliasFilter;
+ 
+ import java.io.IOException;
++import java.util.Arrays;
+ import java.util.HashMap;
+ import java.util.Map;
+ 
+@@ -117,10 +118,14 @@ public XContentBuilder toXContent(XContentBuilder builder, Params params) throws
+                 String index = entry.getKey();
+                 builder.startObject(index);
+                 AliasFilter aliasFilter = entry.getValue();
+-                if (aliasFilter.getAliases().length > 0) {
+-                    builder.array("aliases", aliasFilter.getAliases());
+-                    builder.field("filter");
+-                    aliasFilter.getQueryBuilder().toXContent(builder, params);
++                String[] aliases = aliasFilter.getAliases();
++                if (aliases.length > 0) {
++                    Arrays.sort(aliases); // we want consistent ordering here and these values might be generated from a set / map
++                    builder.array("aliases", aliases);
++                    if (aliasFilter.getQueryBuilder() != null) { // might be null if we include non-filtering aliases
++                        builder.field("filter");
++                        aliasFilter.getQueryBuilder().toXContent(builder, params);
++                    }
+                 }
+                 builder.endObject();
+             }
+diff --git a/core/src/main/java/org/elasticsearch/action/admin/cluster/shards/TransportClusterSearchShardsAction.java b/core/src/main/java/org/elasticsearch/action/admin/cluster/shards/TransportClusterSearchShardsAction.java
+index 8825a4267681..20ed69ae5a92 100644
+--- a/core/src/main/java/org/elasticsearch/action/admin/cluster/shards/TransportClusterSearchShardsAction.java
++++ b/core/src/main/java/org/elasticsearch/action/admin/cluster/shards/TransportClusterSearchShardsAction.java
+@@ -83,8 +83,10 @@ protected void masterOperation(final ClusterSearchShardsRequest request, final C
+         Map<String, Set<String>> routingMap = indexNameExpressionResolver.resolveSearchRouting(state, request.routing(), request.indices());
+         Map<String, AliasFilter> indicesAndFilters = new HashMap<>();
+         for (String index : concreteIndices) {
+-            AliasFilter aliasFilter = indicesService.buildAliasFilter(clusterState, index, request.indices());
+-            indicesAndFilters.put(index, aliasFilter);
++            final AliasFilter aliasFilter = indicesService.buildAliasFilter(clusterState, index, request.indices());
++            final String[] aliases = indexNameExpressionResolver.indexAliases(clusterState, index, aliasMetadata -> true, true,
++                request.indices());
++            indicesAndFilters.put(index, new AliasFilter(aliasFilter.getQueryBuilder(), aliases));
+         }
+ 
+         Set<String> nodeIds = new HashSet<>();
+diff --git a/core/src/main/java/org/elasticsearch/cluster/metadata/IndexNameExpressionResolver.java b/core/src/main/java/org/elasticsearch/cluster/metadata/IndexNameExpressionResolver.java
+index 168fe2ad7f29..d4c6ec587db7 100644
+--- a/core/src/main/java/org/elasticsearch/cluster/metadata/IndexNameExpressionResolver.java
++++ b/core/src/main/java/org/elasticsearch/cluster/metadata/IndexNameExpressionResolver.java
+@@ -48,6 +48,7 @@
+ import java.util.Locale;
+ import java.util.Map;
+ import java.util.Set;
++import java.util.function.Predicate;
+ import java.util.stream.Collectors;
+ 
+ public class IndexNameExpressionResolver extends AbstractComponent {
+@@ -268,8 +269,19 @@ public String resolveDateMathExpression(String dateExpression) {
+      * the index itself - null is returned. Returns <tt>null</tt> if no filtering is required.
+      */
+     public String[] filteringAliases(ClusterState state, String index, String... expressions) {
++        return indexAliases(state, index, AliasMetaData::filteringRequired, false, expressions);
++    }
++
++    /**
++     * Iterates through the list of indices and selects the effective list of required aliases for the
++     * given index.
++     * <p>Only aliases where the given predicate tests successfully are returned. If the indices list contains a non-required reference to
++     * the index itself - null is returned. Returns <tt>null</tt> if no filtering is required.
++     */
++    public String[] indexAliases(ClusterState state, String index, Predicate<AliasMetaData> requiredAlias, boolean skipIdentity,
++                                 String... expressions) {
+         // expand the aliases wildcard
+-        List<String> resolvedExpressions = expressions != null ? Arrays.asList(expressions) : Collections.<String>emptyList();
++        List<String> resolvedExpressions = expressions != null ? Arrays.asList(expressions) : Collections.emptyList();
+         Context context = new Context(state, IndicesOptions.lenientExpandOpen(), true);
+         for (ExpressionResolver expressionResolver : expressionResolvers) {
+             resolvedExpressions = expressionResolver.resolve(context, resolvedExpressions);
+@@ -278,54 +290,50 @@ public String resolveDateMathExpression(String dateExpression) {
+         if (isAllIndices(resolvedExpressions)) {
+             return null;
+         }
++        final IndexMetaData indexMetaData = state.metaData().getIndices().get(index);
++        if (indexMetaData == null) {
++            // Shouldn't happen
++            throw new IndexNotFoundException(index);
++        }
+         // optimize for the most common single index/alias scenario
+         if (resolvedExpressions.size() == 1) {
+             String alias = resolvedExpressions.get(0);
+-            IndexMetaData indexMetaData = state.metaData().getIndices().get(index);
+-            if (indexMetaData == null) {
+-                // Shouldn't happen
+-                throw new IndexNotFoundException(index);
+-            }
++
+             AliasMetaData aliasMetaData = indexMetaData.getAliases().get(alias);
+-            boolean filteringRequired = aliasMetaData != null && aliasMetaData.filteringRequired();
+-            if (!filteringRequired) {
++            if (aliasMetaData == null || requiredAlias.test(aliasMetaData) == false) {
+                 return null;
+             }
+             return new String[]{alias};
+         }
+-        List<String> filteringAliases = null;
++        List<String> aliases = null;
+         for (String alias : resolvedExpressions) {
+             if (alias.equals(index)) {
+-                return null;
+-            }
+-
+-            IndexMetaData indexMetaData = state.metaData().getIndices().get(index);
+-            if (indexMetaData == null) {
+-                // Shouldn't happen
+-                throw new IndexNotFoundException(index);
++                if (skipIdentity) {
++                    continue;
++                } else {
++                    return null;
++                }
+             }
+-
+             AliasMetaData aliasMetaData = indexMetaData.getAliases().get(alias);
+             // Check that this is an alias for the current index
+             // Otherwise - skip it
+             if (aliasMetaData != null) {
+-                boolean filteringRequired = aliasMetaData.filteringRequired();
+-                if (filteringRequired) {
+-                    // If filtering required - add it to the list of filters
+-                    if (filteringAliases == null) {
+-                        filteringAliases = new ArrayList<>();
++                if (requiredAlias.test(aliasMetaData)) {
++                    // If required - add it to the list of aliases
++                    if (aliases == null) {
++                        aliases = new ArrayList<>();
+                     }
+-                    filteringAliases.add(alias);
++                    aliases.add(alias);
+                 } else {
+-                    // If not, we have a non filtering alias for this index - no filtering needed
++                    // If not, we have a non required alias for this index - no futher checking needed
+                     return null;
+                 }
+             }
+         }
+-        if (filteringAliases == null) {
++        if (aliases == null) {
+             return null;
+         }
+-        return filteringAliases.toArray(new String[filteringAliases.size()]);
++        return aliases.toArray(new String[aliases.size()]);
+     }
+ 
+     /**
+diff --git a/core/src/test/java/org/elasticsearch/cluster/metadata/IndexNameExpressionResolverTests.java b/core/src/test/java/org/elasticsearch/cluster/metadata/IndexNameExpressionResolverTests.java
+index b68f3735c0a9..7d3ca04e5a84 100644
+--- a/core/src/test/java/org/elasticsearch/cluster/metadata/IndexNameExpressionResolverTests.java
++++ b/core/src/test/java/org/elasticsearch/cluster/metadata/IndexNameExpressionResolverTests.java
+@@ -33,6 +33,7 @@
+ import java.util.Arrays;
+ import java.util.Collections;
+ import java.util.HashSet;
++import java.util.function.Predicate;
+ 
+ import static org.elasticsearch.common.util.set.Sets.newHashSet;
+ import static org.hamcrest.Matchers.arrayContaining;
+@@ -956,4 +957,17 @@ public void testFilteringAliases() {
+         strings = indexNameExpressionResolver.filteringAliases(state, "test-0", "test-*,alias-*");
+         assertNull(strings);
+     }
++
++    public void testIndexAliases() {
++        MetaData.Builder mdBuilder = MetaData.builder()
++            .put(indexBuilder("test-0").state(State.OPEN)
++                .putAlias(AliasMetaData.builder("test-alias-0").filter("{ \"term\": \"foo\"}"))
++                .putAlias(AliasMetaData.builder("test-alias-1").filter("{ \"term\": \"foo\"}"))
++                .putAlias(AliasMetaData.builder("test-alias-non-filtering"))
++            );
++        ClusterState state = ClusterState.builder(new ClusterName("_name")).metaData(mdBuilder).build();
++        String[] strings = indexNameExpressionResolver.indexAliases(state, "test-0", x -> true, true, "test-*");
++        Arrays.sort(strings);
++        assertArrayEquals(new String[] {"test-alias-0", "test-alias-1", "test-alias-non-filtering"}, strings);
++    }
+ }
+diff --git a/docs/reference/search/search-shards.asciidoc b/docs/reference/search/search-shards.asciidoc
+index 1515a182d425..b20117bb75db 100644
+--- a/docs/reference/search/search-shards.asciidoc
++++ b/docs/reference/search/search-shards.asciidoc
+@@ -4,7 +4,7 @@
+ The search shards api returns the indices and shards that a search request would
+ be executed against. This can give useful feedback for working out issues or
+ planning optimizations with routing and shard preferences. When filtered aliases
+-are used, the filter is returned as part of the `indices` section.
++are used, the filter is returned as part of the `indices` section [5.1.0] Added in 5.1.0.
+ 
+ The `index` may be a single value, or comma-separated.
+ 
+@@ -165,4 +165,4 @@ routing values have been specified.
+ `local`::
+     A boolean value whether to read the cluster state locally in order to
+     determine where shards are allocated instead of using the Master node's
+-    cluster state.
++    cluster state.
+\ No newline at end of file
+diff --git a/rest-api-spec/src/main/resources/rest-api-spec/test/search_shards/10_basic.yaml b/rest-api-spec/src/main/resources/rest-api-spec/test/search_shards/10_basic.yaml
+index 42189883b1ba..d2a53a4416ad 100644
+--- a/rest-api-spec/src/main/resources/rest-api-spec/test/search_shards/10_basic.yaml
++++ b/rest-api-spec/src/main/resources/rest-api-spec/test/search_shards/10_basic.yaml
+@@ -14,7 +14,7 @@
+ ---
+ "Search shards aliases with and without filters":
+   - skip:
+-      version: " - 5.0.99"
++      version: " - 5.99.99" # temporarily disabled
+       reason: indices section was added in 5.1.0
+ 
+   - do:
+@@ -49,7 +49,7 @@
+   - match: { shards.0.0.index: test_index }
+   - is_true: indices.test_index
+   - is_false: indices.test_index.filter
+-  - is_false: indices.test_index.aliases
++  - match: { indices.test_index.aliases: [test_alias_no_filter]}
+ 
+   - do:
+       search_shards:
+@@ -78,3 +78,30 @@
+   - match: { indices.test_index.filter.bool.adjust_pure_negative: true}
+   - lte: { indices.test_index.filter.bool.boost: 1.0 }
+   - gte: { indices.test_index.filter.bool.boost: 1.0 }
++
++  - do:
++      search_shards:
++        index:  "test*"
++
++  - length: { shards: 1 }
++  - match: { shards.0.0.index: test_index }
++  - match: { indices.test_index.aliases: [test_alias_filter_1, test_alias_filter_2, test_alias_no_filter]}
++  - is_false: indices.test_index.filter
++
++  - do:
++      search_shards:
++        index:  ["test_alias_filter_1","test_alias_no_filter"]
++
++  - length: { shards: 1 }
++  - match: { shards.0.0.index: test_index }
++  - match: { indices.test_index.aliases: [test_alias_filter_1, test_alias_no_filter]}
++  - is_false: indices.test_index.filter
++
++  - do:
++      search_shards:
++        index:  ["test_alias_no_filter"]
++
++  - length: { shards: 1 }
++  - match: { shards.0.0.index: test_index }
++  - match: { indices.test_index.aliases: [test_alias_no_filter]}
++  - is_false: indices.test_index.filter

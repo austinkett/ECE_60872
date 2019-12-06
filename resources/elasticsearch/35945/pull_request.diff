@@ -1,0 +1,164 @@
+diff --git a/client/rest-high-level/src/test/java/org/elasticsearch/client/CCRIT.java b/client/rest-high-level/src/test/java/org/elasticsearch/client/CCRIT.java
+index 9c5db63ada9e..391ee1fcd18b 100644
+--- a/client/rest-high-level/src/test/java/org/elasticsearch/client/CCRIT.java
++++ b/client/rest-high-level/src/test/java/org/elasticsearch/client/CCRIT.java
+@@ -39,6 +39,7 @@
+ import org.elasticsearch.client.ccr.ResumeFollowRequest;
+ import org.elasticsearch.client.ccr.UnfollowRequest;
+ import org.elasticsearch.client.core.AcknowledgedResponse;
++import org.elasticsearch.common.xcontent.ObjectPath;
+ import org.elasticsearch.common.xcontent.XContentHelper;
+ import org.elasticsearch.common.xcontent.XContentType;
+ import org.elasticsearch.common.xcontent.json.JsonXContent;
+@@ -55,7 +56,7 @@
+ public class CCRIT extends ESRestHighLevelClientTestCase {
+ 
+     @Before
+-    public void setupRemoteClusterConfig() throws IOException {
++    public void setupRemoteClusterConfig() throws Exception {
+         // Configure local cluster as remote cluster:
+         // TODO: replace with nodes info highlevel rest client code when it is available:
+         final Request request = new Request("GET", "/_nodes");
+@@ -69,6 +70,14 @@ public void setupRemoteClusterConfig() throws IOException {
+         ClusterUpdateSettingsResponse updateSettingsResponse =
+             highLevelClient().cluster().putSettings(updateSettingsRequest, RequestOptions.DEFAULT);
+         assertThat(updateSettingsResponse.isAcknowledged(), is(true));
++
++        assertBusy(() -> {
++            Map<?, ?> localConnection = (Map<?, ?>) toMap(client()
++                .performRequest(new Request("GET", "/_remote/info")))
++                .get("local");
++            assertThat(localConnection, notNullValue());
++            assertThat(localConnection.get("connected"), is(true));
++        });
+     }
+ 
+     public void testIndexFollowing() throws Exception {
+@@ -132,7 +141,6 @@ public void testIndexFollowing() throws Exception {
+         assertThat(unfollowResponse.isAcknowledged(), is(true));
+     }
+ 
+-    @AwaitsFix(bugUrl = "https://github.com/elastic/elasticsearch/issues/35937")
+     public void testAutoFollowing() throws Exception {
+         CcrClient ccrClient = highLevelClient().ccr();
+         PutAutoFollowPatternRequest putAutoFollowPatternRequest =
+@@ -149,14 +157,21 @@ public void testAutoFollowing() throws Exception {
+ 
+         assertBusy(() -> {
+             assertThat(indexExists("copy-logs-20200101"), is(true));
++            // TODO: replace with HLRC follow stats when available:
++            Map<String, Object> rsp = toMap(client().performRequest(new Request("GET", "/copy-logs-20200101/_ccr/stats")));
++            String index = null;
++            try {
++                index = ObjectPath.eval("indices.0.index", rsp);
++            } catch (Exception e){ }
++            assertThat(index, equalTo("copy-logs-20200101"));
+         });
+ 
+         GetAutoFollowPatternRequest getAutoFollowPatternRequest =
+             randomBoolean() ? new GetAutoFollowPatternRequest("pattern1") : new GetAutoFollowPatternRequest();
+         GetAutoFollowPatternResponse getAutoFollowPatternResponse =
+             execute(getAutoFollowPatternRequest, ccrClient::getAutoFollowPattern, ccrClient::getAutoFollowPatternAsync);
+-        assertThat(getAutoFollowPatternResponse.getPatterns().size(), equalTo(1L));
+-        GetAutoFollowPatternResponse.Pattern pattern = getAutoFollowPatternResponse.getPatterns().get("patterns1");
++        assertThat(getAutoFollowPatternResponse.getPatterns().size(), equalTo(1));
++        GetAutoFollowPatternResponse.Pattern pattern = getAutoFollowPatternResponse.getPatterns().get("pattern1");
+         assertThat(pattern, notNullValue());
+         assertThat(pattern.getRemoteCluster(), equalTo(putAutoFollowPatternRequest.getRemoteCluster()));
+         assertThat(pattern.getLeaderIndexPatterns(), equalTo(putAutoFollowPatternRequest.getLeaderIndexPatterns()));
+diff --git a/x-pack/plugin/ccr/src/main/java/org/elasticsearch/xpack/ccr/CcrLicenseChecker.java b/x-pack/plugin/ccr/src/main/java/org/elasticsearch/xpack/ccr/CcrLicenseChecker.java
+index 3985b90a71b2..77ac94da4aa5 100644
+--- a/x-pack/plugin/ccr/src/main/java/org/elasticsearch/xpack/ccr/CcrLicenseChecker.java
++++ b/x-pack/plugin/ccr/src/main/java/org/elasticsearch/xpack/ccr/CcrLicenseChecker.java
+@@ -160,15 +160,22 @@ public void checkRemoteClusterLicenseAndFetchClusterState(
+             final ClusterStateRequest request,
+             final Consumer<Exception> onFailure,
+             final Consumer<ClusterState> leaderClusterStateConsumer) {
+-        checkRemoteClusterLicenseAndFetchClusterState(
++        try {
++            Client remoteClient = systemClient(client.getRemoteClusterClient(clusterAlias));
++            checkRemoteClusterLicenseAndFetchClusterState(
+                 client,
+                 clusterAlias,
+-                systemClient(client.getRemoteClusterClient(clusterAlias)),
++                remoteClient,
+                 request,
+                 onFailure,
+                 leaderClusterStateConsumer,
+                 CcrLicenseChecker::clusterStateNonCompliantRemoteLicense,
+                 e -> clusterStateUnknownRemoteLicense(clusterAlias, e));
++        } catch (Exception e) {
++            // client.getRemoteClusterClient(...) can fail with a IllegalArgumentException if remote
++            // connection is unknown
++            onFailure.accept(e);
++        }
+     }
+ 
+     /**
+diff --git a/x-pack/plugin/ccr/src/main/java/org/elasticsearch/xpack/ccr/action/AutoFollowCoordinator.java b/x-pack/plugin/ccr/src/main/java/org/elasticsearch/xpack/ccr/action/AutoFollowCoordinator.java
+index 0e86aa157adf..6bddedc01040 100644
+--- a/x-pack/plugin/ccr/src/main/java/org/elasticsearch/xpack/ccr/action/AutoFollowCoordinator.java
++++ b/x-pack/plugin/ccr/src/main/java/org/elasticsearch/xpack/ccr/action/AutoFollowCoordinator.java
+@@ -403,6 +403,13 @@ static String getFollowerIndexName(AutoFollowPattern autoFollowPattern, String l
+             return currentState -> {
+                 AutoFollowMetadata currentAutoFollowMetadata = currentState.metaData().custom(AutoFollowMetadata.TYPE);
+                 Map<String, List<String>> newFollowedIndexUUIDS = new HashMap<>(currentAutoFollowMetadata.getFollowedLeaderIndexUUIDs());
++                if (newFollowedIndexUUIDS.containsKey(name) == false) {
++                    // A delete auto follow pattern request can have removed the auto follow pattern while we want to update
++                    // the auto follow metadata with the fact that an index was successfully auto followed. If this
++                    // happens, we can just skip this step.
++                    return currentState;
++                }
++
+                 newFollowedIndexUUIDS.compute(name, (key, existingUUIDs) -> {
+                     assert existingUUIDs != null;
+                     List<String> newUUIDs = new ArrayList<>(existingUUIDs);
+diff --git a/x-pack/plugin/ccr/src/test/java/org/elasticsearch/xpack/ccr/action/AutoFollowCoordinatorTests.java b/x-pack/plugin/ccr/src/test/java/org/elasticsearch/xpack/ccr/action/AutoFollowCoordinatorTests.java
+index 4624a3622b99..2b7fee13502a 100644
+--- a/x-pack/plugin/ccr/src/test/java/org/elasticsearch/xpack/ccr/action/AutoFollowCoordinatorTests.java
++++ b/x-pack/plugin/ccr/src/test/java/org/elasticsearch/xpack/ccr/action/AutoFollowCoordinatorTests.java
+@@ -40,8 +40,10 @@
+ import java.util.function.Consumer;
+ import java.util.function.Function;
+ 
++import static org.elasticsearch.xpack.ccr.action.AutoFollowCoordinator.AutoFollower.recordLeaderIndexAsFollowFunction;
+ import static org.hamcrest.Matchers.equalTo;
+ import static org.hamcrest.Matchers.is;
++import static org.hamcrest.Matchers.notNullValue;
+ import static org.hamcrest.Matchers.nullValue;
+ import static org.hamcrest.Matchers.sameInstance;
+ import static org.mockito.Matchers.anyString;
+@@ -384,6 +386,33 @@ public void testGetLeaderIndicesToFollow_shardsNotStarted() {
+         assertThat(result.get(1).getName(), equalTo("index2"));
+     }
+ 
++    public void testRecordLeaderIndexAsFollowFunction() {
++        AutoFollowMetadata autoFollowMetadata = new AutoFollowMetadata(Collections.emptyMap(),
++            Collections.singletonMap("pattern1", Collections.emptyList()), Collections.emptyMap());
++        ClusterState clusterState = new ClusterState.Builder(new ClusterName("name"))
++            .metaData(new MetaData.Builder().putCustom(AutoFollowMetadata.TYPE, autoFollowMetadata))
++            .build();
++        Function<ClusterState, ClusterState> function = recordLeaderIndexAsFollowFunction("pattern1", new Index("index1", "index1"));
++
++        ClusterState result = function.apply(clusterState);
++        AutoFollowMetadata autoFollowMetadataResult = result.metaData().custom(AutoFollowMetadata.TYPE);
++        assertThat(autoFollowMetadataResult.getFollowedLeaderIndexUUIDs().get("pattern1"), notNullValue());
++        assertThat(autoFollowMetadataResult.getFollowedLeaderIndexUUIDs().get("pattern1").size(), equalTo(1));
++        assertThat(autoFollowMetadataResult.getFollowedLeaderIndexUUIDs().get("pattern1").get(0), equalTo("index1"));
++    }
++
++    public void testRecordLeaderIndexAsFollowFunctionNoEntry() {
++        AutoFollowMetadata autoFollowMetadata = new AutoFollowMetadata(Collections.emptyMap(), Collections.emptyMap(),
++            Collections.emptyMap());
++        ClusterState clusterState = new ClusterState.Builder(new ClusterName("name"))
++            .metaData(new MetaData.Builder().putCustom(AutoFollowMetadata.TYPE, autoFollowMetadata))
++            .build();
++        Function<ClusterState, ClusterState> function = recordLeaderIndexAsFollowFunction("pattern1", new Index("index1", "index1"));
++
++        ClusterState result = function.apply(clusterState);
++        assertThat(result, sameInstance(clusterState));
++    }
++
+     public void testGetFollowerIndexName() {
+         AutoFollowPattern autoFollowPattern = new AutoFollowPattern("remote", Collections.singletonList("metrics-*"), null, null,
+             null, null, null, null, null, null, null, null, null);

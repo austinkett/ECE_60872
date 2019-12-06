@@ -1,0 +1,407 @@
+diff --git a/x-pack/plugin/core/src/main/java/org/elasticsearch/xpack/core/ssl/SSLService.java b/x-pack/plugin/core/src/main/java/org/elasticsearch/xpack/core/ssl/SSLService.java
+index 1a7641ef64b8..82ac444cfb6b 100644
+--- a/x-pack/plugin/core/src/main/java/org/elasticsearch/xpack/core/ssl/SSLService.java
++++ b/x-pack/plugin/core/src/main/java/org/elasticsearch/xpack/core/ssl/SSLService.java
+@@ -52,6 +52,7 @@
+ import java.util.Objects;
+ import java.util.Optional;
+ import java.util.Set;
++import java.util.function.Supplier;
+ import java.util.stream.Collectors;
+ 
+ /**
+@@ -201,9 +202,14 @@ SSLIOSessionStrategy sslIOSessionStrategy(SSLContext sslContext, String[] protoc
+      * @return Never {@code null}.
+      */
+     public SSLSocketFactory sslSocketFactory(SSLConfiguration configuration) {
+-        SSLSocketFactory socketFactory = sslContext(configuration).getSocketFactory();
+-        return new SecuritySSLSocketFactory(socketFactory, configuration.supportedProtocols().toArray(Strings.EMPTY_ARRAY),
+-                supportedCiphers(socketFactory.getSupportedCipherSuites(), configuration.cipherSuites(), false));
++        final SSLContextHolder contextHolder = sslContextHolder(configuration);
++        SSLSocketFactory socketFactory = contextHolder.sslContext().getSocketFactory();
++        final SecuritySSLSocketFactory securitySSLSocketFactory = new SecuritySSLSocketFactory(
++            () -> contextHolder.sslContext().getSocketFactory(),
++            configuration.supportedProtocols().toArray(Strings.EMPTY_ARRAY),
++            supportedCiphers(socketFactory.getSupportedCipherSuites(), configuration.cipherSuites(), false));
++        contextHolder.addReloadListener(securitySSLSocketFactory::reload);
++        return securitySSLSocketFactory;
+     }
+ 
+     /**
+@@ -463,12 +469,15 @@ private void storeSslConfiguration(String key, SSLConfiguration configuration) {
+      */
+     private static class SecuritySSLSocketFactory extends SSLSocketFactory {
+ 
+-        private final SSLSocketFactory delegate;
++        private final Supplier<SSLSocketFactory> delegateSupplier;
+         private final String[] supportedProtocols;
+         private final String[] ciphers;
+ 
+-        SecuritySSLSocketFactory(SSLSocketFactory delegate, String[] supportedProtocols, String[] ciphers) {
+-            this.delegate = delegate;
++        private volatile SSLSocketFactory delegate;
++
++        SecuritySSLSocketFactory(Supplier<SSLSocketFactory> delegateSupplier, String[] supportedProtocols, String[] ciphers) {
++            this.delegateSupplier = delegateSupplier;
++            this.delegate = this.delegateSupplier.get();
+             this.supportedProtocols = supportedProtocols;
+             this.ciphers = ciphers;
+         }
+@@ -525,6 +534,11 @@ public Socket createSocket(InetAddress address, int port, InetAddress localAddre
+             return sslSocket;
+         }
+ 
++        public void reload() {
++            final SSLSocketFactory newDelegate = delegateSupplier.get();
++            this.delegate = newDelegate;
++        }
++
+         private void configureSSLSocket(SSLSocket socket) {
+             SSLParameters parameters = new SSLParameters(ciphers, supportedProtocols);
+             // we use the cipher suite order so that we can prefer the ciphers we set first in the list
+@@ -543,12 +557,14 @@ private static SSLSocket createWithPermissions(CheckedSupplier<Socket, IOExcepti
+         private final KeyConfig keyConfig;
+         private final TrustConfig trustConfig;
+         private final SSLConfiguration sslConfiguration;
++        private final List<Runnable> reloadListeners;
+ 
+         SSLContextHolder(SSLContext context, SSLConfiguration sslConfiguration) {
+             this.context = context;
+             this.sslConfiguration = sslConfiguration;
+             this.keyConfig = sslConfiguration.keyConfig();
+             this.trustConfig = sslConfiguration.trustConfig();
++            this.reloadListeners = new ArrayList<>();
+         }
+ 
+         SSLContext sslContext() {
+@@ -559,6 +575,7 @@ synchronized void reload() {
+             invalidateSessions(context.getClientSessionContext());
+             invalidateSessions(context.getServerSessionContext());
+             reloadSslContext();
++            this.reloadListeners.forEach(Runnable::run);
+         }
+ 
+         private void reloadSslContext() {
+@@ -592,6 +609,10 @@ X509ExtendedTrustManager getEmptyTrustManager() throws GeneralSecurityException,
+             trustManagerFactory.init(keyStore);
+             return (X509ExtendedTrustManager) trustManagerFactory.getTrustManagers()[0];
+         }
++
++        public void addReloadListener(Runnable listener) {
++            this.reloadListeners.add(listener);
++        }
+     }
+ 
+     /**
+diff --git a/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/authc/ldap/LdapSessionFactoryTests.java b/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/authc/ldap/LdapSessionFactoryTests.java
+index c0c0a08a59a5..106eaa893262 100644
+--- a/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/authc/ldap/LdapSessionFactoryTests.java
++++ b/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/authc/ldap/LdapSessionFactoryTests.java
+@@ -13,19 +13,25 @@
+ import org.elasticsearch.common.settings.Settings;
+ import org.elasticsearch.common.util.concurrent.ThreadContext;
+ import org.elasticsearch.common.util.concurrent.UncategorizedExecutionException;
++import org.elasticsearch.env.Environment;
+ import org.elasticsearch.env.TestEnvironment;
+ import org.elasticsearch.threadpool.TestThreadPool;
+ import org.elasticsearch.threadpool.ThreadPool;
++import org.elasticsearch.watcher.ResourceWatcherService;
+ import org.elasticsearch.xpack.core.security.authc.RealmConfig;
+ import org.elasticsearch.xpack.core.security.authc.RealmSettings;
+ import org.elasticsearch.xpack.core.security.authc.ldap.support.LdapSearchScope;
+ import org.elasticsearch.xpack.core.security.authc.ldap.support.SessionFactorySettings;
++import org.elasticsearch.xpack.core.ssl.SSLConfigurationReloader;
+ import org.elasticsearch.xpack.core.ssl.SSLService;
+ import org.elasticsearch.xpack.security.authc.ldap.support.LdapSession;
+ import org.elasticsearch.xpack.security.authc.ldap.support.LdapTestCase;
+ import org.junit.After;
+ import org.junit.Before;
+ 
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.StandardCopyOption;
+ import java.util.List;
+ import java.util.concurrent.ExecutionException;
+ 
+@@ -38,10 +44,23 @@
+     private Settings globalSettings;
+     private SSLService sslService;
+     private ThreadPool threadPool;
++    private Path ldapCaPath;
++
++    @Override
++    protected boolean openLdapsPort() {
++        // Support LDAPS, because it's used in some test
++        return true;
++    }
+ 
+     @Before
+     public void setup() throws Exception {
+-        globalSettings = Settings.builder().put("path.home", createTempDir()).build();
++        final Path origCa = getDataPath("/org/elasticsearch/xpack/security/authc/ldap/support/ldap-ca.crt");
++        ldapCaPath = createTempFile();
++        Files.copy(origCa, ldapCaPath, StandardCopyOption.REPLACE_EXISTING);
++        globalSettings = Settings.builder()
++            .put("path.home", createTempDir())
++            .putList(RealmSettings.realmSslPrefix(REALM_IDENTIFIER) + "certificate_authorities", ldapCaPath.toString())
++            .build();
+         sslService = new SSLService(globalSettings, TestEnvironment.newEnvironment(globalSettings));
+         threadPool = new TestThreadPool("LdapSessionFactoryTests thread pool");
+     }
+@@ -53,7 +72,8 @@ public void shutdown() throws InterruptedException {
+ 
+     public void testBindWithReadTimeout() throws Exception {
+         InMemoryDirectoryServer ldapServer = randomFrom(ldapServers);
+-        String ldapUrl = new LDAPURL("ldap", "localhost", ldapServer.getListenPort(), null, null, null, null).toString();
++        String protocol = randomFrom("ldap", "ldaps");
++        String ldapUrl = new LDAPURL(protocol, "localhost", ldapServer.getListenPort(protocol), null, null, null, null).toString();
+         String groupSearchBase = "o=sevenSeas";
+         String userTemplates = "cn={0},ou=people,o=sevenSeas";
+ 
+@@ -203,4 +223,53 @@ public void testGroupLookupBase() throws Exception {
+             assertThat(groups, contains("cn=HMS Lydia,ou=crews,ou=groups,o=sevenSeas"));
+         }
+     }
++
++    /**
++     * This test connects to the in memory LDAP server over SSL using 2 different CA certificates.
++     * One certificate is valid, the other is not.
++     * The path to the certificate never changes, but the contents are copied in place.
++     * If the realm's CA path is monitored for changes and the underlying SSL context is reloaded, then we will get two different outcomes
++     * (one failure, one success) depending on which file content is in place.
++     */
++    public void testSslTrustIsReloaded() throws Exception {
++        InMemoryDirectoryServer ldapServer = randomFrom(ldapServers);
++        String ldapUrl = new LDAPURL("ldaps", "localhost", ldapServer.getListenPort("ldaps"), null, null, null, null).toString();
++        String groupSearchBase = "o=sevenSeas";
++        String userTemplates = "cn={0},ou=people,o=sevenSeas";
++
++        Settings settings = Settings.builder()
++            .put(globalSettings)
++            .put(buildLdapSettings(ldapUrl, userTemplates, groupSearchBase, LdapSearchScope.SUB_TREE))
++            .build();
++
++        final Path realCa = getDataPath("/org/elasticsearch/xpack/security/authc/ldap/support/ldap-ca.crt");
++        final Path fakeCa = getDataPath("/org/elasticsearch/xpack/security/authc/ldap/support/smb_ca.crt");
++
++        final Environment environment = TestEnvironment.newEnvironment(settings);
++        RealmConfig config = new RealmConfig(REALM_IDENTIFIER, settings,
++            environment, new ThreadContext(settings));
++        LdapSessionFactory sessionFactory = new LdapSessionFactory(config, sslService, threadPool);
++        String user = "Horatio Hornblower";
++        SecureString userPass = new SecureString("pass");
++
++        final ResourceWatcherService resourceWatcher = new ResourceWatcherService(settings, threadPool);
++        new SSLConfigurationReloader(environment, sslService, resourceWatcher);
++
++        Files.copy(fakeCa, ldapCaPath, StandardCopyOption.REPLACE_EXISTING);
++        resourceWatcher.notifyNow(ResourceWatcherService.Frequency.HIGH);
++
++        UncategorizedExecutionException e =
++            expectThrows(UncategorizedExecutionException.class, () -> session(sessionFactory, user, userPass));
++        assertThat(e.getCause(), instanceOf(ExecutionException.class));
++        assertThat(e.getCause().getCause(), instanceOf(LDAPException.class));
++        assertThat(e.getCause().getCause().getMessage(), containsString("SSLPeerUnverifiedException"));
++
++        Files.copy(realCa, ldapCaPath, StandardCopyOption.REPLACE_EXISTING);
++        resourceWatcher.notifyNow(ResourceWatcherService.Frequency.HIGH);
++
++        final LdapSession session = session(sessionFactory, user, userPass);
++        assertThat(session.userDn(), is("cn=Horatio Hornblower,ou=people,o=sevenSeas"));
++
++        session.close();
++    }
+ }
+diff --git a/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/authc/ldap/support/LdapTestCase.java b/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/authc/ldap/support/LdapTestCase.java
+index bba13e9ec2ca..8e9fed97d08b 100644
+--- a/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/authc/ldap/support/LdapTestCase.java
++++ b/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/authc/ldap/support/LdapTestCase.java
+@@ -6,6 +6,8 @@
+ package org.elasticsearch.xpack.security.authc.ldap.support;
+ 
+ import com.unboundid.ldap.listener.InMemoryDirectoryServer;
++import com.unboundid.ldap.listener.InMemoryDirectoryServerConfig;
++import com.unboundid.ldap.listener.InMemoryListenerConfig;
+ import com.unboundid.ldap.sdk.Attribute;
+ import com.unboundid.ldap.sdk.LDAPConnection;
+ import com.unboundid.ldap.sdk.LDAPConnectionPool;
+@@ -30,6 +32,7 @@
+ import org.elasticsearch.xpack.core.security.authc.ldap.support.LdapSearchScope;
+ import org.elasticsearch.xpack.core.security.authc.ldap.support.SessionFactorySettings;
+ import org.elasticsearch.xpack.core.security.authc.support.DnRoleMapperSettings;
++import org.elasticsearch.xpack.core.ssl.CertParsingUtils;
+ import org.elasticsearch.xpack.core.ssl.SSLConfigurationSettings;
+ import org.elasticsearch.xpack.core.ssl.VerificationMode;
+ import org.elasticsearch.xpack.security.authc.support.DnRoleMapper;
+@@ -37,7 +40,13 @@
+ import org.junit.Before;
+ import org.junit.BeforeClass;
+ 
++import javax.net.ssl.KeyManager;
++import javax.net.ssl.KeyManagerFactory;
++import javax.net.ssl.SSLContext;
++import javax.net.ssl.SSLServerSocketFactory;
++import javax.net.ssl.X509ExtendedKeyManager;
+ import java.security.AccessController;
++import java.security.KeyStore;
+ import java.security.PrivilegedAction;
+ import java.security.PrivilegedExceptionAction;
+ import java.util.ArrayList;
+@@ -64,7 +73,24 @@ public static void setNumberOfLdapServers() {
+     public void startLdap() throws Exception {
+         ldapServers = new InMemoryDirectoryServer[numberOfLdapServers];
+         for (int i = 0; i < numberOfLdapServers; i++) {
+-            InMemoryDirectoryServer ldapServer = new InMemoryDirectoryServer("o=sevenSeas");
++            InMemoryDirectoryServerConfig serverConfig = new InMemoryDirectoryServerConfig("o=sevenSeas");
++            List<InMemoryListenerConfig> listeners = new ArrayList<>(2);
++            listeners.add(InMemoryListenerConfig.createLDAPConfig("ldap"));
++            if (openLdapsPort()) {
++                final char[] ldapPassword = "ldap-password".toCharArray();
++                final KeyStore ks = CertParsingUtils.getKeyStoreFromPEM(
++                    getDataPath("/org/elasticsearch/xpack/security/authc/ldap/support/ldap-test-case.crt"),
++                    getDataPath("/org/elasticsearch/xpack/security/authc/ldap/support/ldap-test-case.key"),
++                    ldapPassword
++                );
++                X509ExtendedKeyManager keyManager = CertParsingUtils.keyManager(ks, ldapPassword, KeyManagerFactory.getDefaultAlgorithm());
++                final SSLContext context = SSLContext.getInstance("TLSv1.2");
++                context.init(new KeyManager[] { keyManager }, null, null);
++                SSLServerSocketFactory socketFactory = context.getServerSocketFactory();
++                listeners.add(InMemoryListenerConfig.createLDAPSConfig("ldaps", socketFactory));
++            }
++            serverConfig.setListenerConfigs(listeners);
++            InMemoryDirectoryServer ldapServer = new InMemoryDirectoryServer(serverConfig);
+             ldapServer.add("o=sevenSeas", new Attribute("dc", "UnboundID"),
+                     new Attribute("objectClass", "top", "domain", "extensibleObject"));
+             ldapServer.importFromLDIF(false,
+@@ -78,6 +104,10 @@ public void startLdap() throws Exception {
+         }
+     }
+ 
++    protected boolean openLdapsPort() {
++        return false;
++    }
++
+     @After
+     public void stopLdap() throws Exception {
+         for (int i = 0; i < numberOfLdapServers; i++) {
+diff --git a/x-pack/plugin/security/src/test/resources/org/elasticsearch/xpack/security/authc/ldap/support/ldap-ca.crt b/x-pack/plugin/security/src/test/resources/org/elasticsearch/xpack/security/authc/ldap/support/ldap-ca.crt
+new file mode 100644
+index 000000000000..308365600225
+--- /dev/null
++++ b/x-pack/plugin/security/src/test/resources/org/elasticsearch/xpack/security/authc/ldap/support/ldap-ca.crt
+@@ -0,0 +1,20 @@
++-----BEGIN CERTIFICATE-----
++MIIDSjCCAjKgAwIBAgIVAM5ozCjWHrKyM5Yf/WzUJg/ei3YMMA0GCSqGSIb3DQEB
++CwUAMDQxMjAwBgNVBAMTKUVsYXN0aWMgQ2VydGlmaWNhdGUgVG9vbCBBdXRvZ2Vu
++ZXJhdGVkIENBMB4XDTE4MTIyMTA3NDUyOFoXDTQ2MDUwNzA3NDUyOFowNDEyMDAG
++A1UEAxMpRWxhc3RpYyBDZXJ0aWZpY2F0ZSBUb29sIEF1dG9nZW5lcmF0ZWQgQ0Ew
++ggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQC3QoZjXdPIwfa6y8YehqSF
++4yxeFW+mDQi6soNqGJGjCJj7IN630Gcx4/4smL32mLVk6RwGxS555z+FP3Gt/NLf
++mMc4GWwCAl+l+tAhBPuMtACZwNrKINRP/DdIaVKIKlQWh6bu7WJoyJriyUqN9US6
++ki54G/wfY7NoKhvWoj4zKbQg5lW5XADd2EFgoz9wkRrB2UzyuUYbBmJye/dnZnXn
++mo4Cgwd6kQ/8+VMzcxDFa6jh2TXmb3zIyShe0fiYShPNicScGLhxXHbWhczl3Fy9
++E+x4ksZrqsb6c0WAOHCsgmLZwd5h2lk4+WPg5tf7Va1uZ5ETH8CMFRsbrVb2L93t
++AgMBAAGjUzBRMB0GA1UdDgQWBBROJaHRWe17um5rqqYn10aqedr55DAfBgNVHSME
++GDAWgBROJaHRWe17um5rqqYn10aqedr55DAPBgNVHRMBAf8EBTADAQH/MA0GCSqG
++SIb3DQEBCwUAA4IBAQAm6l1TKmTh5HcwRhBpYWJSQOTq1CVKPGUBvdUCKQGFPmcE
++S5NYf4zvJisuUAB5ycUCPno4nWQ3jEXfITsysg0WypRWuZf61P4th6RKtzm4nP6a
++G+n1CtjIUN5mp0NTgBUeOL0aIXAPuWdQaVx9Q8JAV4N/w9B9n0LPvQ6j/ZtltvXE
++s6WyQTnSX6wAuxk0qxePszI2ZICeukp85Q3XjXOFTODbmT3rbANpKFJaaH7jBYqV
++XHVo38zVx4UBGnZVAs0MH2pcGp1hWpq2p/cXjxi4IaGofKt9/CbUgTAFJnEkrSRP
++2C5LrbRaaj1zECnwVmTnx1L9j/g7Ti83P+kdi7rI
++-----END CERTIFICATE-----
+diff --git a/x-pack/plugin/security/src/test/resources/org/elasticsearch/xpack/security/authc/ldap/support/ldap-ca.key b/x-pack/plugin/security/src/test/resources/org/elasticsearch/xpack/security/authc/ldap/support/ldap-ca.key
+new file mode 100644
+index 000000000000..c7e7f6cb5c12
+--- /dev/null
++++ b/x-pack/plugin/security/src/test/resources/org/elasticsearch/xpack/security/authc/ldap/support/ldap-ca.key
+@@ -0,0 +1,27 @@
++-----BEGIN RSA PRIVATE KEY-----
++MIIEpAIBAAKCAQEAt0KGY13TyMH2usvGHoakheMsXhVvpg0IurKDahiRowiY+yDe
++t9BnMeP+LJi99pi1ZOkcBsUueec/hT9xrfzS35jHOBlsAgJfpfrQIQT7jLQAmcDa
++yiDUT/w3SGlSiCpUFoem7u1iaMia4slKjfVEupIueBv8H2OzaCob1qI+Mym0IOZV
++uVwA3dhBYKM/cJEawdlM8rlGGwZicnv3Z2Z155qOAoMHepEP/PlTM3MQxWuo4dk1
++5m98yMkoXtH4mEoTzYnEnBi4cVx21oXM5dxcvRPseJLGa6rG+nNFgDhwrIJi2cHe
++YdpZOPlj4ObX+1WtbmeREx/AjBUbG61W9i/d7QIDAQABAoIBABic5LO/zEvwURTx
++fWBoMPyScEkKk/43Te7VPvUm65h79R/1YDRL1zBKML8InKrcA7DT5iG6pe1Vc6CP
++ztLRW/kP6eHM+EakzvfZ4c4tfyN8oYAE+N2g3yMG+t3M13rWRIjqGy+HzmnIV5UR
++9+NtB5gPPhJ/n7MPju70iNyg2b3BJ0LozgboT+/7UGJAHTnla83BTJ5prVwrBVhX
++eCLokYnfttI6swoZci84qONIAhRt5WSE98XZZa8ESmJzJ2vV2dAHaWXQTRKlRsQ8
++1FKkhbU60+L5eFMokvrHquWmYGjdE8Kow+NDTx00AdANKTWBwUjYj4kA0qR3yK6g
++1Ny7PbkCgYEA/KPMqSJi/2cq9gDiVIL1LPGxfMEUID9+1yAwZ1sDH1+iCKkYYqCF
++0miy1mm+H3SFKcstZd0+Ck2TvRqFHPb7g7PNH5oMZfSsxEsmGFr+TS/ZpMUKuXJ8
++68A6oRwWyycdwgTVdbG4iBYGv9Vs8tE3VdhcEvQHAloVrEad+dwn0o8CgYEAubJ/
++RHnvyl6PCT+/Ek7ZIYyIEkgl0swajOkaR6z4lewK4cfkh0djAjpSd43xDKR9Rk3N
++8viyiXIilvzw1sX5ag/QCAiSYANHPmVX5PQ+jWCnqam4PBJXCSQoEtCjEelIkqVx
++Tusjb0gzhwRZ7IhS2Gl+A/rnxnnS16PdEAp/VcMCgYEA6LDNbfKYD/kr3o0N6Rz9
++SLoL6YXETbdt0iJ5sphnFdx1V1i3dw+2cgewwD+At2QQyl+ynqHZ5I9zRbdJZ1Ys
++bi+K/FJcnQNwpRM6MTCODPXHljVOHWRPnqvc1EsUy2Rpyiu9l7tq5Ry0drfSswrz
++1oOCuoo8cnQahiQ8mMenfg0CgYAKBC3HNMiRYt5WQmD9DNG7dIgWbFvV7fp0pVIs
++kZDrDUtc+FpETb5ybVDrb/WTl//F3gaA15dRwJ1LBaO8Afu9E9NFy6iRkzuxiufd
++yqrhF1iT1zq/ysF1FcUvlp9lJO8sMc5V0msb4ooc+0gacRP+5lnMvyjnVMThqs4O
++wnIx3wKBgQCUSKcmfp4ROe8PHOZ4pC6MTo/fPAjBIav3Yd+PcJ6yodtk8/DVkQww
++ssvGP6TuBhOXQdfeLd6PHclMQGMMe2cRdCYJNWUF1LC5ae9Il+NZjjZsHNXjPaun
++/gHCDOI0oh0Wu7j8/QtCxIO8+6GJyAOUE3f/amqpUa+U60mqPzS99A==
++-----END RSA PRIVATE KEY-----
+diff --git a/x-pack/plugin/security/src/test/resources/org/elasticsearch/xpack/security/authc/ldap/support/ldap-test-case.crt b/x-pack/plugin/security/src/test/resources/org/elasticsearch/xpack/security/authc/ldap/support/ldap-test-case.crt
+new file mode 100644
+index 000000000000..b291aaa9362d
+--- /dev/null
++++ b/x-pack/plugin/security/src/test/resources/org/elasticsearch/xpack/security/authc/ldap/support/ldap-test-case.crt
+@@ -0,0 +1,20 @@
++-----BEGIN CERTIFICATE-----
++MIIDRTCCAi2gAwIBAgIVAJpxxIbXWyvdd6/rIFXPgWe6fyvTMA0GCSqGSIb3DQEB
++CwUAMDQxMjAwBgNVBAMTKUVsYXN0aWMgQ2VydGlmaWNhdGUgVG9vbCBBdXRvZ2Vu
++ZXJhdGVkIENBMB4XDTE4MTIyMTA3NDY1NVoXDTQ2MDUwNzA3NDY1NVowGTEXMBUG
++A1UEAxMObGRhcC10ZXN0LWNhc2UwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEK
++AoIBAQCswbyZDtaghZXsPhs1+lqCnq5HmRT2P6Drrs9bJlABeql29IhzdHOGLr+l
++TMhKOUpHuphgC31qbf/GvQLS65qdOzTjNfLv93+Jj0gp4S7Q6eRZvn1ihUgzECHa
++zTYwIlzVs4sFPm5i2fQbDK7W6zQm+h9r6GjCYj01OeIAe7rbRI9Ar+svuHGfZnaQ
++HzLZlfYkkM2bCaXBgKWVwmEUmwMW+IMOPCrVm+gk1MDbGnu9KtY/LqrJcddsqOdk
++K8qJ0Lpchg3zlP4qIzbmWRyTUIy1USbcazjuC/vMmN4fr/Xr0Jrhi4Rw8l2LGdyA
++8qnqtKYTqMzo3uv1ESlER8EAZDUbAgMBAAGjaTBnMB0GA1UdDgQWBBQaiCDScfBa
++jHOSk04XOymffbLBxTAfBgNVHSMEGDAWgBROJaHRWe17um5rqqYn10aqedr55DAa
++BgNVHREEEzARgglsb2NhbGhvc3SHBH8AAAEwCQYDVR0TBAIwADANBgkqhkiG9w0B
++AQsFAAOCAQEAXBovNqVg+VQ1LR0PfEMpbgbQlekky8qY2y1tz7J0ntGepAq+Np6n
++7J9En6ty1ELZUvgPUCF2btQqZbv8uyHz/C+rojKC5xzHN5qbZ31o5/0I/kNase1Z
++NbXuNJe3wAXuz+Mj5rtuOGZvlFsbtocuoydVYOclfqjUXcoZtqCcRamSvye7vGl2
++CHPqDi0uK8d75nE9Jrnmz/BNNV7CjPg636PJmCUrLL21+t69ZFL1eGAFtLBmmjcw
++cMkyv9bJirjZbjt/9UB+fW9XzV3RVLAzfrIHtToupXmWc4+hTOnlbKfFwqB9fa7Y
++XcCfGrZoJg9di1HbJrSJmv5QgRTM+/zkrA==
++-----END CERTIFICATE-----
+diff --git a/x-pack/plugin/security/src/test/resources/org/elasticsearch/xpack/security/authc/ldap/support/ldap-test-case.key b/x-pack/plugin/security/src/test/resources/org/elasticsearch/xpack/security/authc/ldap/support/ldap-test-case.key
+new file mode 100644
+index 000000000000..dfa7e7038e91
+--- /dev/null
++++ b/x-pack/plugin/security/src/test/resources/org/elasticsearch/xpack/security/authc/ldap/support/ldap-test-case.key
+@@ -0,0 +1,30 @@
++-----BEGIN RSA PRIVATE KEY-----
++Proc-Type: 4,ENCRYPTED
++DEK-Info: DES-EDE3-CBC,F7442C1F07A3A829
++
++jIINPsJbBILgZPf/MXVO5FPESwscOXnP9hQ6RpiQnxs3OlFWHqcuc0xw8jUeTGkS
++TJP/01p5PsqxA+keUAShgPGHHvLGZjKiIv/INAWk6Blm3Ic8hRYeTGfvJztSC+gk
++tFOj2vBJpSkTwdb9nk4vfGNYvhx4PZOrNqOFMXlgxQfioE/vWwHHHpx52niABQeh
++rAJKqW84oGmJl0cOxGkIblSgt6roQ0W+YzAQCTlpPLide1sW1daWRQgh4J+nwGLl
++WhoiGDTZxwmiOI0CgSSiaFwb4gmX8oyZq5MIVvN3QyQCAJYhiL+gJ4iNBE0mBZKW
++qF+5+8xerEPQ94Psox6PYMv/nJKSxv4yU57dx3Qp9qK0vJQTTK/T6sECom8gJ1XG
++yr/ZzeN3iAECK6rYnG+GGePN4iyBncBHGztbGzjcmPujbMQ96bpWAChNngOR9TUx
++sUufIwDR7Bw+Bwi7ybRqNkB+OAlzs8ioiMSQho5gR2YkVG6uFGYeIv5v67jXk62i
++kPiNLDBSpHRUa2CAwnlYmvDLo6VyDCVhkglPERFki9YYv9akAXExQ0+8UKXA43gH
++KXhqByiv4fw6h9q85T/n7CHXqsiDmrsHrlwun4a9ge5cHPnFrBsCZXcw0ZVEFtpQ
++VR1e0ELMBpdgLND8HtX95a/f1JRgX7AllG/egie3dfMeMUHEKVKJDRof2PVIuYqg
++hYFlLZXowHWvlYVwbEEgeR07n2TC9sD1UmEOHG1s9UV1iv0iPgJObTX8V1wC0lDx
++hq5TXMk3BAApHQZlOhuNLCabw6vOT1ijVoriWjpTxMhr9twYWo1lQ7QdHFft8HO8
++Ut0z7IPSTYvgj3IcE3CUrPqRYtqRimR4VFbafUZFM1UwiF7Qca5tkxAiGZWzzEYk
++hRZYaCwAruexbEVJx87a8TxV34h7gAviNeFSSzTeNVG3VXZlvGSWY23AlVZn5tFE
++fekxFB20T93u1XWKS8k5He0D0Pb39nuJrBOkZv+c0e5daBkAw3QMM2lYIM5iGJd9
++UehpzOLBR1qLmILL7k8dscebJ5HPKxGdBDE1PMdwkujydUvBSyenssWMosCglvl4
++Nso1kckc09FGUL9JRNFuhzrC0eP2+kzRVJ7upwr5SBHgOPpy99q0ugkzkSYDGf4c
++OpBOiAjbF8xwK1O+tV+yl3B8JMBEQEdePvjZ3WcqL6aYIaakUaSMKHa0zYS3pOFi
++zOR0Y2d69KhbSckTgh71gXpbT0ym1EUhpALbQskJ7StL/hU4AguWwOYpfuAYVvHt
++3BxMTZHqZaQCEMQFQWUIt7ZgtUoe2Lab1gx+q+gpUYaoCGRSYa0+H4cSQvIgiIsh
++9LU+deFLu6jF3lWlwQO5ZVxM0K95SwTj2eBpkYuonDIs7tUW7LIksM+8sxW+DCiA
++fBkFMdcOkiFV9oSTWI1HqpiePSJTOmHPZvYVqJ/ZDNBk6xSfPOH04TYNMEJqDf7W
++KQ2BSFXSiRxi4RniYyYzFYuFM/Fo4V3CTIGX2r4R8Jfb9t4Nn2Db6+r7RknDaR5k
++nhHQXwB+hbKNQSJlc2nMpG4MbwSO1axWio3yELRSCN+yFP6z8cobIw==
++-----END RSA PRIVATE KEY-----

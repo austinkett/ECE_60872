@@ -1,0 +1,445 @@
+diff --git a/x-pack/plugin/security/src/main/java/org/elasticsearch/xpack/security/support/SecurityIndexManager.java b/x-pack/plugin/security/src/main/java/org/elasticsearch/xpack/security/support/SecurityIndexManager.java
+index 0d48cd6b856e..64f129bb156f 100644
+--- a/x-pack/plugin/security/src/main/java/org/elasticsearch/xpack/security/support/SecurityIndexManager.java
++++ b/x-pack/plugin/security/src/main/java/org/elasticsearch/xpack/security/support/SecurityIndexManager.java
+@@ -45,8 +45,10 @@
+ import org.elasticsearch.common.xcontent.XContentType;
+ import org.elasticsearch.common.xcontent.json.JsonXContent;
+ import org.elasticsearch.gateway.GatewayService;
++import org.elasticsearch.index.Index;
+ import org.elasticsearch.index.IndexNotFoundException;
+ import org.elasticsearch.index.mapper.MapperService;
++import org.elasticsearch.indices.IndexClosedException;
+ import org.elasticsearch.rest.RestStatus;
+ import org.elasticsearch.xpack.core.security.index.RestrictedIndicesNames;
+ import org.elasticsearch.xpack.core.template.TemplateUtils;
+@@ -174,9 +176,11 @@ public ElasticsearchException getUnavailableReason() {
+             throw new IllegalStateException("caller must make sure to use a frozen state and check indexAvailable");
+         }
+ 
+-        if (localState.indexExists()) {
++        if (localState.indexState == IndexMetaData.State.CLOSE) {
++            return new IndexClosedException(new Index(localState.concreteIndexName, ClusterState.UNKNOWN_UUID));
++        } else if (localState.indexExists()) {
+             return new UnavailableShardsException(null,
+-                    "at least one primary shard for the index [" + localState.concreteIndexName + "] is unavailable");
++                "at least one primary shard for the index [" + localState.concreteIndexName + "] is unavailable");
+         } else {
+             return new IndexNotFoundException(localState.concreteIndexName);
+         }
+@@ -207,11 +211,24 @@ public void clusterChanged(ClusterChangedEvent event) {
+         final boolean indexAvailable = checkIndexAvailable(event.state());
+         final boolean mappingIsUpToDate = indexMetaData == null || checkIndexMappingUpToDate(event.state());
+         final Version mappingVersion = oldestIndexMappingVersion(event.state());
+-        final ClusterHealthStatus indexStatus = indexMetaData == null ? null :
+-            new ClusterIndexHealth(indexMetaData, event.state().getRoutingTable().index(indexMetaData.getIndex())).getStatus();
+         final String concreteIndexName = indexMetaData == null ? internalIndexName : indexMetaData.getIndex().getName();
++        final ClusterHealthStatus indexHealth;
++        final IndexMetaData.State indexState;
++        if (indexMetaData == null) {
++            // Index does not exist
++            indexState = null;
++            indexHealth = null;
++        } else if (indexMetaData.getState() == IndexMetaData.State.CLOSE) {
++            indexState = IndexMetaData.State.CLOSE;
++            indexHealth = null;
++            logger.warn("Index [{}] is closed. This is likely to prevent security from functioning correctly", concreteIndexName);
++        } else {
++            indexState = IndexMetaData.State.OPEN;
++            final IndexRoutingTable routingTable = event.state().getRoutingTable().index(indexMetaData.getIndex());
++            indexHealth = new ClusterIndexHealth(indexMetaData, routingTable).getStatus();
++        }
+         final State newState = new State(creationTime, isIndexUpToDate, indexAvailable, mappingIsUpToDate, mappingVersion,
+-                concreteIndexName, indexStatus);
++                concreteIndexName, indexHealth, indexState);
+         this.indexState = newState;
+ 
+         if (newState.equals(previousState) == false) {
+@@ -222,23 +239,21 @@ public void clusterChanged(ClusterChangedEvent event) {
+     }
+ 
+     private boolean checkIndexAvailable(ClusterState state) {
+-        final IndexRoutingTable routingTable = getIndexRoutingTable(state);
+-        if (routingTable != null && routingTable.allPrimaryShardsActive()) {
+-            return true;
+-        }
+-        logger.debug("Index [{}] is not yet active", aliasName);
+-        return false;
+-    }
+-
+-    /**
+-     * Returns the routing-table for this index, or <code>null</code> if the index does not exist.
+-     */
+-    private IndexRoutingTable getIndexRoutingTable(ClusterState clusterState) {
+-        IndexMetaData metaData = resolveConcreteIndex(aliasName, clusterState.metaData());
++        IndexMetaData metaData = resolveConcreteIndex(aliasName, state.metaData());
+         if (metaData == null) {
+-            return null;
++            logger.debug("Index [{}] is not available - no metadata", aliasName);
++            return false;
++        }
++        if (metaData.getState() == IndexMetaData.State.CLOSE) {
++            logger.warn("Index [{}] is closed", aliasName);
++            return false;
++        }
++        final IndexRoutingTable routingTable = state.routingTable().index(metaData.getIndex());
++        if (routingTable == null || routingTable.allPrimaryShardsActive() == false) {
++            logger.debug("Index [{}] is not yet active", aliasName);
++            return false;
+         } else {
+-            return clusterState.routingTable().index(metaData.getIndex());
++            return true;
+         }
+     }
+ 
+@@ -403,15 +418,15 @@ public void onFailure(Exception e) {
+      * Return true if the state moves from an unhealthy ("RED") index state to a healthy ("non-RED") state.
+      */
+     public static boolean isMoveFromRedToNonRed(State previousState, State currentState) {
+-        return (previousState.indexStatus == null || previousState.indexStatus == ClusterHealthStatus.RED)
+-                && currentState.indexStatus != null && currentState.indexStatus != ClusterHealthStatus.RED;
++        return (previousState.indexHealth == null || previousState.indexHealth == ClusterHealthStatus.RED)
++                && currentState.indexHealth != null && currentState.indexHealth != ClusterHealthStatus.RED;
+     }
+ 
+     /**
+      * Return true if the state moves from the index existing to the index not existing.
+      */
+     public static boolean isIndexDeleted(State previousState, State currentState) {
+-        return previousState.indexStatus != null && currentState.indexStatus == null;
++        return previousState.indexHealth != null && currentState.indexHealth == null;
+     }
+ 
+     private static byte[] readTemplateAsBytes(String templateName) {
+@@ -441,24 +456,27 @@ public static boolean isIndexDeleted(State previousState, State currentState) {
+      * State of the security index.
+      */
+     public static class State {
+-        public static final State UNRECOVERED_STATE = new State(null, false, false, false, null, null, null);
++        public static final State UNRECOVERED_STATE = new State(null, false, false, false, null, null, null, null);
+         public final Instant creationTime;
+         public final boolean isIndexUpToDate;
+         public final boolean indexAvailable;
+         public final boolean mappingUpToDate;
+         public final Version mappingVersion;
+         public final String concreteIndexName;
+-        public final ClusterHealthStatus indexStatus;
++        public final ClusterHealthStatus indexHealth;
++        public final IndexMetaData.State indexState;
+ 
+         public State(Instant creationTime, boolean isIndexUpToDate, boolean indexAvailable,
+-                     boolean mappingUpToDate, Version mappingVersion, String concreteIndexName, ClusterHealthStatus indexStatus) {
++                     boolean mappingUpToDate, Version mappingVersion, String concreteIndexName, ClusterHealthStatus indexHealth,
++                     IndexMetaData.State indexState) {
+             this.creationTime = creationTime;
+             this.isIndexUpToDate = isIndexUpToDate;
+             this.indexAvailable = indexAvailable;
+             this.mappingUpToDate = mappingUpToDate;
+             this.mappingVersion = mappingVersion;
+             this.concreteIndexName = concreteIndexName;
+-            this.indexStatus = indexStatus;
++            this.indexHealth = indexHealth;
++            this.indexState = indexState;
+         }
+ 
+         @Override
+@@ -472,7 +490,8 @@ public boolean equals(Object o) {
+                 mappingUpToDate == state.mappingUpToDate &&
+                 Objects.equals(mappingVersion, state.mappingVersion) &&
+                 Objects.equals(concreteIndexName, state.concreteIndexName) &&
+-                indexStatus == state.indexStatus;
++                indexHealth == state.indexHealth &&
++                indexState == state.indexState;
+         }
+ 
+         public boolean indexExists() {
+@@ -482,7 +501,7 @@ public boolean indexExists() {
+         @Override
+         public int hashCode() {
+             return Objects.hash(creationTime, isIndexUpToDate, indexAvailable, mappingUpToDate, mappingVersion, concreteIndexName,
+-                indexStatus);
++                indexHealth);
+         }
+     }
+ }
+diff --git a/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/authc/AuthenticationServiceTests.java b/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/authc/AuthenticationServiceTests.java
+index 67ce5ce2b27a..c3f3b86249f8 100644
+--- a/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/authc/AuthenticationServiceTests.java
++++ b/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/authc/AuthenticationServiceTests.java
+@@ -25,6 +25,7 @@
+ import org.elasticsearch.action.update.UpdateRequestBuilder;
+ import org.elasticsearch.client.Client;
+ import org.elasticsearch.cluster.health.ClusterHealthStatus;
++import org.elasticsearch.cluster.metadata.IndexMetaData;
+ import org.elasticsearch.cluster.service.ClusterService;
+ import org.elasticsearch.common.SuppressForbidden;
+ import org.elasticsearch.common.UUIDs;
+@@ -364,7 +365,7 @@ public void testCacheClearOnSecurityIndexChange() {
+ 
+         // green to yellow or yellow to green
+         previousState = dummyState(randomFrom(ClusterHealthStatus.GREEN, ClusterHealthStatus.YELLOW));
+-        currentState = dummyState(previousState.indexStatus == ClusterHealthStatus.GREEN ?
++        currentState = dummyState(previousState.indexHealth == ClusterHealthStatus.GREEN ?
+             ClusterHealthStatus.YELLOW : ClusterHealthStatus.GREEN);
+         service.onSecurityIndexStateChange(previousState, currentState);
+         assertEquals(expectedInvalidation, service.getNumInvalidation());
+@@ -1400,6 +1401,7 @@ private void setCompletedToTrue(AtomicBoolean completed) {
+     }
+ 
+     private SecurityIndexManager.State dummyState(ClusterHealthStatus indexStatus) {
+-        return new SecurityIndexManager.State(Instant.now(), true, true, true, null, concreteSecurityIndexName, indexStatus);
++        return new SecurityIndexManager.State(
++            Instant.now(), true, true, true, null, concreteSecurityIndexName, indexStatus, IndexMetaData.State.OPEN);
+     }
+ }
+diff --git a/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/authc/esnative/NativeRealmTests.java b/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/authc/esnative/NativeRealmTests.java
+index 28625f20627e..a8682c4e21d8 100644
+--- a/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/authc/esnative/NativeRealmTests.java
++++ b/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/authc/esnative/NativeRealmTests.java
+@@ -6,6 +6,7 @@
+ package org.elasticsearch.xpack.security.authc.esnative;
+ 
+ import org.elasticsearch.cluster.health.ClusterHealthStatus;
++import org.elasticsearch.cluster.metadata.IndexMetaData;
+ import org.elasticsearch.common.settings.Settings;
+ import org.elasticsearch.common.util.concurrent.ThreadContext;
+ import org.elasticsearch.env.TestEnvironment;
+@@ -27,7 +28,8 @@
+         RestrictedIndicesNames.INTERNAL_SECURITY_MAIN_INDEX_6, RestrictedIndicesNames.INTERNAL_SECURITY_MAIN_INDEX_7);
+ 
+     private SecurityIndexManager.State dummyState(ClusterHealthStatus indexStatus) {
+-        return new SecurityIndexManager.State(Instant.now(), true, true, true, null, concreteSecurityIndexName, indexStatus);
++        return new SecurityIndexManager.State(
++            Instant.now(), true, true, true, null, concreteSecurityIndexName, indexStatus, IndexMetaData.State.OPEN);
+     }
+ 
+     public void testCacheClearOnIndexHealthChange() {
+@@ -72,7 +74,7 @@ void clearCache() {
+ 
+         // green to yellow or yellow to green
+         previousState = dummyState(randomFrom(ClusterHealthStatus.GREEN, ClusterHealthStatus.YELLOW));
+-        currentState = dummyState(previousState.indexStatus == ClusterHealthStatus.GREEN ?
++        currentState = dummyState(previousState.indexHealth == ClusterHealthStatus.GREEN ?
+             ClusterHealthStatus.YELLOW : ClusterHealthStatus.GREEN);
+         nativeRealm.onSecurityIndexStateChange(previousState, currentState);
+         assertEquals(expectedInvalidation, numInvalidation.get());
+diff --git a/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/authc/support/mapper/NativeRoleMappingStoreTests.java b/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/authc/support/mapper/NativeRoleMappingStoreTests.java
+index 3cca6cc4fd38..4dd1f13cf030 100644
+--- a/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/authc/support/mapper/NativeRoleMappingStoreTests.java
++++ b/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/authc/support/mapper/NativeRoleMappingStoreTests.java
+@@ -10,6 +10,7 @@
+ import org.elasticsearch.client.Client;
+ import org.elasticsearch.cluster.ClusterName;
+ import org.elasticsearch.cluster.health.ClusterHealthStatus;
++import org.elasticsearch.cluster.metadata.IndexMetaData;
+ import org.elasticsearch.common.bytes.BytesArray;
+ import org.elasticsearch.common.settings.Settings;
+ import org.elasticsearch.common.util.concurrent.ThreadContext;
+@@ -138,7 +139,12 @@ private String randomiseDn(String dn) {
+     }
+ 
+     private SecurityIndexManager.State dummyState(ClusterHealthStatus indexStatus) {
+-        return new SecurityIndexManager.State(Instant.now(), true, true, true, null, concreteSecurityIndexName, indexStatus);
++        return indexState(true, indexStatus);
++    }
++
++    private SecurityIndexManager.State indexState(boolean isUpToDate, ClusterHealthStatus healthStatus) {
++        return new SecurityIndexManager.State(
++            Instant.now(), isUpToDate, true, true, null, concreteSecurityIndexName, healthStatus, IndexMetaData.State.OPEN);
+     }
+ 
+     public void testCacheClearOnIndexHealthChange() {
+@@ -172,7 +178,7 @@ public void testCacheClearOnIndexHealthChange() {
+ 
+         // green to yellow or yellow to green
+         previousState = dummyState(randomFrom(ClusterHealthStatus.GREEN, ClusterHealthStatus.YELLOW));
+-        currentState = dummyState(previousState.indexStatus == ClusterHealthStatus.GREEN ?
++        currentState = dummyState(previousState.indexHealth == ClusterHealthStatus.GREEN ?
+             ClusterHealthStatus.YELLOW : ClusterHealthStatus.GREEN);
+         store.onSecurityIndexStateChange(previousState, currentState);
+         assertEquals(expectedInvalidation, numInvalidation.get());
+@@ -182,14 +188,10 @@ public void testCacheClearOnIndexOutOfDateChange() {
+         final AtomicInteger numInvalidation = new AtomicInteger(0);
+         final NativeRoleMappingStore store = buildRoleMappingStoreForInvalidationTesting(numInvalidation, true);
+ 
+-        store.onSecurityIndexStateChange(
+-            new SecurityIndexManager.State(Instant.now(), false, true, true, null, concreteSecurityIndexName, null),
+-            new SecurityIndexManager.State(Instant.now(), true, true, true, null, concreteSecurityIndexName, null));
++        store.onSecurityIndexStateChange(indexState(false, null), indexState(true, null));
+         assertEquals(1, numInvalidation.get());
+ 
+-        store.onSecurityIndexStateChange(
+-            new SecurityIndexManager.State(Instant.now(), true, true, true, null, concreteSecurityIndexName, null),
+-            new SecurityIndexManager.State(Instant.now(), false, true, true, null, concreteSecurityIndexName, null));
++        store.onSecurityIndexStateChange(indexState(true, null), indexState(false, null));
+         assertEquals(2, numInvalidation.get());
+     }
+ 
+diff --git a/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/authz/store/CompositeRolesStoreTests.java b/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/authz/store/CompositeRolesStoreTests.java
+index a39545f3a9b3..b4e0a6a22cf8 100644
+--- a/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/authz/store/CompositeRolesStoreTests.java
++++ b/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/authz/store/CompositeRolesStoreTests.java
+@@ -763,7 +763,12 @@ public void testCustomRolesProvidersLicensing() {
+     }
+ 
+     private SecurityIndexManager.State dummyState(ClusterHealthStatus indexStatus) {
+-        return new SecurityIndexManager.State(Instant.now(), true, true, true, null, concreteSecurityIndexName, indexStatus);
++        return dummyIndexState(true, indexStatus);
++    }
++
++    public SecurityIndexManager.State dummyIndexState(boolean isIndexUpToDate, ClusterHealthStatus healthStatus) {
++        return new SecurityIndexManager.State(
++            Instant.now(), isIndexUpToDate, true, true, null, concreteSecurityIndexName, healthStatus, IndexMetaData.State.OPEN);
+     }
+ 
+     public void testCacheClearOnIndexHealthChange() {
+@@ -812,7 +817,7 @@ public void invalidateAll() {
+ 
+         // green to yellow or yellow to green
+         previousState = dummyState(randomFrom(ClusterHealthStatus.GREEN, ClusterHealthStatus.YELLOW));
+-        currentState = dummyState(previousState.indexStatus == ClusterHealthStatus.GREEN ?
++        currentState = dummyState(previousState.indexHealth == ClusterHealthStatus.GREEN ?
+                                   ClusterHealthStatus.YELLOW : ClusterHealthStatus.GREEN);
+         compositeRolesStore.onSecurityIndexStateChange(previousState, currentState);
+         assertEquals(expectedInvalidation, numInvalidation.get());
+@@ -837,14 +842,10 @@ public void invalidateAll() {
+             }
+         };
+ 
+-        compositeRolesStore.onSecurityIndexStateChange(
+-            new SecurityIndexManager.State(Instant.now(), false, true, true, null, concreteSecurityIndexName, null),
+-            new SecurityIndexManager.State(Instant.now(), true, true, true, null, concreteSecurityIndexName, null));
++        compositeRolesStore.onSecurityIndexStateChange(dummyIndexState(false, null), dummyIndexState(true, null));
+         assertEquals(1, numInvalidation.get());
+ 
+-        compositeRolesStore.onSecurityIndexStateChange(
+-            new SecurityIndexManager.State(Instant.now(), true, true, true, null, concreteSecurityIndexName, null),
+-            new SecurityIndexManager.State(Instant.now(), false, true, true, null, concreteSecurityIndexName, null));
++        compositeRolesStore.onSecurityIndexStateChange(dummyIndexState(true, null), dummyIndexState(false, null));
+         assertEquals(2, numInvalidation.get());
+     }
+ 
+diff --git a/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/support/SecurityIndexManagerTests.java b/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/support/SecurityIndexManagerTests.java
+index 6e7a9806781b..1987ad7d406f 100644
+--- a/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/support/SecurityIndexManagerTests.java
++++ b/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/support/SecurityIndexManagerTests.java
+@@ -155,8 +155,8 @@ public void testIndexHealthChangeListeners() throws Exception {
+         manager.clusterChanged(event(clusterStateBuilder));
+ 
+         assertTrue(listenerCalled.get());
+-        assertNull(previousState.get().indexStatus);
+-        assertEquals(ClusterHealthStatus.GREEN, currentState.get().indexStatus);
++        assertNull(previousState.get().indexHealth);
++        assertEquals(ClusterHealthStatus.GREEN, currentState.get().indexHealth);
+ 
+         // reset and call with no change to the index
+         listenerCalled.set(false);
+@@ -191,8 +191,8 @@ public void testIndexHealthChangeListeners() throws Exception {
+         event = new ClusterChangedEvent("different index health", clusterStateBuilder.build(), previousClusterState);
+         manager.clusterChanged(event);
+         assertTrue(listenerCalled.get());
+-        assertEquals(ClusterHealthStatus.GREEN, previousState.get().indexStatus);
+-        assertEquals(ClusterHealthStatus.RED, currentState.get().indexStatus);
++        assertEquals(ClusterHealthStatus.GREEN, previousState.get().indexHealth);
++        assertEquals(ClusterHealthStatus.RED, currentState.get().indexHealth);
+ 
+         // swap prev and current
+         listenerCalled.set(false);
+@@ -201,8 +201,8 @@ public void testIndexHealthChangeListeners() throws Exception {
+         event = new ClusterChangedEvent("different index health swapped", previousClusterState, clusterStateBuilder.build());
+         manager.clusterChanged(event);
+         assertTrue(listenerCalled.get());
+-        assertEquals(ClusterHealthStatus.RED, previousState.get().indexStatus);
+-        assertEquals(ClusterHealthStatus.GREEN, currentState.get().indexStatus);
++        assertEquals(ClusterHealthStatus.RED, previousState.get().indexHealth);
++        assertEquals(ClusterHealthStatus.GREEN, currentState.get().indexHealth);
+     }
+ 
+     public void testWriteBeforeStateNotRecovered() throws Exception {
+@@ -247,7 +247,7 @@ public void testWriteBeforeStateNotRecovered() throws Exception {
+         assertThat(prepareRunnableCalled.get(), is(true));
+     }
+ 
+-    public void testListeneredNotCalledBeforeStateNotRecovered() throws Exception {
++    public void testListenerNotCalledBeforeStateNotRecovered() throws Exception {
+         final AtomicBoolean listenerCalled = new AtomicBoolean(false);
+         manager.addIndexStateListener((prev, current) -> {
+             listenerCalled.set(true);
+@@ -307,6 +307,31 @@ public void testIndexOutOfDateListeners() throws Exception {
+         assertTrue(manager.isIndexUpToDate());
+     }
+ 
++    public void testProcessClosedIndexState() throws Exception {
++        // Index initially exists
++        final ClusterState.Builder indexAvailable = createClusterState(RestrictedIndicesNames.INTERNAL_SECURITY_MAIN_INDEX_7,
++            RestrictedIndicesNames.SECURITY_MAIN_ALIAS, TEMPLATE_NAME, IndexMetaData.State.OPEN);
++        markShardsAvailable(indexAvailable);
++
++        manager.clusterChanged(event(indexAvailable));
++        assertThat(manager.indexExists(), is(true));
++        assertThat(manager.isAvailable(), is(true));
++
++        // Now close it
++        final ClusterState.Builder indexClosed = createClusterState(RestrictedIndicesNames.INTERNAL_SECURITY_MAIN_INDEX_7,
++            RestrictedIndicesNames.SECURITY_MAIN_ALIAS, TEMPLATE_NAME, IndexMetaData.State.CLOSE);
++        if (randomBoolean()) {
++            // In old/mixed cluster versions closed indices have no routing table
++            indexClosed.routingTable(RoutingTable.EMPTY_ROUTING_TABLE);
++        } else {
++            markShardsAvailable(indexClosed);
++        }
++
++        manager.clusterChanged(event(indexClosed));
++        assertThat(manager.indexExists(), is(true));
++        assertThat(manager.isAvailable(), is(false));
++    }
++
+     private void assertInitialState() {
+         assertThat(manager.indexExists(), Matchers.equalTo(false));
+         assertThat(manager.isAvailable(), Matchers.equalTo(false));
+@@ -322,18 +347,23 @@ private void assertIndexUpToDateButNotAvailable() {
+     }
+ 
+     public static ClusterState.Builder createClusterState(String indexName, String aliasName, String templateName) throws IOException {
+-        return createClusterState(indexName, aliasName, templateName, templateName, SecurityIndexManager.INTERNAL_MAIN_INDEX_FORMAT);
++        return createClusterState(indexName, aliasName, templateName, IndexMetaData.State.OPEN);
++    }
++
++    public static ClusterState.Builder createClusterState(String indexName, String aliasName, String templateName,
++                                                          IndexMetaData.State state) throws IOException {
++        return createClusterState(indexName, aliasName, templateName, templateName, SecurityIndexManager.INTERNAL_MAIN_INDEX_FORMAT, state);
+     }
+ 
+     public static ClusterState.Builder createClusterState(String indexName, String aliasName, String templateName, int format)
+             throws IOException {
+-        return createClusterState(indexName, aliasName, templateName, templateName, format);
++        return createClusterState(indexName, aliasName, templateName, templateName, format, IndexMetaData.State.OPEN);
+     }
+ 
+     private static ClusterState.Builder createClusterState(String indexName, String aliasName, String templateName, String buildMappingFrom,
+-            int format) throws IOException {
++                                                           int format, IndexMetaData.State state) throws IOException {
+         IndexTemplateMetaData.Builder templateBuilder = getIndexTemplateMetaData(templateName);
+-        IndexMetaData.Builder indexMeta = getIndexMetadata(indexName, aliasName, buildMappingFrom, format);
++        IndexMetaData.Builder indexMeta = getIndexMetadata(indexName, aliasName, buildMappingFrom, format, state);
+ 
+         MetaData.Builder metaDataBuilder = new MetaData.Builder();
+         metaDataBuilder.put(templateBuilder);
+@@ -354,7 +384,8 @@ private static ClusterState state() {
+                 .build();
+     }
+ 
+-    private static IndexMetaData.Builder getIndexMetadata(String indexName, String aliasName, String templateName, int format)
++    private static IndexMetaData.Builder getIndexMetadata(String indexName, String aliasName, String templateName, int format,
++                                                          IndexMetaData.State state)
+             throws IOException {
+         IndexMetaData.Builder indexMetaData = IndexMetaData.builder(indexName);
+         indexMetaData.settings(Settings.builder()
+@@ -364,6 +395,7 @@ private static ClusterState state() {
+                 .put(IndexMetaData.INDEX_FORMAT_SETTING.getKey(), format)
+                 .build());
+         indexMetaData.putAlias(AliasMetaData.builder(aliasName).build());
++        indexMetaData.state(state);
+         final Map<String, String> mappings = getTemplateMappings(templateName);
+         for (Map.Entry<String, String> entry : mappings.entrySet()) {
+             indexMetaData.putMapping(entry.getKey(), entry.getValue());

@@ -1,0 +1,409 @@
+diff --git a/core/src/main/java/org/elasticsearch/index/fielddata/ordinals/GlobalOrdinalsBuilder.java b/core/src/main/java/org/elasticsearch/index/fielddata/ordinals/GlobalOrdinalsBuilder.java
+index 31014a5a1a95..e6f1d24f1e39 100644
+--- a/core/src/main/java/org/elasticsearch/index/fielddata/ordinals/GlobalOrdinalsBuilder.java
++++ b/core/src/main/java/org/elasticsearch/index/fielddata/ordinals/GlobalOrdinalsBuilder.java
+@@ -19,19 +19,24 @@
+ 
+ package org.elasticsearch.index.fielddata.ordinals;
+ 
++import org.apache.lucene.index.DocValues;
+ import org.apache.lucene.index.IndexReader;
+ import org.apache.lucene.index.MultiDocValues.OrdinalMap;
+ import org.apache.lucene.index.RandomAccessOrds;
++import org.apache.lucene.util.Accountable;
+ import org.apache.lucene.util.packed.PackedInts;
+ import org.elasticsearch.common.breaker.CircuitBreaker;
+ import org.elasticsearch.common.logging.ESLogger;
++import org.elasticsearch.common.settings.Settings;
+ import org.elasticsearch.common.unit.TimeValue;
+ import org.elasticsearch.index.IndexSettings;
+-import org.elasticsearch.index.fielddata.AtomicOrdinalsFieldData;
+-import org.elasticsearch.index.fielddata.IndexOrdinalsFieldData;
++import org.elasticsearch.index.fielddata.*;
++import org.elasticsearch.index.fielddata.plain.AbstractAtomicOrdinalsFieldData;
+ import org.elasticsearch.indices.breaker.CircuitBreakerService;
+ 
+ import java.io.IOException;
++import java.util.Collection;
++import java.util.Collections;
+ 
+ /**
+  * Utility class to build global ordinals.
+@@ -69,4 +74,38 @@ public static IndexOrdinalsFieldData build(final IndexReader indexReader, IndexO
+         );
+     }
+ 
++    public static IndexOrdinalsFieldData buildEmpty(IndexSettings indexSettings, final IndexReader indexReader, IndexOrdinalsFieldData indexFieldData) throws IOException {
++        assert indexReader.leaves().size() > 1;
++
++        final AtomicOrdinalsFieldData[] atomicFD = new AtomicOrdinalsFieldData[indexReader.leaves().size()];
++        final RandomAccessOrds[] subs = new RandomAccessOrds[indexReader.leaves().size()];
++        for (int i = 0; i < indexReader.leaves().size(); ++i) {
++            atomicFD[i] = new AbstractAtomicOrdinalsFieldData() {
++                @Override
++                public RandomAccessOrds getOrdinalsValues() {
++                    return DocValues.emptySortedSet();
++                }
++
++                @Override
++                public long ramBytesUsed() {
++                    return 0;
++                }
++
++                @Override
++                public Collection<Accountable> getChildResources() {
++                    return Collections.emptyList();
++                }
++
++                @Override
++                public void close() {
++                }
++            };
++            subs[i] = atomicFD[i].getOrdinalsValues();
++        }
++        final OrdinalMap ordinalMap = OrdinalMap.build(null, subs, PackedInts.DEFAULT);
++        return new InternalGlobalOrdinalsIndexFieldData(indexSettings, indexFieldData.getFieldNames(),
++                indexFieldData.getFieldDataType(), atomicFD, ordinalMap, 0
++        );
++    }
++
+ }
+diff --git a/core/src/main/java/org/elasticsearch/index/fielddata/plain/AbstractIndexFieldData.java b/core/src/main/java/org/elasticsearch/index/fielddata/plain/AbstractIndexFieldData.java
+index 95dd417fdf54..8f0f2798c056 100644
+--- a/core/src/main/java/org/elasticsearch/index/fielddata/plain/AbstractIndexFieldData.java
++++ b/core/src/main/java/org/elasticsearch/index/fielddata/plain/AbstractIndexFieldData.java
+@@ -64,7 +64,10 @@ public void clear() {
+     @Override
+     public FD load(LeafReaderContext context) {
+         if (context.reader().getFieldInfos().fieldInfo(fieldNames.indexName()) == null) {
+-            // If the field doesn't exist, then don't bother with loading and adding an empty instance to the field data cache
++            // Some leaf readers may be wrapped and report different set of fields and use the same cache key.
++            // If a field can't be found then it doesn't mean it isn't there,
++            // so if a field doesn't exist then we don't cache it and just return an empty field data instance.
++            // The next time the field is found, we do cache.
+             return empty(context.reader().maxDoc());
+         }
+ 
+diff --git a/core/src/main/java/org/elasticsearch/index/fielddata/plain/AbstractIndexOrdinalsFieldData.java b/core/src/main/java/org/elasticsearch/index/fielddata/plain/AbstractIndexOrdinalsFieldData.java
+index 647deeb27621..73ae7684f645 100644
+--- a/core/src/main/java/org/elasticsearch/index/fielddata/plain/AbstractIndexOrdinalsFieldData.java
++++ b/core/src/main/java/org/elasticsearch/index/fielddata/plain/AbstractIndexOrdinalsFieldData.java
+@@ -64,6 +64,24 @@ public IndexOrdinalsFieldData loadGlobal(DirectoryReader indexReader) {
+             // ordinals are already global
+             return this;
+         }
++        boolean fieldFound = false;
++        for (LeafReaderContext context : indexReader.leaves()) {
++            if (context.reader().getFieldInfos().fieldInfo(getFieldNames().indexName()) != null) {
++                fieldFound = true;
++                break;
++            }
++        }
++        if (fieldFound == false) {
++            // Some directory readers may be wrapped and report different set of fields and use the same cache key.
++            // If a field can't be found then it doesn't mean it isn't there,
++            // so if a field doesn't exist then we don't cache it and just return an empty field data instance.
++            // The next time the field is found, we do cache.
++            try {
++                return GlobalOrdinalsBuilder.buildEmpty(indexSettings, indexReader, this);
++            } catch (IOException e) {
++                throw new RuntimeException(e);
++            }
++        }
+         try {
+             return cache.load(indexReader, this);
+         } catch (Throwable e) {
+diff --git a/core/src/main/java/org/elasticsearch/index/fielddata/plain/SortedSetDVOrdinalsIndexFieldData.java b/core/src/main/java/org/elasticsearch/index/fielddata/plain/SortedSetDVOrdinalsIndexFieldData.java
+index 10b18e3cb831..fcbbe884bd4b 100644
+--- a/core/src/main/java/org/elasticsearch/index/fielddata/plain/SortedSetDVOrdinalsIndexFieldData.java
++++ b/core/src/main/java/org/elasticsearch/index/fielddata/plain/SortedSetDVOrdinalsIndexFieldData.java
+@@ -31,6 +31,8 @@
+ import org.elasticsearch.search.MultiValueMode;
+ import org.elasticsearch.indices.breaker.CircuitBreakerService;
+ 
++import java.io.IOException;
++
+ public class SortedSetDVOrdinalsIndexFieldData extends DocValuesIndexFieldData implements IndexOrdinalsFieldData {
+ 
+     private final IndexSettings indexSettings;
+@@ -65,6 +67,24 @@ public IndexOrdinalsFieldData loadGlobal(DirectoryReader indexReader) {
+             // ordinals are already global
+             return this;
+         }
++        boolean fieldFound = false;
++        for (LeafReaderContext context : indexReader.leaves()) {
++            if (context.reader().getFieldInfos().fieldInfo(getFieldNames().indexName()) != null) {
++                fieldFound = true;
++                break;
++            }
++        }
++        if (fieldFound == false) {
++            // Some directory readers may be wrapped and report different set of fields and use the same cache key.
++            // If a field can't be found then it doesn't mean it isn't there,
++            // so if a field doesn't exist then we don't cache it and just return an empty field data instance.
++            // The next time the field is found, we do cache.
++            try {
++                return GlobalOrdinalsBuilder.buildEmpty(indexSettings, indexReader, this);
++            } catch (IOException e) {
++                throw new RuntimeException(e);
++            }
++        }
+         try {
+             return cache.load(indexReader, this);
+         } catch (Throwable e) {
+diff --git a/core/src/test/java/org/elasticsearch/index/fielddata/FieldDataCacheTests.java b/core/src/test/java/org/elasticsearch/index/fielddata/FieldDataCacheTests.java
+new file mode 100644
+index 000000000000..59fc8952a67b
+--- /dev/null
++++ b/core/src/test/java/org/elasticsearch/index/fielddata/FieldDataCacheTests.java
+@@ -0,0 +1,134 @@
++/*
++ * Licensed to Elasticsearch under one or more contributor
++ * license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright
++ * ownership. Elasticsearch licenses this file to you under
++ * the Apache License, Version 2.0 (the "License"); you may
++ * not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++package org.elasticsearch.index.fielddata;
++
++import org.apache.lucene.document.Document;
++import org.apache.lucene.document.Field;
++import org.apache.lucene.document.SortedSetDocValuesField;
++import org.apache.lucene.document.StringField;
++import org.apache.lucene.index.*;
++import org.apache.lucene.store.Directory;
++import org.apache.lucene.util.BytesRef;
++import org.elasticsearch.Version;
++import org.elasticsearch.cluster.metadata.IndexMetaData;
++import org.elasticsearch.common.lucene.index.ElasticsearchDirectoryReader;
++import org.elasticsearch.common.settings.Settings;
++import org.elasticsearch.index.IndexSettings;
++import org.elasticsearch.index.fielddata.plain.PagedBytesIndexFieldData;
++import org.elasticsearch.index.fielddata.plain.SortedSetDVOrdinalsIndexFieldData;
++import org.elasticsearch.index.mapper.MappedFieldType;
++import org.elasticsearch.index.mapper.core.StringFieldMapper;
++import org.elasticsearch.index.shard.ShardId;
++import org.elasticsearch.indices.breaker.NoneCircuitBreakerService;
++import org.elasticsearch.test.ESTestCase;
++import org.elasticsearch.test.FieldMaskingReader;
++
++import java.util.Collections;
++
++import static org.hamcrest.Matchers.equalTo;
++
++public class FieldDataCacheTests extends ESTestCase {
++
++    public void testLoadGlobal_neverCacheIfFieldIsMissing() throws Exception {
++        Directory dir = newDirectory();
++        IndexWriterConfig iwc = new IndexWriterConfig(null);
++        iwc.setMergePolicy(NoMergePolicy.INSTANCE);
++        IndexWriter iw = new IndexWriter(dir, iwc);
++        long numDocs = scaledRandomIntBetween(32, 128);
++
++        for (int i = 1; i <= numDocs; i++) {
++            Document doc = new Document();
++            doc.add(new SortedSetDocValuesField("field1", new BytesRef(String.valueOf(i))));
++            doc.add(new StringField("field2", String.valueOf(i), Field.Store.NO));
++            iw.addDocument(doc);
++            if (i % 24 == 0) {
++                iw.commit();
++            }
++        }
++        iw.close();
++        DirectoryReader ir = ElasticsearchDirectoryReader.wrap(DirectoryReader.open(dir), new ShardId("_index", 0));
++
++        DummyAccountingFieldDataCache fieldDataCache = new DummyAccountingFieldDataCache();
++        // Testing SortedSetDVOrdinalsIndexFieldData:
++        SortedSetDVOrdinalsIndexFieldData sortedSetDVOrdinalsIndexFieldData = createSortedDV("field1", fieldDataCache);
++        sortedSetDVOrdinalsIndexFieldData.loadGlobal(ir);
++        assertThat(fieldDataCache.cachedGlobally, equalTo(1));
++        sortedSetDVOrdinalsIndexFieldData.loadGlobal(new FieldMaskingReader("field1", ir));
++        assertThat(fieldDataCache.cachedGlobally, equalTo(1));
++
++        // Testing PagedBytesIndexFieldData
++        PagedBytesIndexFieldData pagedBytesIndexFieldData = createPagedBytes("field2", fieldDataCache);
++        pagedBytesIndexFieldData.loadGlobal(ir);
++        assertThat(fieldDataCache.cachedGlobally, equalTo(2));
++        pagedBytesIndexFieldData.loadGlobal(new FieldMaskingReader("field2", ir));
++        assertThat(fieldDataCache.cachedGlobally, equalTo(2));
++
++        ir.close();
++        dir.close();
++    }
++
++    private SortedSetDVOrdinalsIndexFieldData createSortedDV(String fieldName, IndexFieldDataCache indexFieldDataCache) {
++        FieldDataType fieldDataType = new StringFieldMapper.StringFieldType().fieldDataType();
++        MappedFieldType.Names names = new MappedFieldType.Names(fieldName);
++        return new SortedSetDVOrdinalsIndexFieldData(createIndexSettings(), indexFieldDataCache, names, new NoneCircuitBreakerService(), fieldDataType);
++    }
++
++    private PagedBytesIndexFieldData createPagedBytes(String fieldName, IndexFieldDataCache indexFieldDataCache) {
++        FieldDataType fieldDataType = new StringFieldMapper.StringFieldType().fieldDataType();
++        MappedFieldType.Names names = new MappedFieldType.Names(fieldName);
++        return new PagedBytesIndexFieldData(createIndexSettings(), names, fieldDataType, indexFieldDataCache, new NoneCircuitBreakerService());
++    }
++
++    private IndexSettings createIndexSettings() {
++        Settings settings = Settings.EMPTY;
++        IndexMetaData indexMetaData = IndexMetaData.builder("_name")
++                .settings(Settings.builder().put(IndexMetaData.SETTING_VERSION_CREATED, Version.CURRENT))
++                .numberOfShards(1)
++                .numberOfReplicas(0)
++                .creationDate(System.currentTimeMillis())
++                .build();
++        return new IndexSettings(indexMetaData, settings, Collections.emptyList());
++    }
++
++    private class DummyAccountingFieldDataCache implements IndexFieldDataCache {
++
++        private int cachedGlobally = 0;
++
++        @Override
++        public <FD extends AtomicFieldData, IFD extends IndexFieldData<FD>> FD load(LeafReaderContext context, IFD indexFieldData) throws Exception {
++            return indexFieldData.loadDirect(context);
++        }
++
++        @Override
++        public <FD extends AtomicFieldData, IFD extends IndexFieldData.Global<FD>> IFD load(DirectoryReader indexReader, IFD indexFieldData) throws Exception {
++            cachedGlobally++;
++            return (IFD) indexFieldData.localGlobalDirect(indexReader);
++        }
++
++        @Override
++        public void clear() {
++        }
++
++        @Override
++        public void clear(String fieldName) {
++        }
++    }
++
++}
+diff --git a/core/src/test/java/org/elasticsearch/index/shard/IndexShardTests.java b/core/src/test/java/org/elasticsearch/index/shard/IndexShardTests.java
+index 7422820a8114..31fe873f951e 100644
+--- a/core/src/test/java/org/elasticsearch/index/shard/IndexShardTests.java
++++ b/core/src/test/java/org/elasticsearch/index/shard/IndexShardTests.java
+@@ -80,6 +80,7 @@
+ import org.elasticsearch.test.DummyShardLock;
+ import org.elasticsearch.test.ESSingleNodeTestCase;
+ import org.elasticsearch.test.IndexSettingsModule;
++import org.elasticsearch.test.FieldMaskingReader;
+ import org.elasticsearch.test.VersionUtils;
+ 
+ import java.io.IOException;
+@@ -959,13 +960,15 @@ public IndexSearcher wrap(IndexSearcher searcher) throws EngineException {
+             MappedFieldType foo = newShard.mapperService().indexName("foo");
+             IndexFieldData.Global ifd = shard.indexFieldDataService().getForField(foo);
+             FieldDataStats before = shard.fieldData().stats("foo");
++            assertThat(before.getMemorySizeInBytes(), equalTo(0l));
+             FieldDataStats after = null;
+             try (Engine.Searcher searcher = newShard.acquireSearcher("test")) {
+                 assumeTrue("we have to have more than one segment", searcher.getDirectoryReader().leaves().size() > 1);
+                 IndexFieldData indexFieldData = ifd.loadGlobal(searcher.getDirectoryReader());
+                 after = shard.fieldData().stats("foo");
+                 assertEquals(after.getEvictions(), before.getEvictions());
+-                assertTrue(indexFieldData.toString(), after.getMemorySizeInBytes() > before.getMemorySizeInBytes());
++                // If a field doesn't exist an empty IndexFieldData is returned and that isn't cached:
++                assertThat(after.getMemorySizeInBytes(), equalTo(0l));
+             }
+             assertEquals(shard.fieldData().stats("foo").getEvictions(), before.getEvictions());
+             assertEquals(shard.fieldData().stats("foo").getMemorySizeInBytes(), after.getMemorySizeInBytes());
+@@ -1024,28 +1027,4 @@ private final IndexShard reinitWithWrapper(IndexService indexService, IndexShard
+         return newShard;
+     }
+ 
+-    private static class FieldMaskingReader extends FilterDirectoryReader {
+-        private final String field;
+-        public FieldMaskingReader(String field, DirectoryReader in) throws IOException {
+-            super(in, new SubReaderWrapper() {
+-                private final String filteredField = field;
+-                @Override
+-                public LeafReader wrap(LeafReader reader) {
+-                    return new FieldFilterLeafReader(reader, Collections.singleton(field), true);
+-                }
+-            });
+-            this.field = field;
+-
+-        }
+-
+-        @Override
+-        protected DirectoryReader doWrapDirectoryReader(DirectoryReader in) throws IOException {
+-            return new FieldMaskingReader(field, in);
+-        }
+-
+-        @Override
+-        public Object getCoreCacheKey() {
+-            return in.getCoreCacheKey();
+-        }
+-    }
+ }
+diff --git a/test-framework/src/main/java/org/elasticsearch/test/FieldMaskingReader.java b/test-framework/src/main/java/org/elasticsearch/test/FieldMaskingReader.java
+new file mode 100644
+index 000000000000..5ce620166c15
+--- /dev/null
++++ b/test-framework/src/main/java/org/elasticsearch/test/FieldMaskingReader.java
+@@ -0,0 +1,51 @@
++/*
++ * Licensed to Elasticsearch under one or more contributor
++ * license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright
++ * ownership. Elasticsearch licenses this file to you under
++ * the Apache License, Version 2.0 (the "License"); you may
++ * not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.elasticsearch.test;
++
++import org.apache.lucene.index.DirectoryReader;
++import org.apache.lucene.index.FieldFilterLeafReader;
++import org.apache.lucene.index.FilterDirectoryReader;
++import org.apache.lucene.index.LeafReader;
++
++import java.io.IOException;
++import java.util.Collections;
++
++public class FieldMaskingReader extends FilterDirectoryReader {
++    private final String field;
++    public FieldMaskingReader(String field, DirectoryReader in) throws IOException {
++        super(in, new FilterDirectoryReader.SubReaderWrapper() {
++            @Override
++            public LeafReader wrap(LeafReader reader) {
++                return new FieldFilterLeafReader(reader, Collections.singleton(field), true);
++            }
++        });
++        this.field = field;
++
++    }
++
++    @Override
++    protected DirectoryReader doWrapDirectoryReader(DirectoryReader in) throws IOException {
++        return new FieldMaskingReader(field, in);
++    }
++
++    @Override
++    public Object getCoreCacheKey() {
++        return in.getCoreCacheKey();
++    }
++}
+\ No newline at end of file

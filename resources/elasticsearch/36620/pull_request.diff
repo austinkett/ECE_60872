@@ -1,0 +1,237 @@
+diff --git a/docs/reference/ilm/using-policies-rollover.asciidoc b/docs/reference/ilm/using-policies-rollover.asciidoc
+index 3cc4271e83dc..3af6e125fcd9 100644
+--- a/docs/reference/ilm/using-policies-rollover.asciidoc
++++ b/docs/reference/ilm/using-policies-rollover.asciidoc
+@@ -129,19 +129,19 @@ the new index, enabling indexing to continue uninterrupted.
+ 
+ beta[]
+ 
+-After an index has been rolled over by {ilm}, the
+-`index.lifecycle.indexing_complete` setting will be set to `true` on the index.
+-This indicates to {ilm} that this index has already been rolled over, and does
+-not need to be rolled over again. If you <<ilm-remove-policy,remove the policy>>
+-from an index and set it to use another policy, this setting indicates that the
+-new policy should skip execution of the Rollover action.
+-
+-You can also set this setting to `true` manually if you want to indicate that
+-{ilm} should not roll over a particular index. This is useful if you need to
+-make an exception to your normal Lifecycle Policy and switching the alias to a
++The `index.lifecycle.indexing_complete` setting indicates to {ilm} whether this
++index has already been rolled over. If it is set to `true`, that indicates that
++this index has already been rolled over and does not need to be rolled over
++again. Therefore, {ilm} will skip any Rollover Action configured in the
++associated lifecycle policy for this index. This is useful if you need to make
++an exception to your normal Lifecycle Policy and switching the alias to a
+ different index by hand, but do not want to remove the index from {ilm}
+ completely.
+ 
++This setting is set to `true` automatically by ILM upon the successful
++completion of a Rollover Action. However, it will be removed if
++<<ilm-remove-policy,the policy is removed>> from the index.
++
+ IMPORTANT: If `index.lifecycle.indexing_complete` is set to `true` on an index,
+ it will not be rolled over by {ilm}, but {ilm} will verify that this index is no
+ longer the write index for the alias specified by
+diff --git a/x-pack/plugin/core/src/main/java/org/elasticsearch/xpack/core/indexlifecycle/WaitForRolloverReadyStep.java b/x-pack/plugin/core/src/main/java/org/elasticsearch/xpack/core/indexlifecycle/WaitForRolloverReadyStep.java
+index 03bf905290ff..46504dd305d7 100644
+--- a/x-pack/plugin/core/src/main/java/org/elasticsearch/xpack/core/indexlifecycle/WaitForRolloverReadyStep.java
++++ b/x-pack/plugin/core/src/main/java/org/elasticsearch/xpack/core/indexlifecycle/WaitForRolloverReadyStep.java
+@@ -53,18 +53,30 @@ public void evaluateCondition(IndexMetaData indexMetaData, Listener listener) {
+             return;
+         }
+ 
+-        if (indexMetaData.getAliases().containsKey(rolloverAlias) == false) {
+-            listener.onFailure(new IllegalArgumentException(String.format(Locale.ROOT,
+-                "%s [%s] does not point to index [%s]", RolloverAction.LIFECYCLE_ROLLOVER_ALIAS, rolloverAlias,
+-                indexMetaData.getIndex().getName())));
+-            return;
++        // The order of the following checks is important in ways which may not be obvious.
++
++        // First, figure out if 1) The configured alias points to this index, and if so,
++        // whether this index is the write alias for this index
++        boolean aliasPointsToThisIndex = indexMetaData.getAliases().containsKey(rolloverAlias);
++
++        Boolean isWriteIndex = null;
++        if (aliasPointsToThisIndex) {
++            // The writeIndex() call returns a tri-state boolean:
++            // true  -> this index is the write index for this alias
++            // false -> this index is not the write index for this alias
++            // null  -> this alias is a "classic-style" alias and does not have a write index configured, but only points to one index
++            //          and is thus the write index by default
++            isWriteIndex = indexMetaData.getAliases().get(rolloverAlias).writeIndex();
+         }
+ 
+         boolean indexingComplete = LifecycleSettings.LIFECYCLE_INDEXING_COMPLETE_SETTING.get(indexMetaData.getSettings());
+         if (indexingComplete) {
+             logger.trace(indexMetaData.getIndex() + " has lifecycle complete set, skipping " + WaitForRolloverReadyStep.NAME);
+-            Boolean isWriteIndex = indexMetaData.getAliases().get(rolloverAlias).writeIndex();
+-            if (Boolean.TRUE.equals(isWriteIndex)) {
++            // If this index is still the write index for this alias, skipping rollover and continuing with the policy almost certainly
++            // isn't what we want, as something likely still expects to be writing to this index.
++            // If the alias doesn't point to this index, that's okay as that will be the result if this index is using a
++            // "classic-style" alias and has already rolled over, and we want to continue with the policy.
++            if (aliasPointsToThisIndex && Boolean.TRUE.equals(isWriteIndex)) {
+                 listener.onFailure(new IllegalStateException(String.format(Locale.ROOT,
+                     "index [%s] has [%s] set to [true], but is still the write index for alias [%s]",
+                     indexMetaData.getIndex().getName(), LifecycleSettings.LIFECYCLE_INDEXING_COMPLETE, rolloverAlias)));
+@@ -75,6 +87,20 @@ public void evaluateCondition(IndexMetaData indexMetaData, Listener listener) {
+             return;
+         }
+ 
++        // If indexing_complete is *not* set, and the alias does not point to this index, we can't roll over this index, so error out.
++        if (aliasPointsToThisIndex == false) {
++            listener.onFailure(new IllegalArgumentException(String.format(Locale.ROOT,
++                "%s [%s] does not point to index [%s]", RolloverAction.LIFECYCLE_ROLLOVER_ALIAS, rolloverAlias,
++                indexMetaData.getIndex().getName())));
++            return;
++        }
++
++        // Similarly, if isWriteIndex is false (see note above on false vs. null), we can't roll over this index, so error out.
++        if (Boolean.FALSE.equals(isWriteIndex)) {
++            listener.onFailure(new IllegalArgumentException(String.format(Locale.ROOT,
++                "index [%s] is not the write index for alias [%s]", rolloverAlias, indexMetaData.getIndex().getName())));
++        }
++
+         RolloverRequest rolloverRequest = new RolloverRequest(rolloverAlias, null);
+         rolloverRequest.dryRun(true);
+         if (maxAge != null) {
+diff --git a/x-pack/plugin/ilm/qa/multi-node/src/test/java/org/elasticsearch/xpack/indexlifecycle/TimeSeriesLifecycleActionsIT.java b/x-pack/plugin/ilm/qa/multi-node/src/test/java/org/elasticsearch/xpack/indexlifecycle/TimeSeriesLifecycleActionsIT.java
+index cb14f78461de..85597be1f1f6 100644
+--- a/x-pack/plugin/ilm/qa/multi-node/src/test/java/org/elasticsearch/xpack/indexlifecycle/TimeSeriesLifecycleActionsIT.java
++++ b/x-pack/plugin/ilm/qa/multi-node/src/test/java/org/elasticsearch/xpack/indexlifecycle/TimeSeriesLifecycleActionsIT.java
+@@ -531,6 +531,58 @@ public void testDeletePolicyInUse() throws IOException {
+                 not(containsString(managedByOtherPolicyIndex))));
+     }
+ 
++    public void testRemoveAndReaddPolicy() throws Exception {
++        String originalIndex = index + "-000001";
++        String secondIndex = index + "-000002";
++        // Set up a policy with rollover
++        createNewSingletonPolicy("hot", new RolloverAction(null, null, 1L));
++        createIndexWithSettings(
++            originalIndex,
++            Settings.builder().put(IndexMetaData.SETTING_NUMBER_OF_SHARDS, 1)
++                .put(IndexMetaData.SETTING_NUMBER_OF_REPLICAS, 0)
++                .put(LifecycleSettings.LIFECYCLE_NAME, policy)
++                .put(RolloverAction.LIFECYCLE_ROLLOVER_ALIAS, "alias"));
++
++        // Index a document
++        index(client(), originalIndex, "_id", "foo", "bar");
++
++        // Wait for rollover to happen
++        assertBusy(() -> assertTrue(indexExists(secondIndex)));
++
++        // Remove the policy from the original index
++        Request removeRequest = new Request("POST", "/" + originalIndex + "/_ilm/remove");
++        removeRequest.setJsonEntity("");
++        client().performRequest(removeRequest);
++
++        // Add the policy again
++        Request addPolicyRequest = new Request("PUT", "/" + originalIndex + "/_settings");
++        addPolicyRequest.setJsonEntity("{\n" +
++            "  \"settings\": {\n" +
++            "    \"index.lifecycle.name\": \"" + policy + "\",\n" +
++            "    \"index.lifecycle.rollover_alias\": \"alias\"\n" +
++            "  }\n" +
++            "}");
++        client().performRequest(addPolicyRequest);
++        assertBusy(() -> assertTrue((boolean) explainIndex(originalIndex).getOrDefault("managed", false)));
++
++        // Wait for rollover to error
++        assertBusy(() -> assertThat(getStepKeyForIndex(originalIndex), equalTo(new StepKey("hot", RolloverAction.NAME, ErrorStep.NAME))));
++
++        // Set indexing complete
++        Request setIndexingCompleteRequest = new Request("PUT", "/" + originalIndex + "/_settings");
++        setIndexingCompleteRequest.setJsonEntity("{\n" +
++            "  \"index.lifecycle.indexing_complete\": true\n" +
++            "}");
++        client().performRequest(setIndexingCompleteRequest);
++
++        // Retry policy
++        Request retryRequest = new Request("POST", "/" + originalIndex + "/_ilm/retry");
++        client().performRequest(retryRequest);
++
++        // Wait for everything to be copacetic
++        assertBusy(() -> assertThat(getStepKeyForIndex(originalIndex), equalTo(TerminalPolicyStep.KEY)));
++    }
++
+     private void createFullPolicy(TimeValue hotTime) throws IOException {
+         Map<String, LifecycleAction> warmActions = new HashMap<>();
+         warmActions.put(ForceMergeAction.NAME, new ForceMergeAction(1));
+@@ -580,10 +632,18 @@ private void createIndexWithSettingsNoAlias(String index, Settings.Builder setti
+     }
+ 
+     private void createIndexWithSettings(String index, Settings.Builder settings) throws IOException {
++        createIndexWithSettings(index, settings, randomBoolean());
++    }
++
++    private void createIndexWithSettings(String index, Settings.Builder settings, boolean useWriteIndex) throws IOException {
+         Request request = new Request("PUT", "/" + index);
+ 
++        String writeIndexSnippet = "";
++        if (useWriteIndex) {
++            writeIndexSnippet = "\"is_write_index\": true";
++        }
+         request.setJsonEntity("{\n \"settings\": " + Strings.toString(settings.build())
+-            + ", \"aliases\" : { \"alias\": { \"is_write_index\": true } } }");
++            + ", \"aliases\" : { \"alias\": { " + writeIndexSnippet + " } } }");
+         client().performRequest(request);
+         // wait for the shards to initialize
+         ensureGreen(index);
+diff --git a/x-pack/plugin/ilm/src/main/java/org/elasticsearch/xpack/indexlifecycle/IndexLifecycleRunner.java b/x-pack/plugin/ilm/src/main/java/org/elasticsearch/xpack/indexlifecycle/IndexLifecycleRunner.java
+index ef22d2c84010..7ba7bcafe55f 100644
+--- a/x-pack/plugin/ilm/src/main/java/org/elasticsearch/xpack/indexlifecycle/IndexLifecycleRunner.java
++++ b/x-pack/plugin/ilm/src/main/java/org/elasticsearch/xpack/indexlifecycle/IndexLifecycleRunner.java
+@@ -500,6 +500,7 @@ public static ClusterState removePolicyForIndexes(final Index[] indices, Cluster
+         boolean notChanged = true;
+ 
+         notChanged &= Strings.isNullOrEmpty(newSettings.remove(LifecycleSettings.LIFECYCLE_NAME_SETTING.getKey()));
++        notChanged &= Strings.isNullOrEmpty(newSettings.remove(LifecycleSettings.LIFECYCLE_INDEXING_COMPLETE_SETTING.getKey()));
+         notChanged &= Strings.isNullOrEmpty(newSettings.remove(RolloverAction.LIFECYCLE_ROLLOVER_ALIAS_SETTING.getKey()));
+         long newSettingsVersion = notChanged ? indexMetadata.getSettingsVersion() : 1 + indexMetadata.getSettingsVersion();
+ 
+diff --git a/x-pack/plugin/ilm/src/test/java/org/elasticsearch/xpack/indexlifecycle/IndexLifecycleRunnerTests.java b/x-pack/plugin/ilm/src/test/java/org/elasticsearch/xpack/indexlifecycle/IndexLifecycleRunnerTests.java
+index 63ee9349043a..7693a752b28a 100644
+--- a/x-pack/plugin/ilm/src/test/java/org/elasticsearch/xpack/indexlifecycle/IndexLifecycleRunnerTests.java
++++ b/x-pack/plugin/ilm/src/test/java/org/elasticsearch/xpack/indexlifecycle/IndexLifecycleRunnerTests.java
+@@ -1134,6 +1134,32 @@ public void testRemovePolicyForIndexIndexInUnsafe() {
+         assertIndexNotManagedByILM(newClusterState, index);
+     }
+ 
++    public void testRemovePolicyWithIndexingComplete() {
++        String indexName = randomAlphaOfLength(10);
++        String oldPolicyName = "old_policy";
++        StepKey currentStep = new StepKey(randomAlphaOfLength(10), MockAction.NAME, randomAlphaOfLength(10));
++        LifecyclePolicy oldPolicy = createPolicy(oldPolicyName, null, currentStep);
++        Settings.Builder indexSettingsBuilder = Settings.builder()
++            .put(LifecycleSettings.LIFECYCLE_NAME, oldPolicyName)
++            .put(LifecycleSettings.LIFECYCLE_INDEXING_COMPLETE, true);
++        LifecycleExecutionState.Builder lifecycleState = LifecycleExecutionState.builder();
++        lifecycleState.setPhase(currentStep.getPhase());
++        lifecycleState.setAction(currentStep.getAction());
++        lifecycleState.setStep(currentStep.getName());
++        List<LifecyclePolicyMetadata> policyMetadatas = new ArrayList<>();
++        policyMetadatas.add(new LifecyclePolicyMetadata(oldPolicy, Collections.emptyMap(),
++            randomNonNegativeLong(), randomNonNegativeLong()));
++        ClusterState clusterState = buildClusterState(indexName, indexSettingsBuilder, lifecycleState.build(), policyMetadatas);
++        Index index = clusterState.metaData().index(indexName).getIndex();
++        Index[] indices = new Index[] { index };
++        List<String> failedIndexes = new ArrayList<>();
++
++        ClusterState newClusterState = IndexLifecycleRunner.removePolicyForIndexes(indices, clusterState, failedIndexes);
++
++        assertTrue(failedIndexes.isEmpty());
++        assertIndexNotManagedByILM(newClusterState, index);
++    }
++
+     public void testIsReadyToTransition() {
+         String policyName = "async_action_policy";
+         StepKey stepKey = new StepKey("phase", MockAction.NAME, MockAction.NAME);
+@@ -1186,6 +1212,7 @@ public static void assertIndexNotManagedByILM(ClusterState clusterState, Index i
+         assertNotNull(indexSettings);
+         assertFalse(LifecycleSettings.LIFECYCLE_NAME_SETTING.exists(indexSettings));
+         assertFalse(RolloverAction.LIFECYCLE_ROLLOVER_ALIAS_SETTING.exists(indexSettings));
++        assertFalse(LifecycleSettings.LIFECYCLE_INDEXING_COMPLETE_SETTING.exists(indexSettings));
+     }
+ 
+     public static void assertClusterStateOnPolicy(ClusterState oldClusterState, Index index, String expectedPolicy, StepKey previousStep,

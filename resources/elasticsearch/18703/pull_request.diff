@@ -1,0 +1,492 @@
+diff --git a/plugins/repository-s3/build.gradle b/plugins/repository-s3/build.gradle
+index f713d8eadc57..23aa68e7f2d3 100644
+--- a/plugins/repository-s3/build.gradle
++++ b/plugins/repository-s3/build.gradle
+@@ -50,7 +50,11 @@ dependencyLicenses {
+ 
+ test {
+   // this is needed for insecure plugins, remove if possible!
+-  systemProperty 'tests.artifact', project.name 
++  systemProperty 'tests.artifact', project.name
++  // this could be needed by AwsS3ServiceImplTests#testAWSCredentialsWithSystemProviders()
++  // As it's marked as Ignored for now, we can comment those
++  // systemProperty 'aws.accessKeyId', 'DUMMY_ACCESS_KEY'
++  // systemProperty 'aws.secretKey', 'DUMMY_SECRET_KEY'
+ }
+ 
+ thirdPartyAudit.excludes = [
+diff --git a/plugins/repository-s3/src/main/java/org/elasticsearch/cloud/aws/InternalAwsS3Service.java b/plugins/repository-s3/src/main/java/org/elasticsearch/cloud/aws/InternalAwsS3Service.java
+index 36d383d865c7..e1bce876c27f 100644
+--- a/plugins/repository-s3/src/main/java/org/elasticsearch/cloud/aws/InternalAwsS3Service.java
++++ b/plugins/repository-s3/src/main/java/org/elasticsearch/cloud/aws/InternalAwsS3Service.java
+@@ -37,6 +37,7 @@
+ import org.elasticsearch.common.collect.Tuple;
+ import org.elasticsearch.common.component.AbstractLifecycleComponent;
+ import org.elasticsearch.common.inject.Inject;
++import org.elasticsearch.common.logging.ESLogger;
+ import org.elasticsearch.common.settings.Settings;
+ 
+ import java.util.HashMap;
+@@ -57,30 +58,33 @@ public InternalAwsS3Service(Settings settings) {
+     }
+ 
+     @Override
+-    public synchronized AmazonS3 client(String endpoint, Protocol protocol, String region, String account, String key, Integer maxRetries,
++    public synchronized AmazonS3 client(String endpoint, Protocol protocol, String region, String key, String secret, Integer maxRetries,
+                                         boolean useThrottleRetries, Boolean pathStyleAccess) {
+-        if (Strings.isNullOrEmpty(endpoint)) {
+-            // We need to set the endpoint based on the region
+-            if (region != null) {
+-                endpoint = getEndpoint(region);
+-                logger.debug("using s3 region [{}], with endpoint [{}]", region, endpoint);
+-            } else {
+-                // No region has been set so we will use the default endpoint
+-                endpoint = getDefaultEndpoint();
+-            }
+-        }
+-
+-        return getClient(endpoint, protocol, account, key, maxRetries, useThrottleRetries, pathStyleAccess);
+-    }
+-
+-    private synchronized AmazonS3 getClient(String endpoint, Protocol protocol, String account, String key, Integer maxRetries,
+-                                            boolean useThrottleRetries, Boolean pathStyleAccess) {
+-        Tuple<String, String> clientDescriptor = new Tuple<>(endpoint, account);
++        String foundEndpoint = findEndpoint(logger, settings, endpoint, region);
++        Tuple<String, String> clientDescriptor = new Tuple<>(foundEndpoint, key);
+         AmazonS3Client client = clients.get(clientDescriptor);
+         if (client != null) {
+             return client;
+         }
+ 
++        client = new AmazonS3Client(
++            buildCredentials(logger, key, secret),
++            buildConfiguration(logger, settings, protocol, maxRetries, foundEndpoint, useThrottleRetries));
++
++        if (pathStyleAccess != null) {
++            client.setS3ClientOptions(new S3ClientOptions().withPathStyleAccess(pathStyleAccess));
++        }
++
++        if (!foundEndpoint.isEmpty()) {
++            client.setEndpoint(foundEndpoint);
++        }
++
++        clients.put(clientDescriptor, client);
++        return client;
++    }
++
++    public static ClientConfiguration buildConfiguration(ESLogger logger, Settings settings, Protocol protocol, Integer maxRetries,
++                                                         String endpoint, boolean useThrottleRetries) {
+         ClientConfiguration clientConfiguration = new ClientConfiguration();
+         // the response metadata cache is only there for diagnostics purposes,
+         // but can force objects from every response to the old generation.
+@@ -113,43 +117,50 @@ private synchronized AmazonS3 getClient(String endpoint, Protocol protocol, Stri
+             AwsSigner.configureSigner(awsSigner, clientConfiguration, endpoint);
+         }
+ 
++        return clientConfiguration;
++    }
++
++    public static AWSCredentialsProvider buildCredentials(ESLogger logger, String key, String secret) {
+         AWSCredentialsProvider credentials;
+ 
+-        if (account == null && key == null) {
++        if (key.isEmpty() && secret.isEmpty()) {
++            logger.debug("Using either environment variables, system properties or instance profile credentials");
+             credentials = new AWSCredentialsProviderChain(
+-                    new EnvironmentVariableCredentialsProvider(),
+-                    new SystemPropertiesCredentialsProvider(),
+-                    new InstanceProfileCredentialsProvider()
++                new EnvironmentVariableCredentialsProvider(),
++                new SystemPropertiesCredentialsProvider(),
++                new InstanceProfileCredentialsProvider()
+             );
+         } else {
++            logger.debug("Using basic key/secret credentials");
+             credentials = new AWSCredentialsProviderChain(
+-                    new StaticCredentialsProvider(new BasicAWSCredentials(account, key))
++                new StaticCredentialsProvider(new BasicAWSCredentials(key, secret))
+             );
+         }
+-        client = new AmazonS3Client(credentials, clientConfiguration);
+-
+-        if (endpoint != null) {
+-            client.setEndpoint(endpoint);
+-        }
+ 
+-        if (pathStyleAccess != null) {
+-            client.setS3ClientOptions(new S3ClientOptions().withPathStyleAccess(pathStyleAccess));
+-        }
+-
+-        clients.put(clientDescriptor, client);
+-        return client;
++        return credentials;
+     }
+ 
+-    private String getDefaultEndpoint() {
+-        String endpoint = null;
+-        if (CLOUD_S3.ENDPOINT_SETTING.exists(settings)) {
+-            endpoint = CLOUD_S3.ENDPOINT_SETTING.get(settings);
+-            logger.debug("using explicit s3 endpoint [{}]", endpoint);
+-        } else if (CLOUD_S3.REGION_SETTING.exists(settings)) {
+-            String region = CLOUD_S3.REGION_SETTING.get(settings);
+-            endpoint = getEndpoint(region);
+-            logger.debug("using s3 region [{}], with endpoint [{}]", region, endpoint);
++    protected static String findEndpoint(ESLogger logger, Settings settings, String endpoint, String region) {
++        if (Strings.isNullOrEmpty(endpoint)) {
++            logger.debug("no repository level endpoint has been defined. Trying to guess from repository region [{}]", region);
++            if (!region.isEmpty()) {
++                endpoint = getEndpoint(region);
++                logger.debug("using s3 region [{}], with endpoint [{}]", region, endpoint);
++            } else {
++                // No region has been set so we will use the default endpoint
++                if (CLOUD_S3.ENDPOINT_SETTING.exists(settings)) {
++                    endpoint = CLOUD_S3.ENDPOINT_SETTING.get(settings);
++                    logger.debug("using explicit s3 endpoint [{}]", endpoint);
++                } else if (REGION_SETTING.exists(settings) || CLOUD_S3.REGION_SETTING.exists(settings)) {
++                    region = CLOUD_S3.REGION_SETTING.get(settings);
++                    endpoint = getEndpoint(region);
++                    logger.debug("using s3 region [{}], with endpoint [{}]", region, endpoint);
++                }
++            }
++        } else {
++            logger.debug("using repository level endpoint [{}]", endpoint);
+         }
++
+         return endpoint;
+     }
+ 
+diff --git a/plugins/repository-s3/src/main/java/org/elasticsearch/repositories/s3/S3Repository.java b/plugins/repository-s3/src/main/java/org/elasticsearch/repositories/s3/S3Repository.java
+index cc91173d954c..56d05b65711c 100644
+--- a/plugins/repository-s3/src/main/java/org/elasticsearch/repositories/s3/S3Repository.java
++++ b/plugins/repository-s3/src/main/java/org/elasticsearch/repositories/s3/S3Repository.java
+@@ -270,11 +270,6 @@ public S3Repository(RepositoryMetaData metadata, Settings settings, AwsS3Service
+         String endpoint = getValue(metadata.settings(), settings, Repository.ENDPOINT_SETTING, Repositories.ENDPOINT_SETTING);
+         Protocol protocol = getValue(metadata.settings(), settings, Repository.PROTOCOL_SETTING, Repositories.PROTOCOL_SETTING);
+         String region = getValue(metadata.settings(), settings, Repository.REGION_SETTING, Repositories.REGION_SETTING);
+-        // If no region is defined either in region, repositories.s3.region, cloud.aws.s3.region or cloud.aws.region
+-        // we fallback to Default bucket - null
+-        if (Strings.isEmpty(region)) {
+-            region = null;
+-        }
+ 
+         boolean serverSideEncryption = getValue(metadata.settings(), settings, Repository.SERVER_SIDE_ENCRYPTION_SETTING, Repositories.SERVER_SIDE_ENCRYPTION_SETTING);
+         ByteSizeValue bufferSize = getValue(metadata.settings(), settings, Repository.BUFFER_SIZE_SETTING, Repositories.BUFFER_SIZE_SETTING);
+diff --git a/plugins/repository-s3/src/test/java/org/elasticsearch/cloud/aws/AwsS3ServiceImplTests.java b/plugins/repository-s3/src/test/java/org/elasticsearch/cloud/aws/AwsS3ServiceImplTests.java
+new file mode 100644
+index 000000000000..788ea8b60edc
+--- /dev/null
++++ b/plugins/repository-s3/src/test/java/org/elasticsearch/cloud/aws/AwsS3ServiceImplTests.java
+@@ -0,0 +1,313 @@
++/*
++ * Licensed to Elasticsearch under one or more contributor
++ * license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright
++ * ownership. Elasticsearch licenses this file to you under
++ * the Apache License, Version 2.0 (the "License"); you may
++ * not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++package org.elasticsearch.cloud.aws;
++
++import com.amazonaws.ClientConfiguration;
++import com.amazonaws.Protocol;
++import com.amazonaws.auth.AWSCredentials;
++import com.amazonaws.auth.AWSCredentialsProvider;
++import org.elasticsearch.common.settings.Settings;
++import org.elasticsearch.repositories.s3.S3Repository;
++import org.elasticsearch.test.ESTestCase;
++
++import static org.hamcrest.Matchers.containsString;
++import static org.hamcrest.Matchers.is;
++
++public class AwsS3ServiceImplTests extends ESTestCase {
++
++    @AwaitsFix(bugUrl = "https://github.com/elastic/elasticsearch/issues/19556")
++    public void testAWSCredentialsWithSystemProviders() {
++        AWSCredentialsProvider credentialsProvider = InternalAwsS3Service.buildCredentials(logger, "", "");
++
++        AWSCredentials credentials = credentialsProvider.getCredentials();
++        assertThat(credentials.getAWSAccessKeyId(), is("DUMMY_ACCESS_KEY"));
++        assertThat(credentials.getAWSSecretKey(), is("DUMMY_SECRET_KEY"));
++    }
++
++    public void testAWSCredentialsWithElasticsearchAwsSettings() {
++        Settings repositorySettings = generateRepositorySettings(null, null, "eu-central", null, null);
++        Settings settings = Settings.builder()
++            .put(AwsS3Service.KEY_SETTING.getKey(), "aws_key")
++            .put(AwsS3Service.SECRET_SETTING.getKey(), "aws_secret")
++            .build();
++        launchAWSCredentialsWithElasticsearchSettingsTest(repositorySettings, settings, "aws_key", "aws_secret");
++    }
++
++    public void testAWSCredentialsWithElasticsearchS3Settings() {
++        Settings repositorySettings = generateRepositorySettings(null, null, "eu-central", null, null);
++        Settings settings = Settings.builder()
++            .put(AwsS3Service.CLOUD_S3.KEY_SETTING.getKey(), "s3_key")
++            .put(AwsS3Service.CLOUD_S3.SECRET_SETTING.getKey(), "s3_secret")
++            .build();
++        launchAWSCredentialsWithElasticsearchSettingsTest(repositorySettings, settings, "s3_key", "s3_secret");
++    }
++
++    public void testAWSCredentialsWithElasticsearchAwsAndS3Settings() {
++        Settings repositorySettings = generateRepositorySettings(null, null, "eu-central", null, null);
++        Settings settings = Settings.builder()
++            .put(AwsS3Service.KEY_SETTING.getKey(), "aws_key")
++            .put(AwsS3Service.SECRET_SETTING.getKey(), "aws_secret")
++            .put(AwsS3Service.CLOUD_S3.KEY_SETTING.getKey(), "s3_key")
++            .put(AwsS3Service.CLOUD_S3.SECRET_SETTING.getKey(), "s3_secret")
++            .build();
++        launchAWSCredentialsWithElasticsearchSettingsTest(repositorySettings, settings, "s3_key", "s3_secret");
++    }
++
++    public void testAWSCredentialsWithElasticsearchRepositoriesSettings() {
++        Settings repositorySettings = generateRepositorySettings(null, null, "eu-central", null, null);
++        Settings settings = Settings.builder()
++            .put(S3Repository.Repositories.KEY_SETTING.getKey(), "repositories_key")
++            .put(S3Repository.Repositories.SECRET_SETTING.getKey(), "repositories_secret")
++            .build();
++        launchAWSCredentialsWithElasticsearchSettingsTest(repositorySettings, settings, "repositories_key", "repositories_secret");
++    }
++
++    public void testAWSCredentialsWithElasticsearchAwsAndRepositoriesSettings() {
++        Settings repositorySettings = generateRepositorySettings(null, null, "eu-central", null, null);
++        Settings settings = Settings.builder()
++            .put(AwsS3Service.KEY_SETTING.getKey(), "aws_key")
++            .put(AwsS3Service.SECRET_SETTING.getKey(), "aws_secret")
++            .put(S3Repository.Repositories.KEY_SETTING.getKey(), "repositories_key")
++            .put(S3Repository.Repositories.SECRET_SETTING.getKey(), "repositories_secret")
++            .build();
++        launchAWSCredentialsWithElasticsearchSettingsTest(repositorySettings, settings, "repositories_key", "repositories_secret");
++    }
++
++    public void testAWSCredentialsWithElasticsearchAwsAndS3AndRepositoriesSettings() {
++        Settings repositorySettings = generateRepositorySettings(null, null, "eu-central", null, null);
++        Settings settings = Settings.builder()
++            .put(AwsS3Service.KEY_SETTING.getKey(), "aws_key")
++            .put(AwsS3Service.SECRET_SETTING.getKey(), "aws_secret")
++            .put(AwsS3Service.CLOUD_S3.KEY_SETTING.getKey(), "s3_key")
++            .put(AwsS3Service.CLOUD_S3.SECRET_SETTING.getKey(), "s3_secret")
++            .put(S3Repository.Repositories.KEY_SETTING.getKey(), "repositories_key")
++            .put(S3Repository.Repositories.SECRET_SETTING.getKey(), "repositories_secret")
++            .build();
++        launchAWSCredentialsWithElasticsearchSettingsTest(repositorySettings, settings, "repositories_key", "repositories_secret");
++    }
++
++    public void testAWSCredentialsWithElasticsearchRepositoriesSettingsAndRepositorySettings() {
++        Settings repositorySettings = generateRepositorySettings("repository_key", "repository_secret", "eu-central", null, null);
++        Settings settings = Settings.builder()
++            .put(S3Repository.Repositories.KEY_SETTING.getKey(), "repositories_key")
++            .put(S3Repository.Repositories.SECRET_SETTING.getKey(), "repositories_secret")
++            .build();
++        launchAWSCredentialsWithElasticsearchSettingsTest(repositorySettings, settings, "repository_key", "repository_secret");
++    }
++
++    public void testAWSCredentialsWithElasticsearchAwsAndRepositoriesSettingsAndRepositorySettings() {
++        Settings repositorySettings = generateRepositorySettings("repository_key", "repository_secret", "eu-central", null, null);
++        Settings settings = Settings.builder()
++            .put(AwsS3Service.KEY_SETTING.getKey(), "aws_key")
++            .put(AwsS3Service.SECRET_SETTING.getKey(), "aws_secret")
++            .put(S3Repository.Repositories.KEY_SETTING.getKey(), "repositories_key")
++            .put(S3Repository.Repositories.SECRET_SETTING.getKey(), "repositories_secret")
++            .build();
++        launchAWSCredentialsWithElasticsearchSettingsTest(repositorySettings, settings, "repository_key", "repository_secret");
++    }
++
++    public void testAWSCredentialsWithElasticsearchAwsAndS3AndRepositoriesSettingsAndRepositorySettings() {
++        Settings repositorySettings = generateRepositorySettings("repository_key", "repository_secret", "eu-central", null, null);
++        Settings settings = Settings.builder()
++            .put(AwsS3Service.KEY_SETTING.getKey(), "aws_key")
++            .put(AwsS3Service.SECRET_SETTING.getKey(), "aws_secret")
++            .put(AwsS3Service.CLOUD_S3.KEY_SETTING.getKey(), "s3_key")
++            .put(AwsS3Service.CLOUD_S3.SECRET_SETTING.getKey(), "s3_secret")
++            .put(S3Repository.Repositories.KEY_SETTING.getKey(), "repositories_key")
++            .put(S3Repository.Repositories.SECRET_SETTING.getKey(), "repositories_secret")
++            .build();
++        launchAWSCredentialsWithElasticsearchSettingsTest(repositorySettings, settings, "repository_key", "repository_secret");
++    }
++
++    protected void launchAWSCredentialsWithElasticsearchSettingsTest(Settings singleRepositorySettings, Settings settings,
++                                                                     String expectedKey, String expectedSecret) {
++        String key = S3Repository.getValue(singleRepositorySettings, settings,
++            S3Repository.Repository.KEY_SETTING, S3Repository.Repositories.KEY_SETTING);
++        String secret = S3Repository.getValue(singleRepositorySettings, settings,
++            S3Repository.Repository.SECRET_SETTING, S3Repository.Repositories.SECRET_SETTING);
++
++        AWSCredentials credentials = InternalAwsS3Service.buildCredentials(logger, key, secret).getCredentials();
++        assertThat(credentials.getAWSAccessKeyId(), is(expectedKey));
++        assertThat(credentials.getAWSSecretKey(), is(expectedSecret));
++    }
++
++    public void testAWSDefaultConfiguration() {
++        Settings repositorySettings = generateRepositorySettings(null, null, "eu-central", null, null);
++        launchAWSConfigurationTest(Settings.EMPTY, repositorySettings, Protocol.HTTPS, null, -1, null, null, null, 3, false);
++    }
++
++    public void testAWSConfigurationWithAwsSettings() {
++        Settings repositorySettings = generateRepositorySettings(null, null, "eu-central", null, null);
++        Settings settings = Settings.builder()
++            .put(AwsS3Service.PROTOCOL_SETTING.getKey(), "http")
++            .put(AwsS3Service.PROXY_HOST_SETTING.getKey(), "aws_proxy_host")
++            .put(AwsS3Service.PROXY_PORT_SETTING.getKey(), 8080)
++            .put(AwsS3Service.PROXY_USERNAME_SETTING.getKey(), "aws_proxy_username")
++            .put(AwsS3Service.PROXY_PASSWORD_SETTING.getKey(), "aws_proxy_password")
++            .put(AwsS3Service.SIGNER_SETTING.getKey(), "AWS3SignerType")
++            .build();
++        launchAWSConfigurationTest(settings, repositorySettings, Protocol.HTTP, "aws_proxy_host", 8080, "aws_proxy_username",
++            "aws_proxy_password", "AWS3SignerType", 3, false);
++    }
++
++    public void testAWSConfigurationWithAwsAndS3Settings() {
++        Settings repositorySettings = generateRepositorySettings(null, null, "eu-central", null, null);
++        Settings settings = Settings.builder()
++            .put(AwsS3Service.PROTOCOL_SETTING.getKey(), "http")
++            .put(AwsS3Service.PROXY_HOST_SETTING.getKey(), "aws_proxy_host")
++            .put(AwsS3Service.PROXY_PORT_SETTING.getKey(), 8080)
++            .put(AwsS3Service.PROXY_USERNAME_SETTING.getKey(), "aws_proxy_username")
++            .put(AwsS3Service.PROXY_PASSWORD_SETTING.getKey(), "aws_proxy_password")
++            .put(AwsS3Service.SIGNER_SETTING.getKey(), "AWS3SignerType")
++            .put(AwsS3Service.CLOUD_S3.PROTOCOL_SETTING.getKey(), "https")
++            .put(AwsS3Service.CLOUD_S3.PROXY_HOST_SETTING.getKey(), "s3_proxy_host")
++            .put(AwsS3Service.CLOUD_S3.PROXY_PORT_SETTING.getKey(), 8081)
++            .put(AwsS3Service.CLOUD_S3.PROXY_USERNAME_SETTING.getKey(), "s3_proxy_username")
++            .put(AwsS3Service.CLOUD_S3.PROXY_PASSWORD_SETTING.getKey(), "s3_proxy_password")
++            .put(AwsS3Service.CLOUD_S3.SIGNER_SETTING.getKey(), "NoOpSignerType")
++            .build();
++        launchAWSConfigurationTest(settings, repositorySettings, Protocol.HTTPS, "s3_proxy_host", 8081, "s3_proxy_username",
++            "s3_proxy_password", "NoOpSignerType", 3, false);
++    }
++
++    protected void launchAWSConfigurationTest(Settings settings,
++                                              Settings singleRepositorySettings,
++                                              Protocol expectedProtocol,
++                                              String expectedProxyHost,
++                                              int expectedProxyPort,
++                                              String expectedProxyUsername,
++                                              String expectedProxyPassword,
++                                              String expectedSigner,
++                                              Integer expectedMaxRetries,
++                                              boolean expectedUseThrottleRetries) {
++        Protocol protocol = S3Repository.getValue(singleRepositorySettings, settings,
++            S3Repository.Repository.PROTOCOL_SETTING, S3Repository.Repositories.PROTOCOL_SETTING);
++        Integer maxRetries = S3Repository.getValue(singleRepositorySettings, settings,
++            S3Repository.Repository.MAX_RETRIES_SETTING, S3Repository.Repositories.MAX_RETRIES_SETTING);
++        Boolean useThrottleRetries = S3Repository.getValue(singleRepositorySettings, settings,
++            S3Repository.Repository.USE_THROTTLE_RETRIES_SETTING, S3Repository.Repositories.USE_THROTTLE_RETRIES_SETTING);
++
++        ClientConfiguration configuration = InternalAwsS3Service.buildConfiguration(logger, settings, protocol, maxRetries, null,
++            useThrottleRetries);
++
++        assertThat(configuration.getResponseMetadataCacheSize(), is(0));
++        assertThat(configuration.getProtocol(), is(expectedProtocol));
++        assertThat(configuration.getProxyHost(), is(expectedProxyHost));
++        assertThat(configuration.getProxyPort(), is(expectedProxyPort));
++        assertThat(configuration.getProxyUsername(), is(expectedProxyUsername));
++        assertThat(configuration.getProxyPassword(), is(expectedProxyPassword));
++        assertThat(configuration.getSignerOverride(), is(expectedSigner));
++        assertThat(configuration.getMaxErrorRetry(), is(expectedMaxRetries));
++        assertThat(configuration.useThrottledRetries(), is(expectedUseThrottleRetries));
++    }
++
++    private static Settings generateRepositorySettings(String key, String secret, String region, String endpoint, Integer maxRetries) {
++        Settings.Builder builder = Settings.builder();
++        if (region != null) {
++            builder.put(S3Repository.Repository.REGION_SETTING.getKey(), region);
++        }
++        if (endpoint != null) {
++            builder.put(S3Repository.Repository.ENDPOINT_SETTING.getKey(), endpoint);
++        }
++        if (key != null) {
++            builder.put(S3Repository.Repository.KEY_SETTING.getKey(), key);
++        }
++        if (secret != null) {
++            builder.put(S3Repository.Repository.SECRET_SETTING.getKey(), secret);
++        }
++        if (maxRetries != null) {
++            builder.put(S3Repository.Repository.MAX_RETRIES_SETTING.getKey(), maxRetries);
++        }
++        return builder.build();
++    }
++
++    public void testDefaultEndpoint() {
++        launchAWSEndpointTest(generateRepositorySettings("repository_key", "repository_secret", null, null, null), Settings.EMPTY, "");
++        launchAWSEndpointTest(generateRepositorySettings("repository_key", "repository_secret", "eu-central", null, null), Settings.EMPTY,
++            "s3.eu-central-1.amazonaws.com");
++        launchAWSEndpointTest(generateRepositorySettings("repository_key", "repository_secret", null, "repository.endpoint", null),
++            Settings.EMPTY, "repository.endpoint");
++    }
++
++    public void testSpecificEndpoint() {
++        Settings settings = Settings.builder()
++            .put(InternalAwsS3Service.CLOUD_S3.ENDPOINT_SETTING.getKey(), "ec2.endpoint")
++            .build();
++        launchAWSEndpointTest(generateRepositorySettings("repository_key", "repository_secret", null, null, null), settings,
++            "ec2.endpoint");
++        // Endpoint has precedence on region. Whatever region we set, we won't use it
++        launchAWSEndpointTest(generateRepositorySettings("repository_key", "repository_secret", "eu-central", null, null), settings,
++            "ec2.endpoint");
++        launchAWSEndpointTest(generateRepositorySettings("repository_key", "repository_secret", null, "repository.endpoint", null),
++            settings, "repository.endpoint");
++    }
++
++    public void testRegionWithAwsSettings() {
++        Settings settings = Settings.builder()
++            .put(InternalAwsS3Service.REGION_SETTING.getKey(), randomFrom("eu-west", "eu-west-1"))
++            .build();
++        launchAWSEndpointTest(generateRepositorySettings("repository_key", "repository_secret", null, null, null), settings,
++            "s3-eu-west-1.amazonaws.com");
++        launchAWSEndpointTest(generateRepositorySettings("repository_key", "repository_secret", "eu-central", null, null), settings,
++            "s3.eu-central-1.amazonaws.com");
++        launchAWSEndpointTest(generateRepositorySettings("repository_key", "repository_secret", null, "repository.endpoint", null),
++            settings, "repository.endpoint");
++    }
++
++    public void testRegionWithAwsAndS3Settings() {
++        Settings settings = Settings.builder()
++            .put(InternalAwsS3Service.REGION_SETTING.getKey(), randomFrom("eu-west", "eu-west-1"))
++            .put(InternalAwsS3Service.CLOUD_S3.REGION_SETTING.getKey(), randomFrom("us-west", "us-west-1"))
++            .build();
++        launchAWSEndpointTest(generateRepositorySettings("repository_key", "repository_secret", null, null, null), settings,
++            "s3-us-west-1.amazonaws.com");
++        launchAWSEndpointTest(generateRepositorySettings("repository_key", "repository_secret", "eu-central", null, null), settings,
++            "s3.eu-central-1.amazonaws.com");
++        launchAWSEndpointTest(generateRepositorySettings("repository_key", "repository_secret", null, "repository.endpoint", null),
++            settings, "repository.endpoint");
++    }
++
++    public void testInvalidRegion() {
++        Settings settings = Settings.builder()
++            .put(InternalAwsS3Service.REGION_SETTING.getKey(), "does-not-exist")
++            .build();
++        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> {
++            launchAWSEndpointTest(generateRepositorySettings("repository_key", "repository_secret", null, null, null), settings, null);
++        });
++        assertThat(e.getMessage(), containsString("No automatic endpoint could be derived from region"));
++
++        launchAWSEndpointTest(generateRepositorySettings("repository_key", "repository_secret", "eu-central", null, null), settings,
++            "s3.eu-central-1.amazonaws.com");
++        launchAWSEndpointTest(generateRepositorySettings("repository_key", "repository_secret", null, "repository.endpoint", null),
++            settings, "repository.endpoint");
++    }
++
++    protected void launchAWSEndpointTest(Settings singleRepositorySettings, Settings settings,
++                                         String expectedEndpoint) {
++        String region = S3Repository.getValue(singleRepositorySettings, settings,
++            S3Repository.Repository.REGION_SETTING, S3Repository.Repositories.REGION_SETTING);
++        String endpoint = S3Repository.getValue(singleRepositorySettings, settings,
++            S3Repository.Repository.ENDPOINT_SETTING, S3Repository.Repositories.ENDPOINT_SETTING);
++
++        String foundEndpoint = InternalAwsS3Service.findEndpoint(logger, settings, endpoint, region);
++        assertThat(foundEndpoint, is(expectedEndpoint));
++    }
++
++}

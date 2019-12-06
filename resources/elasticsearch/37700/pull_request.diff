@@ -1,0 +1,173 @@
+diff --git a/x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/job/process/autodetect/AutodetectProcessManager.java b/x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/job/process/autodetect/AutodetectProcessManager.java
+index 21aa08e14f21..1d8f4f273601 100644
+--- a/x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/job/process/autodetect/AutodetectProcessManager.java
++++ b/x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/job/process/autodetect/AutodetectProcessManager.java
+@@ -77,6 +77,7 @@
+ import java.nio.file.Path;
+ import java.time.Duration;
+ import java.time.ZonedDateTime;
++import java.util.ArrayList;
+ import java.util.Date;
+ import java.util.Iterator;
+ import java.util.List;
+@@ -831,7 +832,16 @@ public boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedE
+         }
+ 
+         @Override
+-        public void execute(Runnable command) {
++        public synchronized void execute(Runnable command) {
++            if (isShutdown()) {
++                EsRejectedExecutionException rejected = new EsRejectedExecutionException("autodetect worker service has shutdown", true);
++                if (command instanceof AbstractRunnable) {
++                    ((AbstractRunnable) command).onRejection(rejected);
++                } else {
++                    throw rejected;
++                }
++            }
++
+             boolean added = queue.offer(contextHolder.preserveContext(command));
+             if (added == false) {
+                 throw new ElasticsearchStatusException("Unable to submit operation", RestStatus.TOO_MANY_REQUESTS);
+@@ -851,6 +861,21 @@ void start() {
+                         EsExecutors.rethrowErrors(contextHolder.unwrap(runnable));
+                     }
+                 }
++
++                synchronized (this) {
++                    // if shutdown with tasks pending notify the handlers
++                    if (queue.isEmpty() == false) {
++                        List<Runnable> notExecuted = new ArrayList<>();
++                        queue.drainTo(notExecuted);
++
++                        for (Runnable runnable : notExecuted) {
++                            if (runnable instanceof AbstractRunnable) {
++                                ((AbstractRunnable) runnable).onRejection(
++                                    new EsRejectedExecutionException("unable to process as autodetect worker service has shutdown", true));
++                            }
++                        }
++                    }
++                }
+             } catch (InterruptedException e) {
+                 Thread.currentThread().interrupt();
+             } finally {
+diff --git a/x-pack/plugin/ml/src/test/java/org/elasticsearch/xpack/ml/job/process/autodetect/AutodetectProcessManagerTests.java b/x-pack/plugin/ml/src/test/java/org/elasticsearch/xpack/ml/job/process/autodetect/AutodetectProcessManagerTests.java
+index 82788d4500b0..6b4fd270b1bb 100644
+--- a/x-pack/plugin/ml/src/test/java/org/elasticsearch/xpack/ml/job/process/autodetect/AutodetectProcessManagerTests.java
++++ b/x-pack/plugin/ml/src/test/java/org/elasticsearch/xpack/ml/job/process/autodetect/AutodetectProcessManagerTests.java
+@@ -14,6 +14,7 @@
+ import org.elasticsearch.cluster.service.ClusterService;
+ import org.elasticsearch.common.CheckedConsumer;
+ import org.elasticsearch.common.settings.Settings;
++import org.elasticsearch.common.util.concurrent.AbstractRunnable;
+ import org.elasticsearch.common.util.concurrent.EsExecutors;
+ import org.elasticsearch.common.util.concurrent.EsRejectedExecutionException;
+ import org.elasticsearch.common.util.concurrent.ThreadContext;
+@@ -54,6 +55,7 @@
+ import org.elasticsearch.xpack.ml.job.process.autodetect.params.TimeRange;
+ import org.elasticsearch.xpack.ml.job.process.normalizer.NormalizerFactory;
+ import org.elasticsearch.xpack.ml.notifications.Auditor;
++import org.junit.After;
+ import org.junit.Before;
+ import org.mockito.ArgumentCaptor;
+ import org.mockito.Mockito;
+@@ -72,9 +74,11 @@
+ import java.util.TreeMap;
+ import java.util.concurrent.Callable;
+ import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Future;
+ import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.concurrent.atomic.AtomicReference;
+ import java.util.function.BiConsumer;
+@@ -125,6 +129,8 @@
+     private Quantiles quantiles = new Quantiles("foo", new Date(), "state");
+     private Set<MlFilter> filters = new HashSet<>();
+ 
++    private ThreadPool threadPool;
++
+     @Before
+     public void setup() throws Exception {
+         Settings settings = Settings.builder().put(Environment.PATH_HOME_SETTING.getKey(), createTempDir()).build();
+@@ -159,8 +165,16 @@ public void setup() throws Exception {
+             handler.accept(buildAutodetectParams());
+             return null;
+         }).when(jobResultsProvider).getAutodetectParams(any(), any(), any());
++
++        threadPool = new TestThreadPool("AutodetectProcessManagerTests");
+     }
+ 
++    @After
++    public void stopThreadPool() throws InterruptedException {
++        terminate(threadPool);
++    }
++
++
+     public void testMaxOpenJobsSetting_givenDefault() {
+         int maxOpenJobs = AutodetectProcessManager.MAX_OPEN_JOBS_PER_NODE.get(Settings.EMPTY);
+         assertEquals(20, maxOpenJobs);
+@@ -690,6 +704,62 @@ public void testAutodetectWorkerExecutorServiceDoesNotSwallowErrors() {
+         }
+     }
+ 
++    public void testAutodetectWorkerExecutorService_SubmitAfterShutdown() {
++        AutodetectProcessManager.AutodetectWorkerExecutorService executor =
++                new AutodetectWorkerExecutorService(new ThreadContext(Settings.EMPTY));
++
++        threadPool.generic().execute(() -> executor.start());
++        executor.shutdown();
++        expectThrows(EsRejectedExecutionException.class, () -> executor.execute(() -> {}));
++    }
++
++    public void testAutodetectWorkerExecutorService_TasksNotExecutedCallHandlerOnShutdown()
++            throws InterruptedException, ExecutionException {
++        AutodetectProcessManager.AutodetectWorkerExecutorService executor =
++                new AutodetectWorkerExecutorService(new ThreadContext(Settings.EMPTY));
++
++        CountDownLatch latch = new CountDownLatch(1);
++
++        Future<?> executorFinished = threadPool.generic().submit(() -> executor.start());
++
++        // run a task that will block while the others are queued up
++        executor.execute(() -> {
++            try {
++                latch.await();
++            } catch (InterruptedException e) {
++            }
++        });
++
++        AtomicBoolean runnableShouldNotBeCalled = new AtomicBoolean(false);
++        executor.execute(() -> runnableShouldNotBeCalled.set(true));
++
++        AtomicInteger onFailureCallCount = new AtomicInteger();
++        AtomicInteger doRunCallCount = new AtomicInteger();
++        for (int i=0; i<2; i++) {
++            executor.execute(new AbstractRunnable() {
++                @Override
++                public void onFailure(Exception e) {
++                    onFailureCallCount.incrementAndGet();
++                }
++
++                @Override
++                protected void doRun() {
++                    doRunCallCount.incrementAndGet();
++                }
++            });
++        }
++
++        // now shutdown
++        executor.shutdown();
++        latch.countDown();
++        executorFinished.get();
++
++        assertFalse(runnableShouldNotBeCalled.get());
++        // the AbstractRunnables should have had their callbacks called
++        assertEquals(2, onFailureCallCount.get());
++        assertEquals(0, doRunCallCount.get());
++    }
++
+     private AutodetectProcessManager createNonSpyManager(String jobId) {
+         Client client = mock(Client.class);
+         ThreadPool threadPool = mock(ThreadPool.class);

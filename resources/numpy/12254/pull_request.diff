@@ -1,0 +1,451 @@
+diff --git a/numpy/core/_dtype_ctypes.py b/numpy/core/_dtype_ctypes.py
+new file mode 100644
+index 00000000000..f10b4e99f04
+--- /dev/null
++++ b/numpy/core/_dtype_ctypes.py
+@@ -0,0 +1,68 @@
++"""
++Conversion from ctypes to dtype.
++
++In an ideal world, we could acheive this through the PEP3118 buffer protocol,
++something like::
++
++    def dtype_from_ctypes_type(t):
++        # needed to ensure that the shape of `t` is within memoryview.format
++        class DummyStruct(ctypes.Structure):
++            _fields_ = [('a', t)]
++
++        # empty to avoid memory allocation
++        ctype_0 = (DummyStruct * 0)()
++        mv = memoryview(ctype_0)
++
++        # convert the struct, and slice back out the field
++        return _dtype_from_pep3118(mv.format)['a']
++
++Unfortunately, this fails because:
++
++* ctypes cannot handle length-0 arrays with PEP3118 (bpo-32782)
++* PEP3118 cannot represent unions, but both numpy and ctypes can
++* ctypes cannot handle big-endian structs with PEP3118 (bpo-32780)
++"""
++import _ctypes
++import ctypes
++
++import numpy as np
++
++
++def _from_ctypes_array(t):
++    return np.dtype((dtype_from_ctypes_type(t._type_), (t._length_,)))
++
++
++def _from_ctypes_structure(t):
++    # TODO: gh-10533, gh-10532
++    fields = []
++    for item in t._fields_:
++        if len(item) > 2:
++            raise TypeError(
++                "ctypes bitfields have no dtype equivalent")
++        fname, ftyp = item
++        fields.append((fname, dtype_from_ctypes_type(ftyp)))
++
++    # by default, ctypes structs are aligned
++    return np.dtype(fields, align=True)
++
++
++def dtype_from_ctypes_type(t):
++    """
++    Construct a dtype object from a ctypes type
++    """
++    if issubclass(t, _ctypes.Array):
++        return _from_ctypes_array(t)
++    elif issubclass(t, _ctypes._Pointer):
++        raise TypeError("ctypes pointers have no dtype equivalent")
++    elif issubclass(t, _ctypes.Structure):
++        return _from_ctypes_structure(t)
++    elif issubclass(t, _ctypes.Union):
++        # TODO
++        raise NotImplementedError(
++            "conversion from ctypes.Union types like {} to dtype"
++            .format(t.__name__))
++    elif isinstance(t._type_, str):
++        return np.dtype(t._type_)
++    else:
++        raise NotImplementedError(
++            "Unknown ctypes type {}".format(t.__name__))
+diff --git a/numpy/core/_internal.py b/numpy/core/_internal.py
+index c4d967dc28f..30069f0ca3b 100644
+--- a/numpy/core/_internal.py
++++ b/numpy/core/_internal.py
+@@ -796,13 +796,13 @@ def _ufunc_doc_signature_formatter(ufunc):
+     )
+ 
+ 
+-def _is_from_ctypes(obj):
+-    # determine if an object comes from ctypes, in order to work around
++def npy_ctypes_check(cls):
++    # determine if a class comes from ctypes, in order to work around
+     # a bug in the buffer protocol for those objects, bpo-10746
+     try:
+         # ctypes class are new-style, so have an __mro__. This probably fails
+         # for ctypes classes with multiple inheritance.
+-        ctype_base = type(obj).__mro__[-2]
++        ctype_base = cls.__mro__[-2]
+         # right now, they're part of the _ctypes module
+         return 'ctypes' in ctype_base.__module__
+     except Exception:
+diff --git a/numpy/core/setup.py b/numpy/core/setup.py
+index fc15fe59fca..a4429cee286 100644
+--- a/numpy/core/setup.py
++++ b/numpy/core/setup.py
+@@ -731,7 +731,9 @@ def get_mathlib_info(*args):
+             join('src', 'common', 'lowlevel_strided_loops.h'),
+             join('src', 'common', 'mem_overlap.h'),
+             join('src', 'common', 'npy_config.h'),
++            join('src', 'common', 'npy_ctypes.h'),
+             join('src', 'common', 'npy_extint128.h'),
++            join('src', 'common', 'npy_import.h'),
+             join('src', 'common', 'npy_longdouble.h'),
+             join('src', 'common', 'templ_common.h.src'),
+             join('src', 'common', 'ucsnarrow.h'),
+diff --git a/numpy/core/src/common/npy_ctypes.h b/numpy/core/src/common/npy_ctypes.h
+new file mode 100644
+index 00000000000..f26db9e0557
+--- /dev/null
++++ b/numpy/core/src/common/npy_ctypes.h
+@@ -0,0 +1,49 @@
++#ifndef NPY_CTYPES_H
++#define NPY_CTYPES_H
++
++#include <Python.h>
++
++#include "npy_import.h"
++
++/*
++ * Check if a python type is a ctypes class.
++ *
++ * Works like the Py<type>_Check functions, returning true if the argument
++ * looks like a ctypes object.
++ *
++ * This entire function is just a wrapper around the Python function of the
++ * same name.
++ */
++NPY_INLINE static int
++npy_ctypes_check(PyTypeObject *obj)
++{
++    static PyObject *py_func = NULL;
++    PyObject *ret_obj;
++    int ret;
++
++    npy_cache_import("numpy.core._internal", "npy_ctypes_check", &py_func);
++    if (py_func == NULL) {
++        goto fail;
++    }
++
++    ret_obj = PyObject_CallFunctionObjArgs(py_func, (PyObject *)obj, NULL);
++    if (ret_obj == NULL) {
++        goto fail;
++    }
++
++    ret = PyObject_IsTrue(ret_obj);
++    if (ret == -1) {
++        goto fail;
++    }
++
++    return ret;
++
++fail:
++    /* If the above fails, then we should just assume that the type is not from
++     * ctypes
++     */
++    PyErr_Clear();
++    return 0;
++}
++
++#endif
+diff --git a/numpy/core/src/multiarray/ctors.c b/numpy/core/src/multiarray/ctors.c
+index aaaaeee82fc..bf888659d54 100644
+--- a/numpy/core/src/multiarray/ctors.c
++++ b/numpy/core/src/multiarray/ctors.c
+@@ -11,7 +11,7 @@
+ 
+ #include "npy_config.h"
+ 
+-#include "npy_import.h"
++#include "npy_ctypes.h"
+ #include "npy_pycompat.h"
+ #include "multiarraymodule.h"
+ 
+@@ -1381,15 +1381,7 @@ _array_from_buffer_3118(PyObject *memoryview)
+          * Note that even if the above are fixed in master, we have to drop the
+          * early patch versions of python to actually make use of the fixes.
+          */
+-
+-        int is_ctypes = _is_from_ctypes(view->obj);
+-        if (is_ctypes < 0) {
+-            /* This error is not useful */
+-            PyErr_WriteUnraisable(view->obj);
+-            is_ctypes = 0;
+-        }
+-
+-        if (!is_ctypes) {
++        if (!npy_ctypes_check(Py_TYPE(view->obj))) {
+             /* This object has no excuse for a broken PEP3118 buffer */
+             PyErr_Format(
+                     PyExc_RuntimeError,
+diff --git a/numpy/core/src/multiarray/descriptor.c b/numpy/core/src/multiarray/descriptor.c
+index 43998087736..7acac80597a 100644
+--- a/numpy/core/src/multiarray/descriptor.c
++++ b/numpy/core/src/multiarray/descriptor.c
+@@ -10,7 +10,7 @@
+ #include "numpy/arrayscalars.h"
+ 
+ #include "npy_config.h"
+-
++#include "npy_ctypes.h"
+ #include "npy_pycompat.h"
+ 
+ #include "_datetime.h"
+@@ -54,79 +54,46 @@ Borrowed_PyMapping_GetItemString(PyObject *o, char *key)
+     return ret;
+ }
+ 
+-/*
+- * Creates a dtype object from ctypes inputs.
+- *
+- * Returns a new reference to a dtype object, or NULL
+- * if this is not possible. When it returns NULL, it does
+- * not set a Python exception.
+- */
+ static PyArray_Descr *
+-_arraydescr_fromctypes(PyObject *obj)
++_arraydescr_from_ctypes_type(PyTypeObject *type)
+ {
+-    PyObject *dtypedescr;
+-    PyArray_Descr *newdescr;
+-    int ret;
++    PyObject *_numpy_dtype_ctypes;
++    PyObject *res;
+ 
+-    /* Understand basic ctypes */
+-    dtypedescr = PyObject_GetAttrString(obj, "_type_");
+-    PyErr_Clear();
+-    if (dtypedescr) {
+-        ret = PyArray_DescrConverter(dtypedescr, &newdescr);
+-        Py_DECREF(dtypedescr);
+-        if (ret == NPY_SUCCEED) {
+-            PyObject *length;
+-            /* Check for ctypes arrays */
+-            length = PyObject_GetAttrString(obj, "_length_");
+-            PyErr_Clear();
+-            if (length) {
+-                /* derived type */
+-                PyObject *newtup;
+-                PyArray_Descr *derived;
+-                newtup = Py_BuildValue("N(N)", newdescr, length);
+-                ret = PyArray_DescrConverter(newtup, &derived);
+-                Py_DECREF(newtup);
+-                if (ret == NPY_SUCCEED) {
+-                    return derived;
+-                }
+-                PyErr_Clear();
+-                return NULL;
+-            }
+-            return newdescr;
+-        }
+-        PyErr_Clear();
++    /* Call the python function of the same name. */
++    _numpy_dtype_ctypes = PyImport_ImportModule("numpy.core._dtype_ctypes");
++    if (_numpy_dtype_ctypes == NULL) {
+         return NULL;
+     }
+-    /* Understand ctypes structures --
+-       bit-fields are not supported
+-       automatically aligns */
+-    dtypedescr = PyObject_GetAttrString(obj, "_fields_");
+-    PyErr_Clear();
+-    if (dtypedescr) {
+-        ret = PyArray_DescrAlignConverter(dtypedescr, &newdescr);
+-        Py_DECREF(dtypedescr);
+-        if (ret == NPY_SUCCEED) {
+-            return newdescr;
+-        }
+-        PyErr_Clear();
++    res = PyObject_CallMethod(_numpy_dtype_ctypes, "dtype_from_ctypes_type", "O", (PyObject *)type);
++    Py_DECREF(_numpy_dtype_ctypes);
++    if (res == NULL) {
++        return NULL;
+     }
+ 
+-    return NULL;
++    /*
++     * sanity check that dtype_from_ctypes_type returned the right type,
++     * since getting it wrong would give segfaults.
++     */
++    if (!PyObject_TypeCheck(res, &PyArrayDescr_Type)) {
++        Py_DECREF(res);
++        PyErr_BadInternalCall();
++        return NULL;
++    }
++
++    return (PyArray_Descr *)res;
+ }
+ 
+ /*
+- * This function creates a dtype object when:
+- *  - The object has a "dtype" attribute, and it can be converted
+- *    to a dtype object.
+- *  - The object is a ctypes type object, including array
+- *    and structure types.
++ * This function creates a dtype object when the object has a "dtype" attribute,
++ * and it can be converted to a dtype object.
+  *
+  * Returns a new reference to a dtype object, or NULL
+  * if this is not possible. When it returns NULL, it does
+  * not set a Python exception.
+  */
+ NPY_NO_EXPORT PyArray_Descr *
+-_arraydescr_fromobj(PyObject *obj)
++_arraydescr_from_dtype_attr(PyObject *obj)
+ {
+     PyObject *dtypedescr;
+     PyArray_Descr *newdescr = NULL;
+@@ -135,15 +102,18 @@ _arraydescr_fromobj(PyObject *obj)
+     /* For arbitrary objects that have a "dtype" attribute */
+     dtypedescr = PyObject_GetAttrString(obj, "dtype");
+     PyErr_Clear();
+-    if (dtypedescr != NULL) {
+-        ret = PyArray_DescrConverter(dtypedescr, &newdescr);
+-        Py_DECREF(dtypedescr);
+-        if (ret == NPY_SUCCEED) {
+-            return newdescr;
+-        }
++    if (dtypedescr == NULL) {
++        return NULL;
++    }
++
++    ret = PyArray_DescrConverter(dtypedescr, &newdescr);
++    Py_DECREF(dtypedescr);
++    if (ret != NPY_SUCCEED) {
+         PyErr_Clear();
++        return NULL;
+     }
+-    return _arraydescr_fromctypes(obj);
++
++    return newdescr;
+ }
+ 
+ /*
+@@ -1423,10 +1393,20 @@ PyArray_DescrConverter(PyObject *obj, PyArray_Descr **at)
+             check_num = NPY_VOID;
+         }
+         else {
+-            *at = _arraydescr_fromobj(obj);
++            *at = _arraydescr_from_dtype_attr(obj);
+             if (*at) {
+                 return NPY_SUCCEED;
+             }
++
++            /*
++             * Note: this comes after _arraydescr_from_dtype_attr because the ctypes
++             * type might override the dtype if numpy does not otherwise
++             * support it.
++             */
++            if (npy_ctypes_check((PyTypeObject *)obj)) {
++                *at = _arraydescr_from_ctypes_type((PyTypeObject *)obj);
++                return *at ? NPY_SUCCEED : NPY_FAIL;
++            }
+         }
+         goto finish;
+     }
+@@ -1596,13 +1576,23 @@ PyArray_DescrConverter(PyObject *obj, PyArray_Descr **at)
+         goto fail;
+     }
+     else {
+-        *at = _arraydescr_fromobj(obj);
++        *at = _arraydescr_from_dtype_attr(obj);
+         if (*at) {
+             return NPY_SUCCEED;
+         }
+         if (PyErr_Occurred()) {
+             return NPY_FAIL;
+         }
++
++        /*
++         * Note: this comes after _arraydescr_from_dtype_attr because the ctypes
++         * type might override the dtype if numpy does not otherwise
++         * support it.
++         */
++        if (npy_ctypes_check(Py_TYPE(obj))) {
++            *at = _arraydescr_from_ctypes_type(Py_TYPE(obj));
++            return *at ? NPY_SUCCEED : NPY_FAIL;
++        }
+         goto fail;
+     }
+     if (PyErr_Occurred()) {
+diff --git a/numpy/core/src/multiarray/descriptor.h b/numpy/core/src/multiarray/descriptor.h
+index 5a3e4b15f23..a5f3b8cdf1f 100644
+--- a/numpy/core/src/multiarray/descriptor.h
++++ b/numpy/core/src/multiarray/descriptor.h
+@@ -8,7 +8,7 @@ NPY_NO_EXPORT PyObject *
+ array_set_typeDict(PyObject *NPY_UNUSED(ignored), PyObject *args);
+ 
+ NPY_NO_EXPORT PyArray_Descr *
+-_arraydescr_fromobj(PyObject *obj);
++_arraydescr_from_dtype_attr(PyObject *obj);
+ 
+ 
+ NPY_NO_EXPORT int
+diff --git a/numpy/core/src/multiarray/scalarapi.c b/numpy/core/src/multiarray/scalarapi.c
+index 5ef6c0bbf47..bc435d1ca43 100644
+--- a/numpy/core/src/multiarray/scalarapi.c
++++ b/numpy/core/src/multiarray/scalarapi.c
+@@ -471,7 +471,7 @@ PyArray_DescrFromTypeObject(PyObject *type)
+     /* Do special thing for VOID sub-types */
+     if (PyType_IsSubtype((PyTypeObject *)type, &PyVoidArrType_Type)) {
+         new = PyArray_DescrNewFromType(NPY_VOID);
+-        conv = _arraydescr_fromobj(type);
++        conv = _arraydescr_from_dtype_attr(type);
+         if (conv) {
+             new->fields = conv->fields;
+             Py_INCREF(new->fields);
+diff --git a/numpy/core/tests/test_dtype.py b/numpy/core/tests/test_dtype.py
+index dbed074662e..ecb51f72d7a 100644
+--- a/numpy/core/tests/test_dtype.py
++++ b/numpy/core/tests/test_dtype.py
+@@ -794,6 +794,36 @@ class PaddedStruct(ctypes.Structure):
+         ], align=True)
+         self.check(PaddedStruct, expected)
+ 
++    def test_bit_fields(self):
++        class BitfieldStruct(ctypes.Structure):
++            _fields_ = [
++                ('a', ctypes.c_uint8, 7),
++                ('b', ctypes.c_uint8, 1)
++            ]
++        assert_raises(TypeError, np.dtype, BitfieldStruct)
++        assert_raises(TypeError, np.dtype, BitfieldStruct())
++
++    def test_pointer(self):
++        p_uint8 = ctypes.POINTER(ctypes.c_uint8)
++        assert_raises(TypeError, np.dtype, p_uint8)
++
++    @pytest.mark.xfail(
++        reason="Unions are not implemented",
++        raises=NotImplementedError)
++    def test_union(self):
++        class Union(ctypes.Union):
++            _fields_ = [
++                ('a', ctypes.c_uint8),
++                ('b', ctypes.c_uint16),
++            ]
++        expected = np.dtype(dict(
++            names=['a', 'b'],
++            formats=[np.uint8, np.uint16],
++            offsets=[0, 0],
++            itemsize=2
++        ))
++        self.check(Union, expected)
++
+     @pytest.mark.xfail(reason="_pack_ is ignored - see gh-11651")
+     def test_packed_structure(self):
+         class PackedStructure(ctypes.Structure):

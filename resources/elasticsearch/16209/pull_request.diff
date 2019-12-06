@@ -1,0 +1,189 @@
+diff --git a/core/src/main/java/org/elasticsearch/index/shard/IndexShard.java b/core/src/main/java/org/elasticsearch/index/shard/IndexShard.java
+index 67addc0e2cbe..685f5b53b799 100644
+--- a/core/src/main/java/org/elasticsearch/index/shard/IndexShard.java
++++ b/core/src/main/java/org/elasticsearch/index/shard/IndexShard.java
+@@ -422,6 +422,7 @@ public IndexShardState recovering(String reason, RecoveryState.Type type, Restor
+ 
+     private IndexShardState recovering(String reason, RecoveryState recoveryState) throws IndexShardStartedException,
+             IndexShardRelocatedException, IndexShardRecoveringException, IndexShardClosedException {
++
+         synchronized (mutex) {
+             if (state == IndexShardState.CLOSED) {
+                 throw new IndexShardClosedException(shardId);
+@@ -505,7 +506,7 @@ private IndexShardState changeState(IndexShardState newState, String reason) {
+ 
+     public void create(Engine.Create create) {
+         ensureWriteAllowed(create);
+-        markLastWrite(create);
++        markLastWrite();
+         create = indexingService.preCreate(create);
+         try {
+             if (logger.isTraceEnabled()) {
+@@ -556,7 +557,7 @@ public void create(Engine.Create create) {
+      */
+     public boolean index(Engine.Index index) {
+         ensureWriteAllowed(index);
+-        markLastWrite(index);
++        markLastWrite();
+         index = indexingService.preIndex(index);
+         final boolean created;
+         try {
+@@ -594,7 +595,7 @@ public boolean index(Engine.Index index) {
+ 
+     public void delete(Engine.Delete delete) {
+         ensureWriteAllowed(delete);
+-        markLastWrite(delete);
++        markLastWrite();
+         delete = indexingService.preDelete(delete);
+         try {
+             if (logger.isTraceEnabled()) {
+@@ -878,9 +879,17 @@ public int performBatchRecovery(Iterable<Translog.Operation> operations) {
+         if (state != IndexShardState.RECOVERING) {
+             throw new IndexShardNotRecoveringException(shardId, state);
+         }
++
++        // This will activate our shard so we get our fair share of the indexing buffer during recovery:
++        markLastWrite();
++
+         return engineConfig.getTranslogRecoveryPerformer().performBatchRecovery(engine(), operations);
+     }
+ 
++    public ByteSizeValue getIndexingBufferSize() {
++        return engineConfig.getIndexingBufferSize();
++    }
++
+     /**
+      * After the store has been recovered, we need to start the engine in order to apply operations
+      */
+@@ -894,6 +903,7 @@ public int performBatchRecovery(Iterable<Translog.Operation> operations) {
+         if (state != IndexShardState.RECOVERING) {
+             throw new IndexShardNotRecoveringException(shardId, state);
+         }
++
+         recoveryState.setStage(RecoveryState.Stage.VERIFY_INDEX);
+         // also check here, before we apply the translog
+         if (Booleans.parseBoolean(checkIndexOnStartup, false)) {
+@@ -908,6 +918,10 @@ public int performBatchRecovery(Iterable<Translog.Operation> operations) {
+         // but we need to make sure we don't loose deletes until we are done recovering
+         engineConfig.setEnableGcDeletes(false);
+         engineConfig.setCreate(indexExists == false);
++        if (skipTranslogRecovery == false) {
++            // This will activate our shard so we get our fair share of the indexing buffer during recovery:
++            markLastWrite();
++        }
+         createNewEngine(skipTranslogRecovery, engineConfig);
+         return engineConfig.getTranslogRecoveryPerformer().getRecoveredTypes();
+     }
+@@ -980,19 +994,15 @@ public void readAllowed() throws IllegalIndexShardStateException {
+         }
+     }
+ 
+-    /** Returns timestamp of last indexing operation */
+-    public long getLastWriteNS() {
+-        return lastWriteNS;
+-    }
+-
+     /** Records timestamp of the last write operation, possibly switching {@code active} to true if we were inactive. */
+-    private void markLastWrite(Engine.Operation op) {
+-        lastWriteNS = op.startTime();
++    private void markLastWrite() {
++        lastWriteNS = System.nanoTime();
+         if (active.getAndSet(true) == false) {
+             // We are currently inactive, but a new write operation just showed up, so we now notify IMC
+             // to wake up and fix our indexing buffer.  We could do this async instead, but cost should
+             // be low, and it's rare this happens.
+             indexingMemoryController.forceCheck();
++            assert engineConfig.getIndexingBufferSize() != IndexingMemoryController.INACTIVE_SHARD_INDEXING_BUFFER || state == IndexShardState.CLOSED: "active=" + active + " state=" + state + " shard=" + shardId();
+         }
+     }
+ 
+@@ -1111,6 +1121,13 @@ public void updateBufferSize(ByteSizeValue shardIndexingBufferSize, ByteSizeValu
+      * if the shard is inactive.
+      */
+     public boolean checkIdle(long inactiveTimeNS) {
++
++        if (state == IndexShardState.RECOVERING) {
++            // Make sure during local translog replay, where the engine is replaying ops directly via the engine, bypassing our shard active
++            // logic here, that we still get our fair share of the total indexing buffer:
++            return false;
++        }
++
+         if (System.nanoTime() - lastWriteNS >= inactiveTimeNS) {
+             boolean wasActive = active.getAndSet(false);
+             if (wasActive) {
+diff --git a/core/src/test/java/org/elasticsearch/index/shard/IndexShardTests.java b/core/src/test/java/org/elasticsearch/index/shard/IndexShardTests.java
+index c46addc4e8a6..e2bfa474e4b5 100644
+--- a/core/src/test/java/org/elasticsearch/index/shard/IndexShardTests.java
++++ b/core/src/test/java/org/elasticsearch/index/shard/IndexShardTests.java
+@@ -68,6 +68,7 @@
+ import org.elasticsearch.index.translog.TranslogConfig;
+ import org.elasticsearch.index.translog.TranslogService;
+ import org.elasticsearch.indices.IndicesService;
++import org.elasticsearch.indices.memory.IndexingMemoryController;
+ import org.elasticsearch.indices.recovery.RecoveryState;
+ import org.elasticsearch.test.DummyShardLock;
+ import org.elasticsearch.test.ESSingleNodeTestCase;
+@@ -754,4 +755,63 @@ public void testFlushRescheduleOnEngineNotAvailable() throws IOException {
+         }
+         assertTrue(checker.maybeFlushAndReschedule());
+     }
++
++    public void testIndexingBufferDuringInternalRecovery() throws IOException {
++        createIndex("index");
++        client().admin().indices().preparePutMapping("index").setType("testtype").setSource(jsonBuilder().startObject()
++                .startObject("testtype")
++                .startObject("properties")
++                .startObject("foo")
++                .field("type", "string")
++                .endObject()
++                .endObject().endObject().endObject()).get();
++        ensureGreen();
++        IndicesService indicesService = getInstanceFromNode(IndicesService.class);
++        IndexService test = indicesService.indexService("index");
++        IndexShard shard = test.shard(0);
++        ShardRouting routing = new ShardRouting(shard.routingEntry());
++        test.removeShard(0, "b/c britta says so");
++        IndexShard newShard = test.createShard(routing);
++        DiscoveryNode localNode = new DiscoveryNode("foo", DummyTransportAddress.INSTANCE, Version.CURRENT);
++        newShard.recovering("for testing", RecoveryState.Type.REPLICA, localNode);
++        // Shard is still inactive since we haven't started recovering yet
++        assertEquals(IndexingMemoryController.INACTIVE_SHARD_INDEXING_BUFFER, newShard.getIndexingBufferSize());
++        newShard.prepareForIndexRecovery();
++        // Shard is still inactive since we haven't started recovering yet
++        assertEquals(IndexingMemoryController.INACTIVE_SHARD_INDEXING_BUFFER, newShard.getIndexingBufferSize());
++        newShard.performTranslogRecovery(true);
++        // Shard should now be active since we did recover:
++        assertNotEquals(IndexingMemoryController.INACTIVE_SHARD_INDEXING_BUFFER, newShard.getIndexingBufferSize());
++    }
++
++    public void testIndexingBufferDuringPeerRecovery() throws IOException {
++        createIndex("index");
++        client().admin().indices().preparePutMapping("index").setType("testtype").setSource(jsonBuilder().startObject()
++                .startObject("testtype")
++                .startObject("properties")
++                .startObject("foo")
++                .field("type", "string")
++                .endObject()
++                .endObject().endObject().endObject()).get();
++        ensureGreen();
++        IndicesService indicesService = getInstanceFromNode(IndicesService.class);
++        IndexService test = indicesService.indexService("index");
++        IndexShard shard = test.shard(0);
++        ShardRouting routing = new ShardRouting(shard.routingEntry());
++        test.removeShard(0, "b/c britta says so");
++        IndexShard newShard = test.createShard(routing);
++        DiscoveryNode localNode = new DiscoveryNode("foo", DummyTransportAddress.INSTANCE, Version.CURRENT);
++        newShard.recovering("for testing", RecoveryState.Type.REPLICA, localNode);
++        // Shard is still inactive since we haven't started recovering yet
++        assertEquals(IndexingMemoryController.INACTIVE_SHARD_INDEXING_BUFFER, newShard.getIndexingBufferSize());
++        List<Translog.Operation> operations = new ArrayList<>();
++        operations.add(new Translog.Index("testtype", "1", jsonBuilder().startObject().field("foo", "bar").endObject().bytes().toBytes()));
++        newShard.prepareForIndexRecovery();
++        newShard.skipTranslogRecovery();
++        // Shard is still inactive since we haven't started recovering yet
++        assertEquals(IndexingMemoryController.INACTIVE_SHARD_INDEXING_BUFFER, newShard.getIndexingBufferSize());
++        newShard.performBatchRecovery(operations);
++        // Shard should now be active since we did recover:
++        assertNotEquals(IndexingMemoryController.INACTIVE_SHARD_INDEXING_BUFFER, newShard.getIndexingBufferSize());
++    }
+ }

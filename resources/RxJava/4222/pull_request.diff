@@ -1,0 +1,324 @@
+diff --git a/src/main/java/io/reactivex/Flowable.java b/src/main/java/io/reactivex/Flowable.java
+index 927f2c8e2a..bce22ec231 100644
+--- a/src/main/java/io/reactivex/Flowable.java
++++ b/src/main/java/io/reactivex/Flowable.java
+@@ -3127,14 +3127,8 @@ public final void subscribe(Subscriber<? super T> s) {
+     @BackpressureSupport(BackpressureKind.PASS_THROUGH)
+     @SchedulerSupport(SchedulerSupport.CUSTOM)
+     public final Flowable<T> subscribeOn(Scheduler scheduler) {
+-        return subscribeOn(scheduler, true);
+-    }
+-
+-    @BackpressureSupport(BackpressureKind.PASS_THROUGH)
+-    @SchedulerSupport(SchedulerSupport.CUSTOM)
+-    public final Flowable<T> subscribeOn(Scheduler scheduler, boolean requestOn) {
+         Objects.requireNonNull(scheduler, "scheduler is null");
+-        return new FlowableSubscribeOn<T>(this, scheduler, requestOn);
++        return new FlowableSubscribeOn<T>(this, scheduler);
+     }
+ 
+     @BackpressureSupport(BackpressureKind.FULL)
+diff --git a/src/main/java/io/reactivex/internal/operators/flowable/FlowableSubscribeOn.java b/src/main/java/io/reactivex/internal/operators/flowable/FlowableSubscribeOn.java
+index 3153bbe0f3..68d634b146 100644
+--- a/src/main/java/io/reactivex/internal/operators/flowable/FlowableSubscribeOn.java
++++ b/src/main/java/io/reactivex/internal/operators/flowable/FlowableSubscribeOn.java
+@@ -13,67 +13,63 @@
+ 
+ package io.reactivex.internal.operators.flowable;
+ 
+-import java.util.concurrent.atomic.AtomicReference;
++import java.util.concurrent.atomic.*;
+ 
+ import org.reactivestreams.*;
+ 
+ import io.reactivex.*;
+ import io.reactivex.internal.subscriptions.SubscriptionHelper;
++import io.reactivex.internal.util.BackpressureHelper;
+ 
+ public final class FlowableSubscribeOn<T> extends Flowable<T> {
+     final Publisher<? extends T> source;
+     final Scheduler scheduler;
+-    final boolean requestOn;
+     
+-    public FlowableSubscribeOn(Publisher<? extends T> source, Scheduler scheduler, boolean requestOn) {
++    public FlowableSubscribeOn(Publisher<? extends T> source, Scheduler scheduler) {
+         this.source = source;
+         this.scheduler = scheduler;
+-        this.requestOn = requestOn;
+     }
+     
+     @Override
+     public void subscribeActual(final Subscriber<? super T> s) {
+-        /*
+-         * FIXME call onSubscribe first
+-         */
+-        if (requestOn) {
+-            Scheduler.Worker w = scheduler.createWorker();
+-            final SubscribeOnSubscriber<T> sos = new SubscribeOnSubscriber<T>(s, w);
+-            w.schedule(new Runnable() {
+-                @Override
+-                public void run() {
+-                    source.subscribe(sos);
+-                }
+-            });
+-        } else {
+-            scheduler.scheduleDirect(new Runnable() {
+-                @Override
+-                public void run() {
+-                    source.subscribe(s);
+-                }
+-            });
+-        }
++        Scheduler.Worker w = scheduler.createWorker();
++        final SubscribeOnSubscriber<T> sos = new SubscribeOnSubscriber<T>(s, w);
++        s.onSubscribe(sos);
++        
++        w.schedule(new Runnable() {
++            @Override
++            public void run() {
++                sos.lazySet(Thread.currentThread());
++                source.subscribe(sos);
++            }
++        });
+     }
+     
+-    static final class SubscribeOnSubscriber<T> extends AtomicReference<Thread> implements Subscriber<T>, Subscription {
++    static final class SubscribeOnSubscriber<T> extends AtomicReference<Thread>
++    implements Subscriber<T>, Subscription {
+         /** */
+         private static final long serialVersionUID = 8094547886072529208L;
+         final Subscriber<? super T> actual;
+         final Scheduler.Worker worker;
+         
+-        Subscription s;
++        final AtomicReference<Subscription> s;
++        
++        final AtomicLong requested;
+         
+         public SubscribeOnSubscriber(Subscriber<? super T> actual, Scheduler.Worker worker) {
+             this.actual = actual;
+             this.worker = worker;
++            this.s = new AtomicReference<Subscription>();
++            this.requested = new AtomicLong();
+         }
+         
+         @Override
+         public void onSubscribe(Subscription s) {
+-            if (SubscriptionHelper.validate(this.s, s)) {
+-                this.s = s;
+-                lazySet(Thread.currentThread());
+-                actual.onSubscribe(this);
++            if (SubscriptionHelper.setOnce(this.s, s)) {
++                long r = requested.getAndSet(0L);
++                if (r != 0L) {
++                    requestUpstream(r, s);
++                }
+             }
+         }
+         
+@@ -105,6 +101,23 @@ public void request(final long n) {
+             if (!SubscriptionHelper.validate(n)) {
+                 return;
+             }
++            Subscription s = this.s.get();
++            if (s != null) {
++                requestUpstream(n, s);
++            } else {
++                BackpressureHelper.add(requested, n);
++                s = this.s.get();
++                if (s != null) {
++                    long r = requested.getAndSet(0L);
++                    if (r != 0L) {
++                        requestUpstream(r, s);
++                    }
++                }
++                
++            }
++        }
++        
++        void requestUpstream(final long n, final Subscription s) {
+             if (Thread.currentThread() == get()) {
+                 s.request(n);
+             } else {
+@@ -119,7 +132,7 @@ public void run() {
+         
+         @Override
+         public void cancel() {
+-            s.cancel();
++            SubscriptionHelper.dispose(s);
+             worker.dispose();
+         }
+     }
+diff --git a/src/main/java/io/reactivex/internal/operators/observable/ObservableSubscribeOn.java b/src/main/java/io/reactivex/internal/operators/observable/ObservableSubscribeOn.java
+index 706e5f4956..3abd4c6b90 100644
+--- a/src/main/java/io/reactivex/internal/operators/observable/ObservableSubscribeOn.java
++++ b/src/main/java/io/reactivex/internal/operators/observable/ObservableSubscribeOn.java
+@@ -30,39 +30,33 @@ public ObservableSubscribeOn(Observable<? extends T> source, Scheduler scheduler
+     
+     @Override
+     public void subscribeActual(final Observer<? super T> s) {
+-        /*
+-         * TODO can't use the returned disposable because to dispose it,
+-         * one must set a Subscription on s on the current thread, but
+-         * it is expected that onSubscribe is run on the target scheduler.
+-         */
+-        scheduler.scheduleDirect(new Runnable() {
++        final SubscribeOnObserver<T> parent = new SubscribeOnObserver<T>(s);
++        
++        s.onSubscribe(parent);
++        
++        parent.setDisposable(scheduler.scheduleDirect(new Runnable() {
+             @Override
+             public void run() {
+-                source.subscribe(s);
++                source.subscribe(parent);
+             }
+-        });
++        }));
+     }
+     
+-    static final class SubscribeOnSubscriber<T> extends AtomicReference<Thread> implements Observer<T>, Disposable {
++    static final class SubscribeOnObserver<T> extends AtomicReference<Disposable> implements Observer<T>, Disposable {
+         /** */
+         private static final long serialVersionUID = 8094547886072529208L;
+         final Observer<? super T> actual;
+-        final Scheduler.Worker worker;
+         
+-        Disposable s;
++        final AtomicReference<Disposable> s;
+         
+-        public SubscribeOnSubscriber(Observer<? super T> actual, Scheduler.Worker worker) {
++        public SubscribeOnObserver(Observer<? super T> actual) {
+             this.actual = actual;
+-            this.worker = worker;
++            this.s = new AtomicReference<Disposable>();
+         }
+         
+         @Override
+         public void onSubscribe(Disposable s) {
+-            if (DisposableHelper.validate(this.s, s)) {
+-                this.s = s;
+-                lazySet(Thread.currentThread());
+-                actual.onSubscribe(this);
+-            }
++            DisposableHelper.setOnce(this.s, s);
+         }
+         
+         @Override
+@@ -72,31 +66,27 @@ public void onNext(T t) {
+         
+         @Override
+         public void onError(Throwable t) {
+-            try {
+-                actual.onError(t);
+-            } finally {
+-                worker.dispose();
+-            }
++            actual.onError(t);
+         }
+         
+         @Override
+         public void onComplete() {
+-            try {
+-                actual.onComplete();
+-            } finally {
+-                worker.dispose();
+-            }
++            actual.onComplete();
+         }
+         
+         @Override
+         public void dispose() {
+-            s.dispose();
+-            worker.dispose();
++            DisposableHelper.dispose(s);
++            DisposableHelper.dispose(this);
+         }
+ 
+         @Override
+         public boolean isDisposed() {
+-            return s.isDisposed();
++            return DisposableHelper.isDisposed(get());
++        }
++        
++        void setDisposable(Disposable d) {
++            DisposableHelper.setOnce(this, d);
+         }
+     }
+ }
+diff --git a/src/test/java/io/reactivex/internal/operators/flowable/FlowableSubscribeOnTest.java b/src/test/java/io/reactivex/internal/operators/flowable/FlowableSubscribeOnTest.java
+index 171d642ff6..5c2828d031 100644
+--- a/src/test/java/io/reactivex/internal/operators/flowable/FlowableSubscribeOnTest.java
++++ b/src/test/java/io/reactivex/internal/operators/flowable/FlowableSubscribeOnTest.java
+@@ -24,8 +24,8 @@
+ import io.reactivex.*;
+ import io.reactivex.Flowable.Operator;
+ import io.reactivex.disposables.Disposable;
+-import io.reactivex.internal.subscriptions.*;
+-import io.reactivex.schedulers.Schedulers;
++import io.reactivex.internal.subscriptions.BooleanSubscription;
++import io.reactivex.schedulers.*;
+ import io.reactivex.subscribers.*;
+ 
+ public class FlowableSubscribeOnTest {
+@@ -265,5 +265,20 @@ public void onNext(Integer t) {
+         ts.awaitTerminalEvent();
+         ts.assertNoErrors();
+     }
++    
++    @Test
++    public void cancelBeforeActualSubscribe() {
++        TestScheduler test = Schedulers.test();
++        
++        TestSubscriber<Integer> ts = Flowable.just(1).hide()
++                .subscribeOn(test).test(Long.MAX_VALUE, 0, true);
++        
++        test.advanceTimeBy(1, TimeUnit.SECONDS);
++        
++        ts
++        .assertSubscribed()
++        .assertNoValues()
++        .assertNotTerminated();
++    }
+ 
+ }
+\ No newline at end of file
+diff --git a/src/test/java/io/reactivex/internal/operators/observable/ObservableSubscribeOnTest.java b/src/test/java/io/reactivex/internal/operators/observable/ObservableSubscribeOnTest.java
+index d9ed5e55e3..69ed69d8de 100644
+--- a/src/test/java/io/reactivex/internal/operators/observable/ObservableSubscribeOnTest.java
++++ b/src/test/java/io/reactivex/internal/operators/observable/ObservableSubscribeOnTest.java
+@@ -24,7 +24,7 @@
+ import io.reactivex.disposables.*;
+ import io.reactivex.internal.disposables.EmptyDisposable;
+ import io.reactivex.observers.TestObserver;
+-import io.reactivex.schedulers.Schedulers;
++import io.reactivex.schedulers.*;
+ 
+ public class ObservableSubscribeOnTest {
+ 
+@@ -181,4 +181,24 @@ public void subscribe(Observer<? super Integer> sub) {
+         ts.assertValues(1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
+         assertEquals(10, count.get());
+     }
++    
++    @Test
++    public void cancelBeforeActualSubscribe() {
++        TestScheduler test = Schedulers.test();
++        
++        TestObserver<Integer> to = new TestObserver<Integer>();
++        
++        Observable.just(1).asObservable()
++                .subscribeOn(test).subscribe(to);
++        
++        to.dispose();
++        
++        test.advanceTimeBy(1, TimeUnit.SECONDS);
++        
++        to
++        .assertSubscribed()
++        .assertNoValues()
++        .assertNotTerminated();
++    }
++    
+ }
+\ No newline at end of file

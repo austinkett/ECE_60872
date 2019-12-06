@@ -1,0 +1,439 @@
+diff --git a/x-pack/plugin/deprecation/src/main/java/org/elasticsearch/xpack/deprecation/ClusterDeprecationChecks.java b/x-pack/plugin/deprecation/src/main/java/org/elasticsearch/xpack/deprecation/ClusterDeprecationChecks.java
+index 7ee27f1c2c40..78321f414ebc 100644
+--- a/x-pack/plugin/deprecation/src/main/java/org/elasticsearch/xpack/deprecation/ClusterDeprecationChecks.java
++++ b/x-pack/plugin/deprecation/src/main/java/org/elasticsearch/xpack/deprecation/ClusterDeprecationChecks.java
+@@ -6,20 +6,29 @@
+ 
+ package org.elasticsearch.xpack.deprecation;
+ 
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
+ import org.elasticsearch.cluster.ClusterState;
++import org.elasticsearch.cluster.metadata.MappingMetaData;
+ import org.elasticsearch.cluster.metadata.MetaData;
++import org.elasticsearch.index.IndexSettings;
+ import org.elasticsearch.ingest.IngestService;
+ import org.elasticsearch.ingest.PipelineConfiguration;
+ import org.elasticsearch.xpack.core.deprecation.DeprecationIssue;
+ 
++import java.io.IOException;
++import java.util.ArrayList;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Objects;
++import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.stream.Collectors;
+ 
+ import static org.elasticsearch.discovery.DiscoverySettings.NO_MASTER_BLOCK_SETTING;
++import static org.elasticsearch.search.SearchModule.INDICES_MAX_CLAUSE_COUNT_SETTING;
+ 
+ public class ClusterDeprecationChecks {
++    private static final Logger logger = LogManager.getLogger(ClusterDeprecationChecks.class);
+ 
+     static DeprecationIssue checkShardLimit(ClusterState state) {
+         int shardsPerNode = MetaData.SETTING_CLUSTER_MAX_SHARDS_PER_NODE.get(state.metaData().settings());
+@@ -92,4 +101,41 @@ static DeprecationIssue checkUserAgentPipelines(ClusterState state) {
+         return null;
+ 
+     }
++
++    static DeprecationIssue checkTemplatesWithTooManyFields(ClusterState state) {
++        Integer maxClauseCount = INDICES_MAX_CLAUSE_COUNT_SETTING.get(state.getMetaData().settings());
++        List<String> templatesOverLimit = new ArrayList<>();
++        state.getMetaData().getTemplates().forEach((templateCursor) -> {
++            AtomicInteger maxFields = new AtomicInteger(0);
++            String templateName = templateCursor.key;
++            boolean defaultFieldSet = templateCursor.value.getSettings().get(IndexSettings.DEFAULT_FIELD_SETTING_KEY) != null;
++            templateCursor.value.getMappings().forEach((mappingCursor) -> {
++                String mappingTypeName = mappingCursor.key;
++                MappingMetaData mappingMetaData = null;
++                try {
++                    mappingMetaData = new MappingMetaData(mappingCursor.value);
++                } catch (IOException e) {
++                    logger.error("failed to parse mapping for type {}: {}", mappingTypeName, e);
++                }
++                if (mappingMetaData != null && defaultFieldSet == false) {
++                    maxFields.set(IndexDeprecationChecks.countFieldsRecursively(mappingMetaData.type(), mappingMetaData.sourceAsMap()));
++                }
++                if (maxFields.get() > maxClauseCount) {
++                    templatesOverLimit.add(templateName);
++                }
++            });
++        });
++
++        if (templatesOverLimit.isEmpty() == false) {
++            return new DeprecationIssue(DeprecationIssue.Level.WARNING,
++                "Fields in index template exceed automatic field expansion limit",
++                "https://www.elastic.co/guide/en/elasticsearch/reference/7.0/breaking-changes-7.0.html" +
++                    "#_limiting_the_number_of_auto_expanded_fields",
++                "Index templates " + templatesOverLimit + " have a number of fields which exceeds the automatic field expansion " +
++                    "limit of [" + maxClauseCount + "] and does not have [" + IndexSettings.DEFAULT_FIELD_SETTING_KEY + "] set, which " +
++                    "may cause queries which use automatic field expansion, such as query_string, simple_query_string, and multi_match " +
++                    "to fail if fields are not explicitly specified in the query.");
++        }
++        return null;
++    }
+ }
+diff --git a/x-pack/plugin/deprecation/src/main/java/org/elasticsearch/xpack/deprecation/DeprecationChecks.java b/x-pack/plugin/deprecation/src/main/java/org/elasticsearch/xpack/deprecation/DeprecationChecks.java
+index b027bfb33d6b..29f444fea8dd 100644
+--- a/x-pack/plugin/deprecation/src/main/java/org/elasticsearch/xpack/deprecation/DeprecationChecks.java
++++ b/x-pack/plugin/deprecation/src/main/java/org/elasticsearch/xpack/deprecation/DeprecationChecks.java
+@@ -37,7 +37,8 @@ private DeprecationChecks() {
+             ClusterDeprecationChecks::checkUserAgentPipelines,
+             ClusterDeprecationChecks::checkShardLimit,
+             ClusterDeprecationChecks::checkNoMasterBlock,
+-            ClusterDeprecationChecks::checkClusterName
++            ClusterDeprecationChecks::checkClusterName,
++            ClusterDeprecationChecks::checkTemplatesWithTooManyFields
+         ));
+ 
+     static List<BiFunction<Settings, PluginsAndModules, DeprecationIssue>> NODE_SETTINGS_CHECKS =
+@@ -71,7 +72,8 @@ private DeprecationChecks() {
+ 			IndexDeprecationChecks::nodeLeftDelayedTimeCheck,
+             IndexDeprecationChecks::shardOnStartupCheck,
+             IndexDeprecationChecks::classicSimilarityMappingCheck,
+-            IndexDeprecationChecks::classicSimilaritySettingsCheck
++            IndexDeprecationChecks::classicSimilaritySettingsCheck,
++            IndexDeprecationChecks::tooManyFieldsCheck
+         ));
+ 
+     static List<BiFunction<DatafeedConfig, NamedXContentRegistry, DeprecationIssue>> ML_SETTINGS_CHECKS =
+diff --git a/x-pack/plugin/deprecation/src/main/java/org/elasticsearch/xpack/deprecation/IndexDeprecationChecks.java b/x-pack/plugin/deprecation/src/main/java/org/elasticsearch/xpack/deprecation/IndexDeprecationChecks.java
+index 1e9585f61498..87f1dd08c4af 100644
+--- a/x-pack/plugin/deprecation/src/main/java/org/elasticsearch/xpack/deprecation/IndexDeprecationChecks.java
++++ b/x-pack/plugin/deprecation/src/main/java/org/elasticsearch/xpack/deprecation/IndexDeprecationChecks.java
+@@ -21,6 +21,7 @@
+ import java.util.ArrayList;
+ import java.util.List;
+ import java.util.Map;
++import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.function.BiConsumer;
+ import java.util.function.Function;
+ import java.util.stream.Collectors;
+@@ -49,7 +50,7 @@ private static void fieldLevelMappingIssue(IndexMetaData indexMetaData, BiConsum
+      * @return a list of issues found in fields
+      */
+     @SuppressWarnings("unchecked")
+-    private static List<String> findInPropertiesRecursively(String type, Map<String, Object> parentMap,
++    static List<String> findInPropertiesRecursively(String type, Map<String, Object> parentMap,
+                                                     Function<Map<?,?>, Boolean> predicate) {
+         List<String> issues = new ArrayList<>();
+         Map<?, ?> properties = (Map<?, ?>) parentMap.get("properties");
+@@ -228,4 +229,66 @@ static DeprecationIssue shardOnStartupCheck(IndexMetaData indexMetaData) {
+         }
+         return null;
+     }
++
++    static DeprecationIssue tooManyFieldsCheck(IndexMetaData indexMetaData) {
++        if (indexMetaData.getSettings().get(IndexSettings.DEFAULT_FIELD_SETTING_KEY) == null) {
++            AtomicInteger fieldCount = new AtomicInteger(0);
++
++            fieldLevelMappingIssue(indexMetaData, ((mappingMetaData, sourceAsMap) -> {
++                fieldCount.addAndGet(countFieldsRecursively(mappingMetaData.type(), sourceAsMap));
++            }));
++
++            // We can't get to the setting `indices.query.bool.max_clause_count` from here, so just check the default of that setting.
++            // It's also much better practice to set `index.query.default_field` than `indices.query.bool.max_clause_count` - there's a
++            // reason we introduced the limit.
++            if (fieldCount.get() > 1024) {
++                return new DeprecationIssue(DeprecationIssue.Level.WARNING,
++                    "Number of fields exceeds automatic field expansion limit",
++                    "https://www.elastic.co/guide/en/elasticsearch/reference/7.0/breaking-changes-7.0.html" +
++                        "#_limiting_the_number_of_auto_expanded_fields",
++                    "This index has [" + fieldCount.get() + "] fields, which exceeds the automatic field expansion limit of 1024 " +
++                        "and does not have [" + IndexSettings.DEFAULT_FIELD_SETTING_KEY + "] set, which may cause queries which use " +
++                        "automatic field expansion, such as query_string, simple_query_string, and multi_match to fail if fields are not " +
++                        "explicitly specified in the query.");
++            }
++        }
++        return null;
++    }
++
++    /* Counts the number of fields in a mapping, designed to count the as closely as possible to
++     * org.elasticsearch.index.search.QueryParserHelper#checkForTooManyFields
++     */
++    @SuppressWarnings("unchecked")
++    static int countFieldsRecursively(String type, Map<String, Object> parentMap) {
++        int fields = 0;
++        Map<?, ?> properties = (Map<?, ?>) parentMap.get("properties");
++        if (properties == null) {
++            return fields;
++        }
++        for (Map.Entry<?, ?> entry : properties.entrySet()) {
++            Map<String, Object> valueMap = (Map<String, Object>) entry.getValue();
++            if (valueMap.containsKey("type")
++                && (valueMap.get("type").equals("object") && valueMap.containsKey("properties") == false) == false) {
++                fields++;
++            }
++
++            Map<?, ?> values = (Map<?, ?>) valueMap.get("fields");
++            if (values != null) {
++                for (Map.Entry<?, ?> multifieldEntry : values.entrySet()) {
++                    Map<String, Object> multifieldValueMap = (Map<String, Object>) multifieldEntry.getValue();
++                    if (multifieldValueMap.containsKey("type")) {
++                        fields++;
++                    }
++                    if (multifieldValueMap.containsKey("properties")) {
++                        fields += countFieldsRecursively(type, multifieldValueMap);
++                    }
++                }
++            }
++            if (valueMap.containsKey("properties")) {
++                fields += countFieldsRecursively(type, valueMap);
++            }
++        }
++
++        return fields;
++    }
+ }
+diff --git a/x-pack/plugin/deprecation/src/test/java/org/elasticsearch/xpack/deprecation/ClusterDeprecationChecksTests.java b/x-pack/plugin/deprecation/src/test/java/org/elasticsearch/xpack/deprecation/ClusterDeprecationChecksTests.java
+index cc5d80a064a5..afde4514d631 100644
+--- a/x-pack/plugin/deprecation/src/test/java/org/elasticsearch/xpack/deprecation/ClusterDeprecationChecksTests.java
++++ b/x-pack/plugin/deprecation/src/test/java/org/elasticsearch/xpack/deprecation/ClusterDeprecationChecksTests.java
+@@ -10,22 +10,30 @@
+ import org.elasticsearch.cluster.ClusterName;
+ import org.elasticsearch.cluster.ClusterState;
+ import org.elasticsearch.cluster.metadata.IndexMetaData;
++import org.elasticsearch.cluster.metadata.IndexTemplateMetaData;
+ import org.elasticsearch.cluster.metadata.MetaData;
+ import org.elasticsearch.cluster.node.DiscoveryNode;
+ import org.elasticsearch.cluster.node.DiscoveryNodes;
++import org.elasticsearch.common.Strings;
+ import org.elasticsearch.common.bytes.BytesArray;
+ import org.elasticsearch.common.settings.Settings;
+ import org.elasticsearch.common.transport.TransportAddress;
++import org.elasticsearch.common.xcontent.XContentBuilder;
+ import org.elasticsearch.common.xcontent.XContentType;
++import org.elasticsearch.index.IndexSettings;
+ import org.elasticsearch.ingest.IngestService;
+ import org.elasticsearch.test.ESTestCase;
+ import org.elasticsearch.xpack.core.deprecation.DeprecationIssue;
+ 
++import java.io.IOException;
++import java.util.Collections;
+ import java.util.List;
+ 
+ import static java.util.Collections.singletonList;
++import static org.elasticsearch.common.xcontent.XContentFactory.jsonBuilder;
+ import static org.elasticsearch.discovery.DiscoverySettings.NO_MASTER_BLOCK_SETTING;
+ import static org.elasticsearch.xpack.deprecation.DeprecationChecks.CLUSTER_SETTINGS_CHECKS;
++import static org.elasticsearch.xpack.deprecation.IndexDeprecationChecksTests.addRandomFields;
+ 
+ public class ClusterDeprecationChecksTests extends ESTestCase {
+ 
+@@ -160,4 +168,76 @@ public void testUserAgentEcsCheck() {
+             "Ingest pipelines [ecs_null] will change to using ECS output format by default in 7.0");
+         assertEquals(singletonList(expected), issues);
+     }
++
++    public void testTemplateWithTooManyFields() throws IOException {
++        String tooManyFieldsTemplate = randomAlphaOfLength(5);
++        String tooManyFieldsWithDefaultFieldsTemplate = randomAlphaOfLength(6);
++        String goodTemplateName = randomAlphaOfLength(7);
++
++        // A template with too many fields
++        int tooHighFieldCount = randomIntBetween(1025, 10_000); // 10_000 is arbitrary
++        XContentBuilder badMappingBuilder = jsonBuilder();
++        badMappingBuilder.startObject();
++        {
++            badMappingBuilder.startObject("_doc");
++            {
++                badMappingBuilder.startObject("properties");
++                {
++                    addRandomFields(tooHighFieldCount, badMappingBuilder);
++                }
++                badMappingBuilder.endObject();
++            }
++            badMappingBuilder.endObject();
++        }
++        badMappingBuilder.endObject();
++
++        // A template with an OK number of fields
++        int okFieldCount = randomIntBetween(1, 1024);
++        XContentBuilder goodMappingBuilder = jsonBuilder();
++        goodMappingBuilder.startObject();
++        {
++            goodMappingBuilder.startObject("_doc");
++            {
++                goodMappingBuilder.startObject("properties");
++                {
++                    addRandomFields(okFieldCount, goodMappingBuilder);
++                }
++                goodMappingBuilder.endObject();
++            }
++            goodMappingBuilder.endObject();
++        }
++        goodMappingBuilder.endObject();
++
++        final ClusterState state = ClusterState.builder(new ClusterName(randomAlphaOfLength(5)))
++            .metaData(MetaData.builder()
++                .put(IndexTemplateMetaData.builder(tooManyFieldsTemplate)
++                    .patterns(Collections.singletonList(randomAlphaOfLength(5)))
++                    .putMapping("_doc", Strings.toString(badMappingBuilder))
++                    .build())
++                .put(IndexTemplateMetaData.builder(tooManyFieldsWithDefaultFieldsTemplate)
++                    .patterns(Collections.singletonList(randomAlphaOfLength(5)))
++                    .putMapping("_doc", Strings.toString(badMappingBuilder))
++                    .settings(Settings.builder()
++                        .put(IndexSettings.DEFAULT_FIELD_SETTING_KEY,
++                            Collections.singletonList(randomAlphaOfLength(5)).toString()))
++                    .build())
++                .put(IndexTemplateMetaData.builder(goodTemplateName)
++                    .patterns(Collections.singletonList(randomAlphaOfLength(5)))
++                    .putMapping("_doc", Strings.toString(goodMappingBuilder))
++                    .build())
++                .build())
++            .build();
++
++        List<DeprecationIssue> issues = DeprecationChecks.filterChecks(CLUSTER_SETTINGS_CHECKS, c -> c.apply(state));
++
++        DeprecationIssue expected = new DeprecationIssue(DeprecationIssue.Level.WARNING,
++            "Fields in index template exceed automatic field expansion limit",
++            "https://www.elastic.co/guide/en/elasticsearch/reference/7.0/breaking-changes-7.0.html" +
++                "#_limiting_the_number_of_auto_expanded_fields",
++            "Index templates " + Collections.singletonList(tooManyFieldsTemplate) + " have a number of fields which exceeds the " +
++                "automatic field expansion limit of [1024] and does not have [" + IndexSettings.DEFAULT_FIELD_SETTING_KEY + "] set, " +
++                "which may cause queries which use automatic field expansion, such as query_string, simple_query_string, and multi_match " +
++                "to fail if fields are not explicitly specified in the query.");
++        assertEquals(singletonList(expected), issues);
++    }
+ }
+diff --git a/x-pack/plugin/deprecation/src/test/java/org/elasticsearch/xpack/deprecation/IndexDeprecationChecksTests.java b/x-pack/plugin/deprecation/src/test/java/org/elasticsearch/xpack/deprecation/IndexDeprecationChecksTests.java
+index c39f2a2bad15..300e20a2a055 100644
+--- a/x-pack/plugin/deprecation/src/test/java/org/elasticsearch/xpack/deprecation/IndexDeprecationChecksTests.java
++++ b/x-pack/plugin/deprecation/src/test/java/org/elasticsearch/xpack/deprecation/IndexDeprecationChecksTests.java
+@@ -8,7 +8,9 @@
+ import org.elasticsearch.Version;
+ import org.elasticsearch.cluster.metadata.IndexMetaData;
+ import org.elasticsearch.cluster.routing.UnassignedInfo;
++import org.elasticsearch.common.Strings;
+ import org.elasticsearch.common.settings.Settings;
++import org.elasticsearch.common.xcontent.XContentBuilder;
+ import org.elasticsearch.index.IndexSettings;
+ import org.elasticsearch.test.ESTestCase;
+ import org.elasticsearch.test.VersionUtils;
+@@ -16,10 +18,13 @@
+ import org.elasticsearch.xpack.core.deprecation.DeprecationIssue;
+ 
+ import java.io.IOException;
++import java.util.ArrayList;
+ import java.util.List;
+ import java.util.Locale;
++import java.util.concurrent.atomic.AtomicInteger;
+ 
+ import static java.util.Collections.singletonList;
++import static org.elasticsearch.common.xcontent.XContentFactory.jsonBuilder;
+ import static org.elasticsearch.index.mapper.MapperService.DEFAULT_MAPPING;
+ import static org.elasticsearch.xpack.deprecation.DeprecationChecks.INDEX_SETTINGS_CHECKS;
+ import static org.hamcrest.Matchers.allOf;
+@@ -341,4 +346,110 @@ public void testShardOnStartupCheck() {
+         List<DeprecationIssue> noIssues = DeprecationChecks.filterChecks(INDEX_SETTINGS_CHECKS, c -> c.apply(goodIndex));
+         assertTrue(noIssues.isEmpty());
+     }
++
++    public void testTooManyFieldsCheck() throws IOException {
++        String simpleMapping = "{\n" +
++            "  \"properties\": {\n" +
++            "    \"some_field\": {\n" +
++            "      \"type\": \"text\"\n" +
++            "    },\n" +
++            "    \"other_field\": {\n" +
++            "      \"type\": \"text\",\n" +
++            "      \"properties\": {\n" +
++            "        \"raw\": {\"type\": \"keyword\"}\n" +
++            "      }\n" +
++            "    }\n" +
++            "  }\n" +
++            "}";
++
++        IndexMetaData simpleIndex = IndexMetaData.builder(randomAlphaOfLengthBetween(5,10))
++            .settings(settings(
++                VersionUtils.randomVersionBetween(random(), Version.V_6_0_0, VersionUtils.getPreviousVersion(Version.CURRENT))))
++            .numberOfShards(randomIntBetween(1,100))
++            .numberOfReplicas(randomIntBetween(1, 100))
++            .putMapping("_doc", simpleMapping)
++            .build();
++        List<DeprecationIssue> noIssues = DeprecationChecks.filterChecks(INDEX_SETTINGS_CHECKS, c -> c.apply(simpleIndex));
++        assertEquals(0, noIssues.size());
++
++        // Test that it catches having too many fields
++        int fieldCount = randomIntBetween(1025, 10_000); // 10_000 is arbitrary
++
++        XContentBuilder mappingBuilder = jsonBuilder();
++        mappingBuilder.startObject();
++        {
++            mappingBuilder.startObject("properties");
++            {
++                addRandomFields(fieldCount, mappingBuilder);
++            }
++            mappingBuilder.endObject();
++        }
++        mappingBuilder.endObject();
++
++        IndexMetaData tooManyFieldsIndex = IndexMetaData.builder(randomAlphaOfLengthBetween(5,10))
++            .settings(settings(
++                VersionUtils.randomVersionBetween(random(), Version.V_6_0_0, VersionUtils.getPreviousVersion(Version.CURRENT))))
++            .numberOfShards(randomIntBetween(1,100))
++            .numberOfReplicas(randomIntBetween(1, 100))
++            .putMapping("_doc", Strings.toString(mappingBuilder))
++            .build();
++        DeprecationIssue expected = new DeprecationIssue(DeprecationIssue.Level.WARNING,
++            "Number of fields exceeds automatic field expansion limit",
++            "https://www.elastic.co/guide/en/elasticsearch/reference/7.0/breaking-changes-7.0.html" +
++                "#_limiting_the_number_of_auto_expanded_fields",
++            "This index has [" + fieldCount + "] fields, which exceeds the automatic field expansion limit of 1024 " +
++                "and does not have [" + IndexSettings.DEFAULT_FIELD_SETTING_KEY + "] set, which may cause queries which use " +
++                "automatic field expansion, such as query_string, simple_query_string, and multi_match to fail if fields are not " +
++                "explicitly specified in the query.");
++        List<DeprecationIssue> issues = DeprecationChecks.filterChecks(INDEX_SETTINGS_CHECKS, c -> c.apply(tooManyFieldsIndex));
++        assertEquals(singletonList(expected), issues);
++
++        // Check that it's okay to  have too many fields as long as `index.query.default_field` is set
++        IndexMetaData tooManyFieldsOk = IndexMetaData.builder(randomAlphaOfLengthBetween(5,10))
++            .settings(settings(
++                VersionUtils.randomVersionBetween(random(), Version.V_6_0_0, VersionUtils.getPreviousVersion(Version.CURRENT)))
++                .put(IndexSettings.DEFAULT_FIELD_SETTING_KEY, randomAlphaOfLength(5)))
++            .numberOfShards(randomIntBetween(1,100))
++            .numberOfReplicas(randomIntBetween(1, 100))
++            .putMapping("_doc", Strings.toString(mappingBuilder))
++            .build();
++        List<DeprecationIssue> withDefaultFieldIssues =
++            DeprecationChecks.filterChecks(INDEX_SETTINGS_CHECKS, c -> c.apply(tooManyFieldsOk));
++        assertEquals(0, withDefaultFieldIssues.size());
++    }
++
++    static void addRandomFields(final int fieldLimit,
++                                        XContentBuilder mappingBuilder) throws IOException {
++        AtomicInteger fieldCount = new AtomicInteger(0);
++        List<String> existingFieldNames = new ArrayList<>();
++        while (fieldCount.get() < fieldLimit) {
++            addRandomField(existingFieldNames, fieldLimit, mappingBuilder, fieldCount);
++        }
++    }
++
++    private static void addRandomField(List<String> existingFieldNames, final int fieldLimit,
++                                       XContentBuilder mappingBuilder, AtomicInteger fieldCount) throws IOException {
++        if (fieldCount.get() > fieldLimit) {
++            return;
++        }
++        String newField = randomValueOtherThanMany(existingFieldNames::contains, () -> randomAlphaOfLengthBetween(2,20));
++        existingFieldNames.add(newField);
++        mappingBuilder.startObject(newField);
++        {
++            if (rarely()) {
++                mappingBuilder.startObject("properties");
++                {
++                    int subfields = randomIntBetween(1,10);
++                    while (existingFieldNames.size() < subfields) {
++                        addRandomField(existingFieldNames, fieldLimit, mappingBuilder, fieldCount);
++                    }
++                }
++                mappingBuilder.endObject();
++            } else {
++                mappingBuilder.field("type", randomFrom("array", "binary", "range", "boolean", "date", "ip", "keyword", "text"));
++                fieldCount.incrementAndGet();
++            }
++        }
++        mappingBuilder.endObject();
++    }
+ }

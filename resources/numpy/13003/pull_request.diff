@@ -1,0 +1,207 @@
+diff --git a/numpy/core/src/multiarray/descriptor.c b/numpy/core/src/multiarray/descriptor.c
+index b6d33a74a3d..cc1ff43b8d1 100644
+--- a/numpy/core/src/multiarray/descriptor.c
++++ b/numpy/core/src/multiarray/descriptor.c
+@@ -77,31 +77,51 @@ _arraydescr_from_ctypes_type(PyTypeObject *type)
+  * and it can be converted to a dtype object.
+  *
+  * Returns a new reference to a dtype object, or NULL
+- * if this is not possible. When it returns NULL, it does
+- * not set a Python exception.
++ * if this is not possible.
++ * When the return value is true, the dtype attribute should have been used
++ * and parsed. Currently the only failure mode for a 1 return is a
++ * RecursionError and the descriptor is set to NULL.
++ * When the return value is false, no error will be set.
+  */
+-NPY_NO_EXPORT PyArray_Descr *
+-_arraydescr_from_dtype_attr(PyObject *obj)
++int
++_arraydescr_from_dtype_attr(PyObject *obj, PyArray_Descr **newdescr)
+ {
+     PyObject *dtypedescr;
+-    PyArray_Descr *newdescr = NULL;
+     int ret;
+ 
+     /* For arbitrary objects that have a "dtype" attribute */
+     dtypedescr = PyObject_GetAttrString(obj, "dtype");
+-    PyErr_Clear();
+     if (dtypedescr == NULL) {
+-        return NULL;
++        /*
++         * This can be reached due to recursion limit being hit while fetching
++         * the attribute (tested for py3.7). This removes the custom message.
++         */
++        goto fail;
+     }
+ 
+-    ret = PyArray_DescrConverter(dtypedescr, &newdescr);
++    if (Py_EnterRecursiveCall(
++            " while trying to convert the given data type from its "
++            "`.dtype` attribute.") != 0) {
++        return 1;
++    }
++
++    ret = PyArray_DescrConverter(dtypedescr, newdescr);
++
+     Py_DECREF(dtypedescr);
++    Py_LeaveRecursiveCall();
+     if (ret != NPY_SUCCEED) {
+-        PyErr_Clear();
+-        return NULL;
++        goto fail;
+     }
+ 
+-    return newdescr;
++    return 1;
++
++  fail:
++    /* Ignore all but recursion errors, to give ctypes a full try. */
++    if (!PyErr_ExceptionMatches(PyExc_RecursionError)) {
++        PyErr_Clear();
++        return 0;
++    }
++    return 1;
+ }
+ 
+ /*
+@@ -1412,11 +1432,16 @@ PyArray_DescrConverter(PyObject *obj, PyArray_Descr **at)
+             check_num = NPY_VOID;
+         }
+         else {
+-            *at = _arraydescr_from_dtype_attr(obj);
+-            if (*at) {
++            if (_arraydescr_from_dtype_attr(obj, at)) {
++                /*
++                 * Using dtype attribute, *at may be NULL if a
++                 * RecursionError occurred.
++                 */
++                if (*at == NULL) {
++                    goto error;
++                }
+                 return NPY_SUCCEED;
+             }
+-
+             /*
+              * Note: this comes after _arraydescr_from_dtype_attr because the ctypes
+              * type might override the dtype if numpy does not otherwise
+@@ -1595,14 +1620,16 @@ PyArray_DescrConverter(PyObject *obj, PyArray_Descr **at)
+         goto fail;
+     }
+     else {
+-        *at = _arraydescr_from_dtype_attr(obj);
+-        if (*at) {
++        if (_arraydescr_from_dtype_attr(obj, at)) {
++            /*
++             * Using dtype attribute, *at may be NULL if a
++             * RecursionError occurred.
++             */
++            if (*at == NULL) {
++                goto error;
++            }
+             return NPY_SUCCEED;
+         }
+-        if (PyErr_Occurred()) {
+-            return NPY_FAIL;
+-        }
+-
+         /*
+          * Note: this comes after _arraydescr_from_dtype_attr because the ctypes
+          * type might override the dtype if numpy does not otherwise
+diff --git a/numpy/core/src/multiarray/descriptor.h b/numpy/core/src/multiarray/descriptor.h
+index a5f3b8cdf1f..d08624cffe2 100644
+--- a/numpy/core/src/multiarray/descriptor.h
++++ b/numpy/core/src/multiarray/descriptor.h
+@@ -7,8 +7,8 @@ NPY_NO_EXPORT PyObject *arraydescr_protocol_descr_get(PyArray_Descr *self);
+ NPY_NO_EXPORT PyObject *
+ array_set_typeDict(PyObject *NPY_UNUSED(ignored), PyObject *args);
+ 
+-NPY_NO_EXPORT PyArray_Descr *
+-_arraydescr_from_dtype_attr(PyObject *obj);
++int
++_arraydescr_from_dtype_attr(PyObject *obj, PyArray_Descr **newdescr);
+ 
+ 
+ NPY_NO_EXPORT int
+diff --git a/numpy/core/src/multiarray/scalarapi.c b/numpy/core/src/multiarray/scalarapi.c
+index bc435d1ca43..2953bfc41f4 100644
+--- a/numpy/core/src/multiarray/scalarapi.c
++++ b/numpy/core/src/multiarray/scalarapi.c
+@@ -471,12 +471,18 @@ PyArray_DescrFromTypeObject(PyObject *type)
+     /* Do special thing for VOID sub-types */
+     if (PyType_IsSubtype((PyTypeObject *)type, &PyVoidArrType_Type)) {
+         new = PyArray_DescrNewFromType(NPY_VOID);
+-        conv = _arraydescr_from_dtype_attr(type);
+-        if (conv) {
++        if (new == NULL) {
++            return NULL;
++        }
++        if (_arraydescr_from_dtype_attr(type, &conv)) {
++            if (conv == NULL) {
++                Py_DECREF(new);
++                return NULL;
++            }
+             new->fields = conv->fields;
+-            Py_INCREF(new->fields);
++            Py_XINCREF(new->fields);
+             new->names = conv->names;
+-            Py_INCREF(new->names);
++            Py_XINCREF(new->names);
+             new->elsize = conv->elsize;
+             new->subarray = conv->subarray;
+             conv->subarray = NULL;
+diff --git a/numpy/core/tests/test_dtype.py b/numpy/core/tests/test_dtype.py
+index a38de0a46a7..89710c3cac5 100644
+--- a/numpy/core/tests/test_dtype.py
++++ b/numpy/core/tests/test_dtype.py
+@@ -939,6 +939,50 @@ def test_invalid_dtype_string():
+     assert_raises(TypeError, np.dtype, u'Fl\xfcgel')
+ 
+ 
++class TestFromDTypeAttribute(object):
++    def test_simple(self):
++        class dt:
++            dtype = "f8"
++
++        assert np.dtype(dt) == np.float64
++        assert np.dtype(dt()) == np.float64
++
++    def test_recursion(self):
++        class dt:
++            pass
++
++        dt.dtype = dt
++        with pytest.raises(RecursionError):
++            np.dtype(dt)
++
++        dt_instance = dt()
++        dt_instance.dtype = dt
++        with pytest.raises(RecursionError):
++            np.dtype(dt_instance)
++
++    def test_void_subtype(self):
++        class dt(np.void):
++            # This code path is fully untested before, so it is unclear
++            # what this should be useful for. Note that if np.void is used
++            # numpy will think we are deallocating a base type [1.17, 2019-02].
++            dtype = np.dtype("f,f")
++            pass
++
++        np.dtype(dt)
++        np.dtype(dt(1))
++
++    def test_void_subtype_recursion(self):
++        class dt(np.void):
++            pass
++
++        dt.dtype = dt
++
++        with pytest.raises(RecursionError):
++            np.dtype(dt)
++
++        with pytest.raises(RecursionError):
++            np.dtype(dt(1))
++
+ class TestFromCTypes(object):
+ 
+     @staticmethod

@@ -1,0 +1,197 @@
+diff --git a/modules/percolator/src/main/java/org/elasticsearch/percolator/PercolatorFieldMapper.java b/modules/percolator/src/main/java/org/elasticsearch/percolator/PercolatorFieldMapper.java
+index 581c6fd49428..6ac073ef90a0 100644
+--- a/modules/percolator/src/main/java/org/elasticsearch/percolator/PercolatorFieldMapper.java
++++ b/modules/percolator/src/main/java/org/elasticsearch/percolator/PercolatorFieldMapper.java
+@@ -409,7 +409,15 @@ public void parse(ParseContext context) throws IOException {
+ 
+         Version indexVersion = context.mapperService().getIndexSettings().getIndexVersionCreated();
+         createQueryBuilderField(indexVersion, queryBuilderField, queryBuilder, context);
+-        Query query = toQuery(queryShardContext, isMapUnmappedFieldAsText(), queryBuilder);
++
++        QueryBuilder queryBuilderForProcessing = queryBuilder.rewrite(new QueryShardContext(queryShardContext) {
++
++            @Override
++            public boolean convertNowRangeToMatchAll() {
++                return true;
++            }
++        });
++        Query query = toQuery(queryShardContext, isMapUnmappedFieldAsText(), queryBuilderForProcessing);
+         processQuery(query, context);
+     }
+ 
+diff --git a/modules/percolator/src/test/java/org/elasticsearch/percolator/PercolatorQuerySearchTests.java b/modules/percolator/src/test/java/org/elasticsearch/percolator/PercolatorQuerySearchTests.java
+index b7693f514393..90c456fee9a6 100644
+--- a/modules/percolator/src/test/java/org/elasticsearch/percolator/PercolatorQuerySearchTests.java
++++ b/modules/percolator/src/test/java/org/elasticsearch/percolator/PercolatorQuerySearchTests.java
+@@ -18,6 +18,8 @@
+  */
+ package org.elasticsearch.percolator;
+ 
++import org.apache.lucene.search.IndexSearcher;
++import org.apache.lucene.search.Query;
+ import org.apache.lucene.search.join.ScoreMode;
+ import org.elasticsearch.action.search.SearchResponse;
+ import org.elasticsearch.action.support.WriteRequest;
+@@ -26,10 +28,14 @@
+ import org.elasticsearch.common.xcontent.XContentBuilder;
+ import org.elasticsearch.common.xcontent.XContentFactory;
+ import org.elasticsearch.common.xcontent.XContentType;
++import org.elasticsearch.index.IndexService;
+ import org.elasticsearch.index.cache.bitset.BitsetFilterCache;
++import org.elasticsearch.index.engine.Engine;
+ import org.elasticsearch.index.fielddata.ScriptDocValues;
+ import org.elasticsearch.index.query.Operator;
++import org.elasticsearch.index.query.QueryBuilder;
+ import org.elasticsearch.index.query.QueryBuilders;
++import org.elasticsearch.index.query.QueryShardContext;
+ import org.elasticsearch.plugins.Plugin;
+ import org.elasticsearch.script.MockScriptPlugin;
+ import org.elasticsearch.script.Script;
+@@ -47,9 +53,14 @@
+ import java.util.function.Function;
+ 
+ import static org.elasticsearch.common.xcontent.XContentFactory.jsonBuilder;
++import static org.elasticsearch.index.query.QueryBuilders.boolQuery;
+ import static org.elasticsearch.index.query.QueryBuilders.matchQuery;
++import static org.elasticsearch.index.query.QueryBuilders.rangeQuery;
++import static org.elasticsearch.index.query.QueryBuilders.scriptQuery;
++import static org.elasticsearch.index.query.QueryBuilders.termQuery;
+ import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertHitCount;
+ import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertSearchHits;
++import static org.hamcrest.Matchers.equalTo;
+ 
+ public class PercolatorQuerySearchTests extends ESSingleNodeTestCase {
+ 
+@@ -221,4 +232,53 @@ public void testMapUnmappedFieldAsText() throws IOException {
+         assertSearchHits(response, "1");
+     }
+ 
++    public void testRangeQueriesWithNow() throws Exception {
++        IndexService indexService = createIndex("test", Settings.builder().put("index.number_of_shards", 1).build(), "_doc",
++            "field1", "type=keyword", "field2", "type=date", "query", "type=percolator");
++
++        client().prepareIndex("test", "_doc", "1")
++            .setSource(jsonBuilder().startObject().field("query", rangeQuery("field2").from("now-1h").to("now+1h")).endObject())
++            .get();
++        client().prepareIndex("test", "_doc", "2")
++            .setSource(jsonBuilder().startObject().field("query", boolQuery()
++                .filter(termQuery("field1", "value"))
++                .filter(rangeQuery("field2").from("now-1h").to("now+1h"))
++            ).endObject())
++            .get();
++
++
++        Script script = new Script(ScriptType.INLINE, MockScriptPlugin.NAME, "1==1", Collections.emptyMap());
++        client().prepareIndex("test", "_doc", "3")
++            .setSource(jsonBuilder().startObject().field("query", boolQuery()
++                .filter(scriptQuery(script))
++                .filter(rangeQuery("field2").from("now-1h").to("now+1h"))
++            ).endObject())
++            .get();
++        client().admin().indices().prepareRefresh().get();
++
++        try (Engine.Searcher engineSearcher = indexService.getShard(0).acquireSearcher("test")) {
++            IndexSearcher indexSearcher = engineSearcher.searcher();
++            long[] currentTime = new long[] {System.currentTimeMillis()};
++            QueryShardContext queryShardContext =
++                indexService.newQueryShardContext(0, engineSearcher.reader(), () -> currentTime[0], null);
++
++            BytesReference source = BytesReference.bytes(jsonBuilder().startObject()
++                .field("field1", "value")
++                .field("field2", currentTime[0])
++                .endObject());
++            QueryBuilder queryBuilder = new PercolateQueryBuilder("query", source, XContentType.JSON);
++            Query query = queryBuilder.toQuery(queryShardContext);
++            assertThat(indexSearcher.count(query), equalTo(3));
++
++            currentTime[0] = currentTime[0] + 10800000; // + 3 hours
++            source = BytesReference.bytes(jsonBuilder().startObject()
++                .field("field1", "value")
++                .field("field2", currentTime[0])
++                .endObject());
++            queryBuilder = new PercolateQueryBuilder("query", source, XContentType.JSON);
++            query = queryBuilder.toQuery(queryShardContext);
++            assertThat(indexSearcher.count(query), equalTo(3));
++        }
++    }
++
+ }
+diff --git a/server/src/main/java/org/elasticsearch/index/query/QueryRewriteContext.java b/server/src/main/java/org/elasticsearch/index/query/QueryRewriteContext.java
+index baf60bbbc091..b275088d8944 100644
+--- a/server/src/main/java/org/elasticsearch/index/query/QueryRewriteContext.java
++++ b/server/src/main/java/org/elasticsearch/index/query/QueryRewriteContext.java
+@@ -124,4 +124,15 @@ public void onFailure(Exception e) {
+         }
+     }
+ 
++    /**
++     * In pre-processing contexts that happen at index time 'now' date ranges should be replaced by a {@link MatchAllQueryBuilder}.
++     * Otherwise documents that should match at query time would never match and the document that have fallen outside the
++     * date range would continue to match.
++     *
++     * @return indicates whether range queries with date ranges using 'now' are rewritten to a {@link MatchAllQueryBuilder}.
++     */
++    public boolean convertNowRangeToMatchAll() {
++        return false;
++    }
++
+ }
+diff --git a/server/src/main/java/org/elasticsearch/index/query/RangeQueryBuilder.java b/server/src/main/java/org/elasticsearch/index/query/RangeQueryBuilder.java
+index 756c6456a9f1..6b8a47e8ce23 100644
+--- a/server/src/main/java/org/elasticsearch/index/query/RangeQueryBuilder.java
++++ b/server/src/main/java/org/elasticsearch/index/query/RangeQueryBuilder.java
+@@ -459,6 +459,16 @@ public String getWriteableName() {
+ 
+     @Override
+     protected QueryBuilder doRewrite(QueryRewriteContext queryRewriteContext) throws IOException {
++        // Percolator queries get rewritten and pre-processed at index time.
++        // If a range query has a date range using 'now' and 'now' gets resolved at index time then
++        // the pre-processing uses that to pre-process. This can then lead to mismatches at query time.
++        if (queryRewriteContext.convertNowRangeToMatchAll()) {
++            if ((from() != null && from().toString().contains("now")) ||
++                (to() != null && to().toString().contains("now"))) {
++                return new MatchAllQueryBuilder();
++            }
++        }
++
+         final MappedFieldType.Relation relation = getRelation(queryRewriteContext);
+         switch (relation) {
+         case DISJOINT:
+diff --git a/server/src/test/java/org/elasticsearch/index/query/RangeQueryBuilderTests.java b/server/src/test/java/org/elasticsearch/index/query/RangeQueryBuilderTests.java
+index 1fe157255b6b..28349994c63e 100644
+--- a/server/src/test/java/org/elasticsearch/index/query/RangeQueryBuilderTests.java
++++ b/server/src/test/java/org/elasticsearch/index/query/RangeQueryBuilderTests.java
+@@ -563,4 +563,33 @@ public void testParseRelation() {
+         builder.relation("intersects");
+         assertEquals(ShapeRelation.INTERSECTS, builder.relation());
+     }
++
++    public void testConvertNowRangeToMatchAll() throws IOException {
++        RangeQueryBuilder query = new RangeQueryBuilder(DATE_FIELD_NAME);
++        DateTime queryFromValue = new DateTime(2019, 1, 1, 0, 0, 0, ISOChronology.getInstanceUTC());
++        DateTime queryToValue = new DateTime(2020, 1, 1, 0, 0, 0, ISOChronology.getInstanceUTC());
++        if (randomBoolean()) {
++            query.from("now");
++            query.to(queryToValue);
++        } else if (randomBoolean()) {
++            query.from(queryFromValue);
++            query.to("now");
++        } else {
++            query.from("now");
++            query.to("now+1h");
++        }
++        QueryShardContext queryShardContext = createShardContext();
++        QueryBuilder rewritten = query.rewrite(queryShardContext);
++        assertThat(rewritten, instanceOf(RangeQueryBuilder.class));
++
++        queryShardContext = new QueryShardContext(queryShardContext) {
++
++            @Override
++            public boolean convertNowRangeToMatchAll() {
++                return true;
++            }
++        };
++        rewritten = query.rewrite(queryShardContext);
++        assertThat(rewritten, instanceOf(MatchAllQueryBuilder.class));
++    }
+ }

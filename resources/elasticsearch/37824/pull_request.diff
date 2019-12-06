@@ -1,0 +1,476 @@
+diff --git a/server/src/main/java/org/elasticsearch/env/NodeEnvironment.java b/server/src/main/java/org/elasticsearch/env/NodeEnvironment.java
+index 15458b1d70b3..8a84af9fc3fc 100644
+--- a/server/src/main/java/org/elasticsearch/env/NodeEnvironment.java
++++ b/server/src/main/java/org/elasticsearch/env/NodeEnvironment.java
+@@ -36,6 +36,7 @@
+ import org.apache.lucene.store.SimpleFSDirectory;
+ import org.elasticsearch.common.CheckedFunction;
+ import org.elasticsearch.common.lease.Releasable;
++import org.elasticsearch.common.logging.DeprecationLogger;
+ import org.elasticsearch.core.internal.io.IOUtils;
+ import org.elasticsearch.ElasticsearchException;
+ import org.elasticsearch.cluster.metadata.IndexMetaData;
+@@ -59,6 +60,7 @@
+ import org.elasticsearch.monitor.fs.FsInfo;
+ import org.elasticsearch.monitor.fs.FsProbe;
+ import org.elasticsearch.monitor.jvm.JvmInfo;
++import org.elasticsearch.node.Node;
+ 
+ import java.io.Closeable;
+ import java.io.IOException;
+@@ -145,6 +147,7 @@ public String toString() {
+     }
+ 
+     private final Logger logger = LogManager.getLogger(NodeEnvironment.class);
++    private final DeprecationLogger deprecationLogger = new DeprecationLogger(logger);
+     private final NodePath[] nodePaths;
+     private final Path sharedDataPath;
+     private final Lock[] locks;
+@@ -311,6 +314,26 @@ public NodeEnvironment(Settings settings, Environment environment, Consumer<Stri
+ 
+             applySegmentInfosTrace(settings);
+             assertCanWrite();
++
++            // backported from 7.0, but turned into warnings.
++            if (DiscoveryNode.isDataNode(settings) == false) {
++                if (DiscoveryNode.isMasterNode(settings) == false) {
++                    try {
++                        ensureNoIndexMetaData(nodePaths);
++                    } catch (IllegalStateException e) {
++                        deprecationLogger.deprecated(e.getMessage()
++                            + ", this should be cleaned up (will refuse to start in 7.0). Create a backup copy before removing.");
++                    }
++                }
++
++                try {
++                    ensureNoShardData(nodePaths);
++                } catch (IllegalStateException e) {
++                    deprecationLogger.deprecated(e.getMessage()
++                        + ", this should be cleaned up (will refuse to start in 7.0). Create a backup copy before removing.");
++                }
++            }
++
+             success = true;
+         } finally {
+             if (success == false) {
+@@ -1035,6 +1058,61 @@ public void ensureAtomicMoveSupported() throws IOException {
+         }
+     }
+ 
++    // identical to 7.0 checks
++    private void ensureNoShardData(final NodePath[] nodePaths) throws IOException {
++        List<Path> shardDataPaths = collectIndexSubPaths(nodePaths, this::isShardPath);
++        if (shardDataPaths.isEmpty() == false) {
++            throw new IllegalStateException("Node is started with "
++                + Node.NODE_DATA_SETTING.getKey()
++                + "=false, but has shard data: "
++                + shardDataPaths);
++        }
++    }
++
++    private void ensureNoIndexMetaData(final NodePath[] nodePaths) throws IOException {
++        List<Path> indexMetaDataPaths = collectIndexSubPaths(nodePaths, this::isIndexMetaDataPath);
++        if (indexMetaDataPaths.isEmpty() == false) {
++            throw new IllegalStateException("Node is started with "
++                + Node.NODE_DATA_SETTING.getKey()
++                + "=false and "
++                + Node.NODE_MASTER_SETTING.getKey()
++                + "=false, but has index metadata: "
++                + indexMetaDataPaths);
++        }
++    }
++
++    private List<Path> collectIndexSubPaths(NodePath[] nodePaths, Predicate<Path> subPathPredicate) throws IOException {
++        List<Path> indexSubPaths = new ArrayList<>();
++        for (NodePath nodePath : nodePaths) {
++            Path indicesPath = nodePath.indicesPath;
++            if (Files.isDirectory(indicesPath)) {
++                try (DirectoryStream<Path> indexStream = Files.newDirectoryStream(indicesPath)) {
++                    for (Path indexPath : indexStream) {
++                        if (Files.isDirectory(indexPath)) {
++                            try (Stream<Path> shardStream = Files.list(indexPath)) {
++                                shardStream.filter(subPathPredicate)
++                                    .map(Path::toAbsolutePath)
++                                    .forEach(indexSubPaths::add);
++                            }
++                        }
++                    }
++                }
++            }
++        }
++
++        return indexSubPaths;
++    }
++
++    private boolean isShardPath(Path path) {
++        return Files.isDirectory(path)
++            && path.getFileName().toString().chars().allMatch(Character::isDigit);
++    }
++
++    private boolean isIndexMetaDataPath(Path path) {
++        return Files.isDirectory(path)
++            && path.getFileName().toString().equals(MetaDataStateFormat.STATE_DIR_NAME);
++    }
++
+     /**
+      * Resolve the custom path for a index's shard.
+      * Uses the {@code IndexMetaData.SETTING_DATA_PATH} setting to determine
+diff --git a/server/src/main/java/org/elasticsearch/gateway/DanglingIndicesState.java b/server/src/main/java/org/elasticsearch/gateway/DanglingIndicesState.java
+index 4d7949cdf4de..0aa853a60608 100644
+--- a/server/src/main/java/org/elasticsearch/gateway/DanglingIndicesState.java
++++ b/server/src/main/java/org/elasticsearch/gateway/DanglingIndicesState.java
+@@ -27,8 +27,10 @@
+ import org.elasticsearch.cluster.metadata.IndexGraveyard;
+ import org.elasticsearch.cluster.metadata.IndexMetaData;
+ import org.elasticsearch.cluster.metadata.MetaData;
++import org.elasticsearch.cluster.node.DiscoveryNode;
+ import org.elasticsearch.cluster.service.ClusterService;
+ import org.elasticsearch.common.inject.Inject;
++import org.elasticsearch.common.settings.Settings;
+ import org.elasticsearch.common.util.concurrent.ConcurrentCollections;
+ import org.elasticsearch.env.NodeEnvironment;
+ import org.elasticsearch.index.Index;
+@@ -62,12 +64,15 @@
+     private final Map<Index, IndexMetaData> danglingIndices = ConcurrentCollections.newConcurrentMap();
+ 
+     @Inject
+-    public DanglingIndicesState(NodeEnvironment nodeEnv, MetaStateService metaStateService,
++    public DanglingIndicesState(Settings settings, NodeEnvironment nodeEnv, MetaStateService metaStateService,
+                                 LocalAllocateDangledIndices allocateDangledIndices, ClusterService clusterService) {
+         this.nodeEnv = nodeEnv;
+         this.metaStateService = metaStateService;
+         this.allocateDangledIndices = allocateDangledIndices;
+-        clusterService.addListener(this);
++        if (DiscoveryNode.isDataNode(settings)
++            || DiscoveryNode.isMasterNode(settings)) {
++            clusterService.addListener(this);
++        }
+     }
+ 
+     /**
+diff --git a/server/src/test/java/org/elasticsearch/env/NodeEnvironmentTests.java b/server/src/test/java/org/elasticsearch/env/NodeEnvironmentTests.java
+index af5d589b1dc4..0dc4da987c70 100644
+--- a/server/src/test/java/org/elasticsearch/env/NodeEnvironmentTests.java
++++ b/server/src/test/java/org/elasticsearch/env/NodeEnvironmentTests.java
+@@ -18,7 +18,17 @@
+  */
+ package org.elasticsearch.env;
+ 
++import junit.framework.AssertionFailedError;
++import org.apache.logging.log4j.Level;
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
++import org.apache.logging.log4j.LoggingException;
++import org.apache.logging.log4j.core.Appender;
++import org.apache.logging.log4j.core.ErrorHandler;
++import org.apache.logging.log4j.core.LogEvent;
++import org.apache.logging.log4j.core.appender.AbstractAppender;
+ import org.apache.lucene.index.SegmentInfos;
++import org.elasticsearch.common.logging.Loggers;
+ import org.elasticsearch.common.util.set.Sets;
+ import org.elasticsearch.core.internal.io.IOUtils;
+ import org.apache.lucene.util.LuceneTestCase;
+@@ -31,6 +41,7 @@
+ import org.elasticsearch.index.Index;
+ import org.elasticsearch.index.IndexSettings;
+ import org.elasticsearch.index.shard.ShardId;
++import org.elasticsearch.node.Node;
+ import org.elasticsearch.test.ESTestCase;
+ import org.elasticsearch.test.IndexSettingsModule;
+ 
+@@ -53,6 +64,7 @@
+ import static org.hamcrest.Matchers.containsString;
+ import static org.hamcrest.Matchers.empty;
+ import static org.hamcrest.Matchers.not;
++import static org.hamcrest.Matchers.startsWith;
+ 
+ @LuceneTestCase.SuppressFileSystems("ExtrasFS") // TODO: fix test to allow extras
+ public class NodeEnvironmentTests extends ESTestCase {
+@@ -475,6 +487,159 @@ public void testExistingTempFiles() throws IOException {
+         }
+     }
+ 
++    // backported from 7.0, but in 6.x this only prints warnings. We keep the original test as is to ease further backports and ensure
++    // that log messages convert into exceptions.
++    public void testEnsureNoShardDataOrIndexMetaData6x() throws IOException, IllegalAccessException {
++        // Convert warn log messages into exceptions and call original test case.
++        Appender appender = new AbstractAppender("convertToException", null, null, false) {
++            @Override
++            public void append(LogEvent event) {
++                if (event.getLevel() == Level.WARN
++                    && event.getMessage().getFormattedMessage()
++                    .endsWith(", this should be cleaned up (will refuse to start in 7.0). Create a backup copy before removing.")) {
++                    assertWarnings(event.getMessage().getFormattedMessage());
++                    throw new LoggingException(new IllegalStateException(event.getMessage().getFormattedMessage()));
++                }
++            }
++        };
++        appender.setHandler(new ErrorHandler() {
++            @Override
++            public void error(String msg) {
++            }
++
++            @Override
++            public void error(String msg, Throwable t) {
++            }
++
++            @Override
++            public void error(String msg, LogEvent event, Throwable t) {
++            }
++        });
++        appender.start();
++        Logger nodeEnvironmentLogger = LogManager.getLogger(NodeEnvironment.class.getName().replace("org.elasticsearch.",
++            "org.elasticsearch.deprecation."));
++        Loggers.addAppender(nodeEnvironmentLogger, appender);
++        try {
++            testEnsureNoShardDataOrIndexMetaData();
++        } finally {
++            Loggers.removeAppender(nodeEnvironmentLogger, appender);
++            appender.stop();
++        }
++    }
++
++    private static <T extends Throwable> T expectLoggingThrows(Class<T> expectedType,
++                                                               String noExceptionMessage,
++                                                               ThrowingRunnable runnable) {
++        try {
++            runnable.run();
++        } catch (Throwable e) {
++            if (e instanceof LoggingException) {
++                e = e.getCause();
++            }
++            if (expectedType.isInstance(e)) {
++                return expectedType.cast(e);
++            }
++            AssertionFailedError assertion =
++                new AssertionFailedError("Unexpected exception type, expected " + expectedType.getSimpleName() + " but got " + e);
++            assertion.initCause(e);
++            throw assertion;
++        }
++        throw new AssertionFailedError(noExceptionMessage);
++    }
++
++    // exact 7.0 copy (except private on purpose to disable test and expectLoggingThrows used)
++    private void testEnsureNoShardDataOrIndexMetaData() throws IOException {
++        Settings settings = buildEnvSettings(Settings.EMPTY);
++        Index index = new Index("test", "testUUID");
++
++        // build settings using same path.data as original but with node.data=false and node.master=false
++        Settings noDataNoMasterSettings = Settings.builder()
++            .put(settings)
++            .put(Node.NODE_DATA_SETTING.getKey(), false)
++            .put(Node.NODE_MASTER_SETTING.getKey(), false)
++            .build();
++
++        // test that we can create data=false and master=false with no meta information
++        newNodeEnvironment(noDataNoMasterSettings).close();
++
++        Path indexPath;
++        try (NodeEnvironment env = newNodeEnvironment(settings)) {
++            for (Path path : env.indexPaths(index)) {
++                Files.createDirectories(path.resolve(MetaDataStateFormat.STATE_DIR_NAME));
++            }
++            indexPath = env.indexPaths(index)[0];
++        }
++
++        verifyFailsOnMetaData(noDataNoMasterSettings, indexPath);
++
++        // build settings using same path.data as original but with node.data=false
++        Settings noDataSettings = Settings.builder()
++            .put(settings)
++            .put(Node.NODE_DATA_SETTING.getKey(), false).build();
++
++        String shardDataDirName = Integer.toString(randomInt(10));
++
++        // test that we can create data=false env with only meta information. Also create shard data for following asserts
++        try (NodeEnvironment env = newNodeEnvironment(noDataSettings)) {
++            for (Path path : env.indexPaths(index)) {
++                Files.createDirectories(path.resolve(shardDataDirName));
++            }
++        }
++
++        verifyFailsOnShardData(noDataSettings, indexPath, shardDataDirName);
++
++        // assert that we get the stricter message on meta-data when both conditions fail
++        verifyFailsOnMetaData(noDataNoMasterSettings, indexPath);
++
++        // build settings using same path.data as original but with node.master=false
++        Settings noMasterSettings = Settings.builder()
++            .put(settings)
++            .put(Node.NODE_MASTER_SETTING.getKey(), false)
++            .build();
++
++        // test that we can create master=false env regardless of data.
++        newNodeEnvironment(noMasterSettings).close();
++
++        // test that we can create data=true, master=true env. Also remove state dir to leave only shard data for following asserts
++        try (NodeEnvironment env = newNodeEnvironment(settings)) {
++            for (Path path : env.indexPaths(index)) {
++                Files.delete(path.resolve(MetaDataStateFormat.STATE_DIR_NAME));
++            }
++        }
++
++        // assert that we fail on shard data even without the metadata dir.
++        verifyFailsOnShardData(noDataSettings, indexPath, shardDataDirName);
++        verifyFailsOnShardData(noDataNoMasterSettings, indexPath, shardDataDirName);
++    }
++
++    private void verifyFailsOnShardData(Settings settings, Path indexPath, String shardDataDirName) {
++        IllegalStateException ex = expectLoggingThrows(IllegalStateException.class,
++            "Must fail creating NodeEnvironment on a data path that has shard data if node.data=false",
++            () -> newNodeEnvironment(settings).close());
++
++        assertThat(ex.getMessage(),
++            containsString(indexPath.resolve(shardDataDirName).toAbsolutePath().toString()));
++        assertThat(ex.getMessage(),
++            startsWith("Node is started with "
++                + Node.NODE_DATA_SETTING.getKey()
++                + "=false, but has shard data"));
++    }
++
++    private void verifyFailsOnMetaData(Settings settings, Path indexPath) {
++        IllegalStateException ex = expectLoggingThrows(IllegalStateException.class,
++            "Must fail creating NodeEnvironment on a data path that has index meta-data if node.data=false and node.master=false",
++            () -> newNodeEnvironment(settings).close());
++
++        assertThat(ex.getMessage(),
++            containsString(indexPath.resolve(MetaDataStateFormat.STATE_DIR_NAME).toAbsolutePath().toString()));
++        assertThat(ex.getMessage(),
++            startsWith("Node is started with "
++                + Node.NODE_DATA_SETTING.getKey()
++                + "=false and "
++                + Node.NODE_MASTER_SETTING.getKey()
++                + "=false, but has index metadata"));
++    }
++
+     /** Converts an array of Strings to an array of Paths, adding an additional child if specified */
+     private Path[] stringsToPaths(String[] strings, String additional) {
+         Path[] locations = new Path[strings.length];
+diff --git a/server/src/test/java/org/elasticsearch/gateway/DanglingIndicesStateTests.java b/server/src/test/java/org/elasticsearch/gateway/DanglingIndicesStateTests.java
+index 9593b58eae97..ea4aa2da0886 100644
+--- a/server/src/test/java/org/elasticsearch/gateway/DanglingIndicesStateTests.java
++++ b/server/src/test/java/org/elasticsearch/gateway/DanglingIndicesStateTests.java
+@@ -26,16 +26,21 @@
+ import org.elasticsearch.common.settings.Settings;
+ import org.elasticsearch.env.NodeEnvironment;
+ import org.elasticsearch.index.Index;
++import org.elasticsearch.node.Node;
+ import org.elasticsearch.test.ESTestCase;
+ import org.hamcrest.Matchers;
+ 
++import java.io.IOException;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
+ import java.nio.file.StandardCopyOption;
+ import java.util.Map;
+ 
+ import static org.hamcrest.Matchers.equalTo;
++import static org.mockito.Matchers.any;
+ import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
+ 
+ public class DanglingIndicesStateTests extends ESTestCase {
+ 
+@@ -158,7 +163,47 @@ public void testDanglingIndicesNotImportedWhenTombstonePresent() throws Exceptio
+         }
+     }
+ 
++    public void testDanglingIndicesDisabledForCoordinatorOnly() throws IOException {
++        Settings noDataNoMasterSettings = Settings.builder()
++            .put(Node.NODE_DATA_SETTING.getKey(), false)
++            .put(Node.NODE_MASTER_SETTING.getKey(), false)
++            .build();
++
++        Settings noDataSettings = Settings.builder()
++            .put(Node.NODE_DATA_SETTING.getKey(), false)
++            .build();
++
++        Settings noMasterSettings = Settings.builder()
++            .put(Node.NODE_MASTER_SETTING.getKey(), false)
++            .build();
++
++        verifyDanglingIndicesDisabled(noDataNoMasterSettings, 0,
++            "node.data=false and node.master=false nodes should not detect any dangling indices");
++        verifyDanglingIndicesDisabled(noDataSettings, 1,
++            "node.data=false and node.master=true nodes should detect dangling indices");
++        verifyDanglingIndicesDisabled(noMasterSettings, 1,
++            "node.data=true and node.master=false nodes should detect dangling indices");
++        // also validated by #testDanglingIndicesDiscovery, included for completeness.
++        verifyDanglingIndicesDisabled(Settings.EMPTY, 1,
++            "node.data=true and node.master=true nodes should detect dangling indices");
++    }
++
++    private void verifyDanglingIndicesDisabled(Settings settings, int expected, String reason) throws IOException {
++        try (NodeEnvironment env = newNodeEnvironment(settings)) {
++            MetaStateService metaStateService = new MetaStateService(env, xContentRegistry());
++            ClusterService clusterService = mock(ClusterService.class);
++            new DanglingIndicesState(settings, env, metaStateService, null, clusterService);
++            verify(clusterService, times(expected)).addListener(any());
++        }
++    }
++
+     private DanglingIndicesState createDanglingIndicesState(NodeEnvironment env, MetaStateService metaStateService) {
+-        return new DanglingIndicesState(env, metaStateService, null, mock(ClusterService.class));
++        return new DanglingIndicesState(Settings.EMPTY, env, metaStateService, null, mock(ClusterService.class));
++    }
++
++    private DanglingIndicesState createDanglingIndicesState(NodeEnvironment env,
++                                                            MetaStateService metaStateService,
++                                                            Settings settings) {
++        return new DanglingIndicesState(settings, env, metaStateService, null, mock(ClusterService.class));
+     }
+ }
+diff --git a/server/src/test/java/org/elasticsearch/gateway/GatewayIndexStateIT.java b/server/src/test/java/org/elasticsearch/gateway/GatewayIndexStateIT.java
+index ff8393b659d1..56dae77e1459 100644
+--- a/server/src/test/java/org/elasticsearch/gateway/GatewayIndexStateIT.java
++++ b/server/src/test/java/org/elasticsearch/gateway/GatewayIndexStateIT.java
+@@ -40,6 +40,7 @@
+ import org.elasticsearch.common.unit.TimeValue;
+ import org.elasticsearch.common.xcontent.XContentFactory;
+ import org.elasticsearch.common.xcontent.XContentType;
++import org.elasticsearch.discovery.DiscoverySettings;
+ import org.elasticsearch.discovery.zen.ElectMasterService;
+ import org.elasticsearch.env.NodeEnvironment;
+ import org.elasticsearch.index.mapper.MapperParsingException;
+@@ -318,6 +319,40 @@ public boolean clearData(String nodeName) {
+         assertThat(client().prepareGet("test", "type1", "1").execute().actionGet().isExists(), equalTo(true));
+     }
+ 
++    public void testDanglingIndicesIgnoredWhenObsolete() throws Exception {
++        logger.info("--> starting first node");
++        internalCluster().startNode();
++
++        logger.info("--> indexing a simple document");
++        client().prepareIndex("test", "type1", "1").setSource("field1", "value1").setRefreshPolicy(IMMEDIATE).get();
++
++        internalCluster().fullRestart(new RestartCallback() {
++            @Override
++            public Settings onNodeStopped(String nodeName) throws Exception {
++                return Settings.builder()
++                    .put(Node.NODE_DATA_SETTING.getKey(), false)
++                    .put(Node.NODE_MASTER_SETTING.getKey(), false)
++                    // avoid waiting for discovery.
++                    .put(DiscoverySettings.INITIAL_STATE_TIMEOUT_SETTING.getKey(), 0)
++                    .build();
++            }
++
++            @Override
++            public boolean validateClusterForming() {
++                return false;
++            }
++        });
++
++        logger.info("--> starting second node (master)");
++        internalCluster().startNode();
++
++        logger.info("--> verify green status");
++        ensureGreen();
++
++        logger.info("--> verify that the dangling index does not exists");
++        assertThat(client().admin().indices().prepareExists("test").execute().actionGet().isExists(), equalTo(false));
++    }
++
+     /**
+      * This test ensures that when an index deletion takes place while a node is offline, when that
+      * node rejoins the cluster, it deletes the index locally instead of importing it as a dangling index.

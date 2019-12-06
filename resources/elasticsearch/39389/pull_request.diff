@@ -1,0 +1,145 @@
+diff --git a/server/src/main/java/org/elasticsearch/cluster/coordination/ElasticsearchNodeCommand.java b/server/src/main/java/org/elasticsearch/cluster/coordination/ElasticsearchNodeCommand.java
+index db77da733e20..9e2d3dcde351 100644
+--- a/server/src/main/java/org/elasticsearch/cluster/coordination/ElasticsearchNodeCommand.java
++++ b/server/src/main/java/org/elasticsearch/cluster/coordination/ElasticsearchNodeCommand.java
+@@ -125,27 +125,39 @@ protected void execute(Terminal terminal, OptionSet options, Environment env) th
+ 
+     protected void writeNewMetaData(Terminal terminal, Manifest oldManifest, long newCurrentTerm,
+                                     MetaData oldMetaData, MetaData newMetaData, Path[] dataPaths) {
++        long newGeneration;
+         try {
+             terminal.println(Terminal.Verbosity.VERBOSE,
+                     "[clusterUUID = " + oldMetaData.clusterUUID() + ", committed = " + oldMetaData.clusterUUIDCommitted() + "] => " +
+                          "[clusterUUID = " + newMetaData.clusterUUID() + ", committed = " + newMetaData.clusterUUIDCommitted() + "]");
+             terminal.println(Terminal.Verbosity.VERBOSE, "New coordination metadata is " + newMetaData.coordinationMetaData());
+             terminal.println(Terminal.Verbosity.VERBOSE, "Writing new global metadata to disk");
+-            long newGeneration = MetaData.FORMAT.write(newMetaData, dataPaths);
++            newGeneration = MetaData.FORMAT.write(newMetaData, dataPaths);
+             Manifest newManifest = new Manifest(newCurrentTerm, oldManifest.getClusterStateVersion(), newGeneration,
+                     oldManifest.getIndexGenerations());
+             terminal.println(Terminal.Verbosity.VERBOSE, "New manifest is " + newManifest);
+             terminal.println(Terminal.Verbosity.VERBOSE, "Writing new manifest file to disk");
+             Manifest.FORMAT.writeAndCleanup(newManifest, dataPaths);
+-            terminal.println(Terminal.Verbosity.VERBOSE, "Cleaning up old metadata");
+-            MetaData.FORMAT.cleanupOldFiles(newGeneration, dataPaths);
+         } catch (Exception e) {
+             terminal.println(Terminal.Verbosity.VERBOSE, "Cleaning up new metadata");
+             MetaData.FORMAT.cleanupOldFiles(oldManifest.getGlobalGeneration(), dataPaths);
+             throw new ElasticsearchException(WRITE_METADATA_EXCEPTION_MSG, e);
+         }
++        // if cleaning old files fail, we still succeeded.
++        try {
++            cleanUpOldMetaData(terminal, dataPaths, newGeneration);
++        } catch (Exception e) {
++            terminal.println(Terminal.Verbosity.SILENT,
++                "Warning: Cleaning up old metadata failed, but operation was otherwise successful (message: " + e.getMessage() + ")");
++        }
+     }
+ 
++    protected void cleanUpOldMetaData(Terminal terminal, Path[] dataPaths, long newGeneration) {
++        terminal.println(Terminal.Verbosity.VERBOSE, "Cleaning up old metadata");
++        MetaData.FORMAT.cleanupOldFiles(newGeneration, dataPaths);
++    }
++
++
+     //package-private for testing
+     OptionParser getParser() {
+         return parser;
+diff --git a/server/src/test/java/org/elasticsearch/cluster/coordination/ElasticsearchNodeCommandIT.java b/server/src/test/java/org/elasticsearch/cluster/coordination/ElasticsearchNodeCommandIT.java
+index d93133ef78b6..f2ceae6ebab8 100644
+--- a/server/src/test/java/org/elasticsearch/cluster/coordination/ElasticsearchNodeCommandIT.java
++++ b/server/src/test/java/org/elasticsearch/cluster/coordination/ElasticsearchNodeCommandIT.java
+@@ -22,10 +22,13 @@
+ import org.elasticsearch.ElasticsearchException;
+ import org.elasticsearch.action.admin.cluster.settings.ClusterUpdateSettingsRequest;
+ import org.elasticsearch.cli.MockTerminal;
++import org.elasticsearch.cli.Terminal;
++import org.elasticsearch.cluster.ClusterModule;
+ import org.elasticsearch.cluster.ClusterState;
+ import org.elasticsearch.cluster.metadata.Manifest;
+ import org.elasticsearch.cluster.metadata.MetaData;
+ import org.elasticsearch.common.settings.Settings;
++import org.elasticsearch.common.xcontent.NamedXContentRegistry;
+ import org.elasticsearch.env.Environment;
+ import org.elasticsearch.env.NodeEnvironment;
+ import org.elasticsearch.env.NodeMetaData;
+@@ -36,6 +39,7 @@
+ import org.elasticsearch.test.junit.annotations.TestLogging;
+ 
+ import java.io.IOException;
++import java.nio.file.Path;
+ import java.util.ArrayList;
+ import java.util.List;
+ import java.util.Locale;
+@@ -46,6 +50,7 @@
+ import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertHitCount;
+ import static org.hamcrest.Matchers.containsString;
+ import static org.hamcrest.Matchers.equalTo;
++import static org.hamcrest.Matchers.greaterThan;
+ 
+ @ESIntegTestCase.ClusterScope(scope = ESIntegTestCase.Scope.TEST, numDataNodes = 0, autoMinMasterNodes = false)
+ @TestLogging("_root:DEBUG,org.elasticsearch.cluster.service:TRACE,org.elasticsearch.cluster.coordination:TRACE")
+@@ -418,4 +423,63 @@ public void testCanRunUnsafeBootstrapAfterErroneousDetachWithoutLoosingMetaData(
+         assertThat(state.metaData().settings().get(INDICES_RECOVERY_MAX_BYTES_PER_SEC_SETTING.getKey()),
+                 equalTo("1234kb"));
+     }
++
++    private static class SimulatedDeleteFailureException extends RuntimeException {
++    }
++
++    public void testCleanupOldMetaDataFails() throws Exception {
++        // establish some metadata.
++        internalCluster().setBootstrapMasterNodeIndex(0);
++        internalCluster().startNode();
++        Environment environment = TestEnvironment.newEnvironment(internalCluster().getDefaultSettings());
++        internalCluster().stopRandomDataNode();
++
++        // find data paths
++        Path[] dataPaths;
++        try (NodeEnvironment nodeEnvironment = new NodeEnvironment(environment.settings(), environment)) {
++            dataPaths = nodeEnvironment.nodeDataPaths();
++        }
++
++        NamedXContentRegistry namedXContentRegistry = new NamedXContentRegistry(ClusterModule.getNamedXWriteables());
++
++        final Manifest originalManifest = loadLatestManifest(dataPaths, namedXContentRegistry);
++        final MetaData originalMetaData = loadMetaData(dataPaths, namedXContentRegistry, originalManifest);
++
++        executeCommand(new UnsafeBootstrapMasterCommand() {
++            @Override
++            protected void cleanUpOldMetaData(Terminal terminal, Path[] dataPaths, long newGeneration) {
++                throw new SimulatedDeleteFailureException();
++            }
++        }, environment, 0, false);
++
++
++        // check original meta-data left untouched.
++        assertEquals(loadMetaData(dataPaths, namedXContentRegistry, originalManifest).clusterUUID(), originalMetaData.clusterUUID());
++
++        // check that we got new clusterUUID despite deletion failing
++        final Manifest secondManifest = loadLatestManifest(dataPaths, namedXContentRegistry);
++        final MetaData secondMetaData = loadMetaData(dataPaths, namedXContentRegistry, secondManifest);
++        assertThat(secondManifest.getGlobalGeneration(), greaterThan(originalManifest.getGlobalGeneration()));
++        assertNotEquals(originalMetaData.clusterUUID(), secondMetaData.clusterUUID());
++
++        // check that a new run will cleanup.
++        executeCommand(new UnsafeBootstrapMasterCommand(), environment, 0, false);
++
++        assertNull(loadMetaData(dataPaths, namedXContentRegistry, originalManifest));
++        assertNull(loadMetaData(dataPaths, namedXContentRegistry, secondManifest));
++
++        final Manifest finalManifest = loadLatestManifest(dataPaths, namedXContentRegistry);
++        final MetaData finalMetaData = loadMetaData(dataPaths, namedXContentRegistry, finalManifest);
++
++        assertNotNull(finalMetaData);
++        assertNotEquals(secondMetaData.clusterUUID(), finalMetaData.clusterUUID());
++    }
++
++    private Manifest loadLatestManifest(Path[] dataPaths, NamedXContentRegistry namedXContentRegistry) throws IOException {
++        return Manifest.FORMAT.loadLatestState(logger, namedXContentRegistry, dataPaths);
++    }
++
++    private MetaData loadMetaData(Path[] dataPaths, NamedXContentRegistry namedXContentRegistry, Manifest manifest) {
++        return MetaData.FORMAT.loadGeneration(logger, namedXContentRegistry, manifest.getGlobalGeneration(), dataPaths);
++    }
+ }

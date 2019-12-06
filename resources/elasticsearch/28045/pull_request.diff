@@ -1,0 +1,215 @@
+diff --git a/server/src/main/java/org/elasticsearch/index/search/MatchQuery.java b/server/src/main/java/org/elasticsearch/index/search/MatchQuery.java
+index f37b1d6f4701..d6a0bf5f7380 100644
+--- a/server/src/main/java/org/elasticsearch/index/search/MatchQuery.java
++++ b/server/src/main/java/org/elasticsearch/index/search/MatchQuery.java
+@@ -29,6 +29,7 @@
+ import org.apache.lucene.search.BooleanClause.Occur;
+ import org.apache.lucene.search.BooleanQuery;
+ import org.apache.lucene.search.BoostQuery;
++import org.apache.lucene.search.DisjunctionMaxQuery;
+ import org.apache.lucene.search.FuzzyQuery;
+ import org.apache.lucene.search.MultiPhraseQuery;
+ import org.apache.lucene.search.MultiTermQuery;
+@@ -350,7 +351,12 @@ protected Query analyzePhrase(String field, TokenStream stream, int slop) throws
+                     throw exc;
+                 }
+             }
+-            return super.analyzePhrase(field, stream, slop);
++            Query query = super.analyzePhrase(field, stream, slop);
++            if (query instanceof PhraseQuery) {
++                // synonyms that expand to multiple terms can return a phrase query.
++                return blendPhraseQuery((PhraseQuery) query, mapper);
++            }
++            return query;
+         }
+ 
+         /**
+@@ -472,6 +478,14 @@ private Query boolToExtendedCommonTermsQuery(BooleanQuery bq, Occur highFreqOccu
+         }
+     }
+ 
++    /**
++     * Called when a phrase query is built with {@link QueryBuilder#analyzePhrase(String, TokenStream, int)}.
++     * Subclass can override this function to blend this query to multiple fields.
++     */
++    protected Query blendPhraseQuery(PhraseQuery query, MappedFieldType fieldType) {
++        return query;
++    }
++
+     protected Query blendTermsQuery(Term[] terms, MappedFieldType fieldType) {
+         return new SynonymQuery(terms);
+     }
+@@ -494,5 +508,4 @@ protected Query blendTermQuery(Term term, MappedFieldType fieldType) {
+         }
+         return termQuery(fieldType, term.bytes(), lenient);
+     }
+-
+ }
+diff --git a/server/src/main/java/org/elasticsearch/index/search/MultiMatchQuery.java b/server/src/main/java/org/elasticsearch/index/search/MultiMatchQuery.java
+index 61029f70e8f1..8a85c67b6815 100644
+--- a/server/src/main/java/org/elasticsearch/index/search/MultiMatchQuery.java
++++ b/server/src/main/java/org/elasticsearch/index/search/MultiMatchQuery.java
+@@ -25,10 +25,10 @@
+ import org.apache.lucene.search.BoostQuery;
+ import org.apache.lucene.search.DisjunctionMaxQuery;
+ import org.apache.lucene.search.MatchNoDocsQuery;
++import org.apache.lucene.search.PhraseQuery;
+ import org.apache.lucene.search.Query;
+ import org.apache.lucene.search.TermQuery;
+ import org.apache.lucene.util.BytesRef;
+-import org.elasticsearch.ElasticsearchParseException;
+ import org.elasticsearch.common.lucene.search.Queries;
+ import org.elasticsearch.index.mapper.MappedFieldType;
+ import org.elasticsearch.index.query.AbstractQueryBuilder;
+@@ -143,6 +143,10 @@ public Query blendTerms(Term[] terms, MappedFieldType fieldType) {
+         public Query termQuery(MappedFieldType fieldType, BytesRef value) {
+             return MultiMatchQuery.this.termQuery(fieldType, value, lenient);
+         }
++
++        public Query blendPhrase(PhraseQuery query, MappedFieldType type) {
++            return MultiMatchQuery.super.blendPhraseQuery(query, type);
++        }
+     }
+ 
+     final class CrossFieldsQueryBuilder extends QueryBuilder {
+@@ -226,6 +230,17 @@ public Query termQuery(MappedFieldType fieldType, BytesRef value) {
+              */
+             return blendTerm(new Term(fieldType.name(), value.utf8ToString()), fieldType);
+         }
++
++        @Override
++        public Query blendPhrase(PhraseQuery query, MappedFieldType type) {
++            if (blendedFields == null) {
++                return super.blendPhrase(query, type);
++            }
++            /**
++             * We build phrase queries for multi-word synonyms when {@link QueryBuilder#autoGenerateSynonymsPhraseQuery} is true.
++             */
++            return MultiMatchQuery.blendPhrase(query, blendedFields);
++        }
+     }
+ 
+     static Query blendTerm(QueryShardContext context, BytesRef value, Float commonTermsCutoff, float tieBreaker,
+@@ -288,6 +303,28 @@ static Query blendTerms(QueryShardContext context, BytesRef[] values, Float comm
+         }
+     }
+ 
++    /**
++     * Expand a {@link PhraseQuery} to multiple fields that share the same analyzer.
++     * Returns a {@link DisjunctionMaxQuery} with a disjunction for each expanded field.
++     */
++    static Query blendPhrase(PhraseQuery query, FieldAndFieldType... fields) {
++        List<Query> disjunctions = new ArrayList<>();
++        for (FieldAndFieldType field : fields) {
++            int[] positions = query.getPositions();
++            Term[] terms = query.getTerms();
++            PhraseQuery.Builder builder = new PhraseQuery.Builder();
++            for (int i = 0; i < terms.length; i++) {
++                builder.add(new Term(field.fieldType.name(), terms[i].bytes()), positions[i]);
++            }
++            Query q = builder.build();
++            if (field.boost != AbstractQueryBuilder.DEFAULT_BOOST) {
++                q = new BoostQuery(q, field.boost);
++            }
++            disjunctions.add(q);
++        }
++        return new DisjunctionMaxQuery(disjunctions, 0.0f);
++    }
++
+     @Override
+     protected Query blendTermQuery(Term term, MappedFieldType fieldType) {
+         if (queryBuilder == null) {
+@@ -304,6 +341,14 @@ protected Query blendTermsQuery(Term[] terms, MappedFieldType fieldType) {
+         return queryBuilder.blendTerms(terms, fieldType);
+     }
+ 
++    @Override
++    protected Query blendPhraseQuery(PhraseQuery query, MappedFieldType fieldType) {
++        if (queryBuilder == null) {
++            return super.blendPhraseQuery(query, fieldType);
++        }
++        return queryBuilder.blendPhrase(query, fieldType);
++    }
++
+     static final class FieldAndFieldType {
+         final MappedFieldType fieldType;
+         final float boost;
+diff --git a/server/src/test/java/org/elasticsearch/index/search/MultiMatchQueryTests.java b/server/src/test/java/org/elasticsearch/index/search/MultiMatchQueryTests.java
+index 5695094553de..1f033b5fb418 100644
+--- a/server/src/test/java/org/elasticsearch/index/search/MultiMatchQueryTests.java
++++ b/server/src/test/java/org/elasticsearch/index/search/MultiMatchQueryTests.java
+@@ -19,12 +19,16 @@
+ 
+ package org.elasticsearch.index.search;
+ 
++import org.apache.lucene.analysis.MockSynonymAnalyzer;
+ import org.apache.lucene.index.Term;
+ import org.apache.lucene.queries.BlendedTermQuery;
++import org.apache.lucene.search.BooleanClause;
++import org.apache.lucene.search.BooleanQuery;
+ import org.apache.lucene.search.BoostQuery;
+ import org.apache.lucene.search.DisjunctionMaxQuery;
+ import org.apache.lucene.search.MatchAllDocsQuery;
+ import org.apache.lucene.search.MatchNoDocsQuery;
++import org.apache.lucene.search.PhraseQuery;
+ import org.apache.lucene.search.Query;
+ import org.apache.lucene.search.SynonymQuery;
+ import org.apache.lucene.search.TermQuery;
+@@ -43,7 +47,11 @@
+ import org.junit.Before;
+ 
+ import java.io.IOException;
++import java.util.ArrayList;
+ import java.util.Arrays;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
+ 
+ import static org.elasticsearch.index.query.QueryBuilders.multiMatchQuery;
+ import static org.hamcrest.Matchers.equalTo;
+@@ -220,4 +228,45 @@ public void testMultiMatchCrossFieldsWithSynonyms() throws IOException {
+         assertThat(parsedQuery, equalTo(expectedQuery));
+ 
+     }
++
++    public void testMultiMatchCrossFieldsWithSynonymsPhrase() throws IOException {
++        QueryShardContext queryShardContext = indexService.newQueryShardContext(
++            randomInt(20), null, () -> { throw new UnsupportedOperationException(); }, null);
++        MultiMatchQuery parser = new MultiMatchQuery(queryShardContext);
++        parser.setAnalyzer(new MockSynonymAnalyzer());
++        Map<String, Float> fieldNames = new HashMap<>();
++        fieldNames.put("name.first", 1.0f);
++        fieldNames.put("name.last", 1.0f);
++        Query query = parser.parse(MultiMatchQueryBuilder.Type.CROSS_FIELDS, fieldNames, "guinea pig", null);
++
++        Term[] terms = new Term[2];
++        terms[0] = new Term("name.first", "cavy");
++        terms[1] = new Term("name.last", "cavy");
++        float[] boosts = new float[2];
++        Arrays.fill(boosts, 1.0f);
++
++        List<Query> phraseDisjuncts = new ArrayList<>();
++        phraseDisjuncts.add(
++            new PhraseQuery.Builder()
++                .add(new Term("name.first", "guinea"))
++                .add(new Term("name.first", "pig"))
++                .build()
++        );
++        phraseDisjuncts.add(
++            new PhraseQuery.Builder()
++                .add(new Term("name.last", "guinea"))
++                .add(new Term("name.last", "pig"))
++                .build()
++        );
++        BooleanQuery expected = new BooleanQuery.Builder()
++            .add(
++                new BooleanQuery.Builder()
++                    .add(new DisjunctionMaxQuery(phraseDisjuncts, 0.0f), BooleanClause.Occur.SHOULD)
++                    .add(BlendedTermQuery.dismaxBlendedQuery(terms, boosts, 1.0f), BooleanClause.Occur.SHOULD)
++                    .build(),
++                BooleanClause.Occur.SHOULD
++            )
++            .build();
++        assertEquals(expected, query);
++    }
+ }

@@ -1,0 +1,320 @@
+diff --git a/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsBlobContainer.java b/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsBlobContainer.java
+index e485cf56b4c3..290de5b873ef 100644
+--- a/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsBlobContainer.java
++++ b/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsBlobContainer.java
+@@ -25,6 +25,7 @@
+ import org.apache.hadoop.fs.Options.CreateOpts;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.PathFilter;
++import org.elasticsearch.SpecialPermission;
+ import org.elasticsearch.common.Nullable;
+ import org.elasticsearch.common.blobstore.BlobMetaData;
+ import org.elasticsearch.common.blobstore.BlobPath;
+@@ -32,10 +33,14 @@
+ import org.elasticsearch.common.blobstore.support.PlainBlobMetaData;
+ import org.elasticsearch.repositories.hdfs.HdfsBlobStore.Operation;
+ 
++import java.io.FilterInputStream;
+ import java.io.IOException;
+ import java.io.InputStream;
+ import java.nio.file.FileAlreadyExistsException;
+ import java.nio.file.NoSuchFileException;
++import java.security.AccessController;
++import java.security.PrivilegedActionException;
++import java.security.PrivilegedExceptionAction;
+ import java.util.Collections;
+ import java.util.EnumSet;
+ import java.util.LinkedHashMap;
+@@ -43,12 +48,14 @@
+ 
+ final class HdfsBlobContainer extends AbstractBlobContainer {
+     private final HdfsBlobStore store;
++    private final HdfsSecurityContext securityContext;
+     private final Path path;
+     private final int bufferSize;
+ 
+-    HdfsBlobContainer(BlobPath blobPath, HdfsBlobStore store, Path path, int bufferSize) {
++    HdfsBlobContainer(BlobPath blobPath, HdfsBlobStore store, Path path, int bufferSize, HdfsSecurityContext hdfsSecurityContext) {
+         super(blobPath);
+         this.store = store;
++        this.securityContext = hdfsSecurityContext;
+         this.path = path;
+         this.bufferSize = bufferSize;
+     }
+@@ -101,7 +108,10 @@ public InputStream readBlob(String blobName) throws IOException {
+         return store.execute(new Operation<InputStream>() {
+             @Override
+             public InputStream run(FileContext fileContext) throws IOException {
+-                return fileContext.open(new Path(path, blobName), bufferSize);
++                // FSDataInputStream can open connections on read() or skip() so we wrap in
++                // HDFSPrivilegedInputSteam which will ensure that underlying methods will
++                // be called with the proper privileges.
++                return new HDFSPrivilegedInputSteam(fileContext.open(new Path(path, blobName), bufferSize), securityContext);
+             }
+         });
+     }
+@@ -161,4 +171,59 @@ public boolean accept(Path path) {
+     public Map<String, BlobMetaData> listBlobs() throws IOException {
+         return listBlobsByPrefix(null);
+     }
++
++    /**
++     * Exists to wrap underlying InputStream methods that might need to make connections or
++     * perform actions within doPrivileged blocks. The HDFS Client performs a lot underneath
++     * the FSInputStream, including making connections and executing reflection based RPC calls.
++     */
++    private static class HDFSPrivilegedInputSteam extends FilterInputStream {
++
++        private final HdfsSecurityContext securityContext;
++
++        HDFSPrivilegedInputSteam(InputStream in, HdfsSecurityContext hdfsSecurityContext) {
++            super(in);
++            this.securityContext = hdfsSecurityContext;
++        }
++
++        public int read() throws IOException {
++            return doPrivilegedOrThrow(in::read);
++        }
++
++        public int read(byte b[]) throws IOException {
++            return doPrivilegedOrThrow(() -> in.read(b));
++        }
++
++        public int read(byte b[], int off, int len) throws IOException {
++            return doPrivilegedOrThrow(() -> in.read(b, off, len));
++        }
++
++        public long skip(long n) throws IOException {
++            return doPrivilegedOrThrow(() -> in.skip(n));
++        }
++
++        public int available() throws IOException {
++            return doPrivilegedOrThrow(() -> in.available());
++        }
++
++        public synchronized void reset() throws IOException {
++            doPrivilegedOrThrow(() -> {
++                in.reset();
++                return null;
++            });
++        }
++
++        private <T> T doPrivilegedOrThrow(PrivilegedExceptionAction<T> action) throws IOException {
++            SecurityManager sm = System.getSecurityManager();
++            if (sm != null) {
++                // unprivileged code such as scripts do not have SpecialPermission
++                sm.checkPermission(new SpecialPermission());
++            }
++            try {
++                return AccessController.doPrivileged(action, null, securityContext.getRestrictedExecutionPermissions());
++            } catch (PrivilegedActionException e) {
++                throw (IOException) e.getCause();
++            }
++        }
++    }
+ }
+diff --git a/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsBlobStore.java b/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsBlobStore.java
+index b7ad5635c776..0556c17d0851 100644
+--- a/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsBlobStore.java
++++ b/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsBlobStore.java
+@@ -86,7 +86,7 @@ public String toString() {
+ 
+     @Override
+     public BlobContainer blobContainer(BlobPath path) {
+-        return new HdfsBlobContainer(path, this, buildHdfsPath(path), bufferSize);
++        return new HdfsBlobContainer(path, this, buildHdfsPath(path), bufferSize, this.securityContext);
+     }
+ 
+     private Path buildHdfsPath(BlobPath blobPath) {
+diff --git a/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsRepository.java b/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsRepository.java
+index f07ec1b1fc3e..9fd64b79d29a 100644
+--- a/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsRepository.java
++++ b/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsRepository.java
+@@ -139,7 +139,7 @@ private FileContext createContext(URI uri, Settings repositorySettings)  {
+         hadoopConfiguration.setBoolean("fs.hdfs.impl.disable.cache", true);
+ 
+         // Create the filecontext with our user information
+-        // This will correctly configure the filecontext to have our UGI as it's internal user.
++        // This will correctly configure the filecontext to have our UGI as its internal user.
+         return ugi.doAs((PrivilegedAction<FileContext>) () -> {
+             try {
+                 AbstractFileSystem fs = AbstractFileSystem.get(uri, hadoopConfiguration);
+diff --git a/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsSecurityContext.java b/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsSecurityContext.java
+index 3cd1a5a40fdc..2a63df6c8bc4 100644
+--- a/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsSecurityContext.java
++++ b/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsSecurityContext.java
+@@ -26,8 +26,6 @@
+ import java.nio.file.Path;
+ import java.security.Permission;
+ import java.util.Arrays;
+-import java.util.Locale;
+-import java.util.function.Supplier;
+ import javax.security.auth.AuthPermission;
+ import javax.security.auth.PrivateCredentialPermission;
+ import javax.security.auth.kerberos.ServicePermission;
+@@ -41,7 +39,7 @@
+  * Oversees all the security specific logic for the HDFS Repository plugin.
+  *
+  * Keeps track of the current user for a given repository, as well as which
+- * permissions to grant the blob store restricted execution methods.
++ * permissions to grant to privileged methods inside the BlobStore.
+  */
+ class HdfsSecurityContext {
+ 
+@@ -56,7 +54,9 @@
+             // 1) hadoop dynamic proxy is messy with access rules
+             new ReflectPermission("suppressAccessChecks"),
+             // 2) allow hadoop to add credentials to our Subject
+-            new AuthPermission("modifyPrivateCredentials")
++            new AuthPermission("modifyPrivateCredentials"),
++            // 3) RPC Engine requires this for re-establishing pooled connections over the lifetime of the client
++            new PrivateCredentialPermission("org.apache.hadoop.security.Credentials * \"*\"", "read")
+         };
+ 
+         // If Security is enabled, we need all the following elevated permissions:
+diff --git a/plugins/repository-hdfs/src/test/resources/rest-api-spec/test/hdfs_repository/30_snapshot_readonly.yaml b/plugins/repository-hdfs/src/test/resources/rest-api-spec/test/hdfs_repository/30_snapshot_readonly.yaml
+new file mode 100644
+index 000000000000..c2a37964e70a
+--- /dev/null
++++ b/plugins/repository-hdfs/src/test/resources/rest-api-spec/test/hdfs_repository/30_snapshot_readonly.yaml
+@@ -0,0 +1,29 @@
++# Integration tests for HDFS Repository plugin
++#
++# Tests retrieving information about snapshot
++#
++---
++"Get a snapshot - readonly":
++  # Create repository
++  - do:
++      snapshot.create_repository:
++        repository: test_snapshot_repository_ro
++        body:
++          type: hdfs
++          settings:
++            uri: "hdfs://localhost:9999"
++            path: "/user/elasticsearch/existing/readonly-repository"
++            readonly: true
++
++  # List snapshot info
++  - do:
++      snapshot.get:
++        repository: test_snapshot_repository_ro
++        snapshot: "_all"
++
++  - length: { snapshots: 1 }
++
++  # Remove our repository
++  - do:
++     snapshot.delete_repository:
++       repository: test_snapshot_repository_ro
+diff --git a/plugins/repository-hdfs/src/test/resources/rest-api-spec/test/secure_hdfs_repository/30_snapshot_readonly.yaml b/plugins/repository-hdfs/src/test/resources/rest-api-spec/test/secure_hdfs_repository/30_snapshot_readonly.yaml
+new file mode 100644
+index 000000000000..8c4c0347a156
+--- /dev/null
++++ b/plugins/repository-hdfs/src/test/resources/rest-api-spec/test/secure_hdfs_repository/30_snapshot_readonly.yaml
+@@ -0,0 +1,31 @@
++# Integration tests for HDFS Repository plugin
++#
++# Tests retrieving information about snapshot
++#
++---
++"Get a snapshot - readonly":
++  # Create repository
++  - do:
++      snapshot.create_repository:
++        repository: test_snapshot_repository_ro
++        body:
++          type: hdfs
++          settings:
++            uri: "hdfs://localhost:9998"
++            path: "/user/elasticsearch/existing/readonly-repository"
++            security:
++              principal: "elasticsearch@BUILD.ELASTIC.CO"
++            readonly: true
++
++  # List snapshot info
++  - do:
++      snapshot.get:
++        repository: test_snapshot_repository_ro
++        snapshot: "_all"
++
++  - length: { snapshots: 1 }
++
++  # Remove our repository
++  - do:
++     snapshot.delete_repository:
++       repository: test_snapshot_repository_ro
+diff --git a/test/fixtures/hdfs-fixture/src/main/java/hdfs/MiniHDFS.java b/test/fixtures/hdfs-fixture/src/main/java/hdfs/MiniHDFS.java
+index 7d41d94e99a3..73f4e443b076 100644
+--- a/test/fixtures/hdfs-fixture/src/main/java/hdfs/MiniHDFS.java
++++ b/test/fixtures/hdfs-fixture/src/main/java/hdfs/MiniHDFS.java
+@@ -19,7 +19,9 @@
+ 
+ package hdfs;
+ 
++import java.io.File;
+ import java.lang.management.ManagementFactory;
++import java.net.URL;
+ import java.nio.charset.StandardCharsets;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
+@@ -29,9 +31,11 @@
+ import java.util.Arrays;
+ import java.util.List;
+ 
++import org.apache.commons.io.FileUtils;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
+ import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.FileUtil;
+ import org.apache.hadoop.fs.permission.AclEntry;
+ import org.apache.hadoop.fs.permission.AclEntryType;
+ import org.apache.hadoop.fs.permission.FsAction;
+@@ -100,15 +104,35 @@ public static void main(String[] args) throws Exception {
+         }
+         MiniDFSCluster dfs = builder.build();
+ 
+-        // Set the elasticsearch user directory up
+-        if (UserGroupInformation.isSecurityEnabled()) {
+-            FileSystem fs = dfs.getFileSystem();
+-            org.apache.hadoop.fs.Path esUserPath = new org.apache.hadoop.fs.Path("/user/elasticsearch");
++        // Configure contents of the filesystem
++        org.apache.hadoop.fs.Path esUserPath = new org.apache.hadoop.fs.Path("/user/elasticsearch");
++        try (FileSystem fs = dfs.getFileSystem()) {
++
++            // Set the elasticsearch user directory up
+             fs.mkdirs(esUserPath);
+-            List<AclEntry> acls = new ArrayList<>();
+-            acls.add(new AclEntry.Builder().setType(AclEntryType.USER).setName("elasticsearch").setPermission(FsAction.ALL).build());
+-            fs.modifyAclEntries(esUserPath, acls);
+-            fs.close();
++            if (UserGroupInformation.isSecurityEnabled()) {
++                List<AclEntry> acls = new ArrayList<>();
++                acls.add(new AclEntry.Builder().setType(AclEntryType.USER).setName("elasticsearch").setPermission(FsAction.ALL).build());
++                fs.modifyAclEntries(esUserPath, acls);
++            }
++
++            // Install a pre-existing repository into HDFS
++            String directoryName = "readonly-repository";
++            String archiveName = directoryName + ".tar.gz";
++            URL readOnlyRepositoryArchiveURL = MiniHDFS.class.getClassLoader().getResource(archiveName);
++            if (readOnlyRepositoryArchiveURL != null) {
++                Path tempDirectory = Files.createTempDirectory(MiniHDFS.class.getName());
++                File readOnlyRepositoryArchive = tempDirectory.resolve(archiveName).toFile();
++                FileUtils.copyURLToFile(readOnlyRepositoryArchiveURL, readOnlyRepositoryArchive);
++                FileUtil.unTar(readOnlyRepositoryArchive, tempDirectory.toFile());
++
++                fs.copyFromLocalFile(true, true,
++                    new org.apache.hadoop.fs.Path(tempDirectory.resolve(directoryName).toAbsolutePath().toUri()),
++                    esUserPath.suffix("/existing/" + directoryName)
++                );
++
++                FileUtils.deleteDirectory(tempDirectory.toFile());
++            }
+         }
+ 
+         // write our PID file
+diff --git a/test/fixtures/hdfs-fixture/src/main/resources/readonly-repository.tar.gz b/test/fixtures/hdfs-fixture/src/main/resources/readonly-repository.tar.gz
+new file mode 100644
+index 000000000000..2cdb6d77c07d
+Binary files /dev/null and b/test/fixtures/hdfs-fixture/src/main/resources/readonly-repository.tar.gz differ

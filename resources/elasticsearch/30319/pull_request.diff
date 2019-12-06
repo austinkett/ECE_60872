@@ -1,0 +1,151 @@
+diff --git a/server/src/main/java/org/elasticsearch/action/admin/indices/validate/query/QueryExplanation.java b/server/src/main/java/org/elasticsearch/action/admin/indices/validate/query/QueryExplanation.java
+index df9c12c95f4c..780bf037f0e2 100644
+--- a/server/src/main/java/org/elasticsearch/action/admin/indices/validate/query/QueryExplanation.java
++++ b/server/src/main/java/org/elasticsearch/action/admin/indices/validate/query/QueryExplanation.java
+@@ -75,7 +75,11 @@ public String getExplanation() {
+ 
+     @Override
+     public void readFrom(StreamInput in) throws IOException {
+-        index = in.readString();
++        if (in.getVersion().onOrAfter(Version.V_6_4_0)) {
++            index = in.readOptionalString();
++        } else {
++            index = in.readString();
++        }
+         if (in.getVersion().onOrAfter(Version.V_5_4_0)) {
+             shard = in.readInt();
+         } else {
+@@ -88,7 +92,11 @@ public void readFrom(StreamInput in) throws IOException {
+ 
+     @Override
+     public void writeTo(StreamOutput out) throws IOException {
+-        out.writeString(index);
++        if (out.getVersion().onOrAfter(Version.V_6_4_0)) {
++            out.writeOptionalString(index);
++        } else {
++            out.writeString(index);
++        }
+         if (out.getVersion().onOrAfter(Version.V_5_4_0)) {
+             out.writeInt(shard);
+         }
+diff --git a/server/src/main/java/org/elasticsearch/action/admin/indices/validate/query/TransportValidateQueryAction.java b/server/src/main/java/org/elasticsearch/action/admin/indices/validate/query/TransportValidateQueryAction.java
+index 0513a37e4fe0..5be321734b5d 100644
+--- a/server/src/main/java/org/elasticsearch/action/admin/indices/validate/query/TransportValidateQueryAction.java
++++ b/server/src/main/java/org/elasticsearch/action/admin/indices/validate/query/TransportValidateQueryAction.java
+@@ -38,8 +38,11 @@
+ import org.elasticsearch.common.inject.Inject;
+ import org.elasticsearch.common.lease.Releasables;
+ import org.elasticsearch.common.settings.Settings;
++import org.elasticsearch.index.IndexNotFoundException;
+ import org.elasticsearch.index.query.ParsedQuery;
+ import org.elasticsearch.index.query.QueryShardException;
++import org.elasticsearch.index.query.Rewriteable;
++import org.elasticsearch.indices.IndexClosedException;
+ import org.elasticsearch.search.SearchService;
+ import org.elasticsearch.search.internal.AliasFilter;
+ import org.elasticsearch.search.internal.SearchContext;
+@@ -54,6 +57,7 @@
+ import java.util.Map;
+ import java.util.Set;
+ import java.util.concurrent.atomic.AtomicReferenceArray;
++import java.util.function.LongSupplier;
+ 
+ public class TransportValidateQueryAction extends TransportBroadcastAction<ValidateQueryRequest, ValidateQueryResponse, ShardValidateQueryRequest, ShardValidateQueryResponse> {
+ 
+@@ -71,7 +75,39 @@ public TransportValidateQueryAction(Settings settings, ThreadPool threadPool, Cl
+     @Override
+     protected void doExecute(Task task, ValidateQueryRequest request, ActionListener<ValidateQueryResponse> listener) {
+         request.nowInMillis = System.currentTimeMillis();
+-        super.doExecute(task, request, listener);
++        LongSupplier timeProvider = () -> request.nowInMillis;
++        ActionListener<org.elasticsearch.index.query.QueryBuilder> rewriteListener = ActionListener.wrap(rewrittenQuery -> {
++            request.query(rewrittenQuery);
++            super.doExecute(task, request, listener);
++        },
++            ex -> {
++            if (ex instanceof IndexNotFoundException ||
++                ex instanceof IndexClosedException) {
++                listener.onFailure(ex);
++            }
++            List<QueryExplanation> explanations = new ArrayList<>();
++            explanations.add(new QueryExplanation(null,
++                QueryExplanation.RANDOM_SHARD,
++                false,
++                null,
++                ex.getMessage()));
++            listener.onResponse(
++                new ValidateQueryResponse(
++                    false,
++                    explanations,
++                    // totalShards is documented as "the total shards this request ran against",
++                    // which is 0 since the failure is happening on the coordinating node.
++                    0,
++                    0 ,
++                    0,
++                    null));
++        });
++        if (request.query() == null) {
++            rewriteListener.onResponse(request.query());
++        } else {
++            Rewriteable.rewriteAndFetch(request.query(), searchService.getRewriteContext(timeProvider),
++                rewriteListener);
++        }
+     }
+ 
+     @Override
+diff --git a/server/src/main/java/org/elasticsearch/index/query/Rewriteable.java b/server/src/main/java/org/elasticsearch/index/query/Rewriteable.java
+index 492130527e8d..ba8d6b84d537 100644
+--- a/server/src/main/java/org/elasticsearch/index/query/Rewriteable.java
++++ b/server/src/main/java/org/elasticsearch/index/query/Rewriteable.java
+@@ -19,6 +19,7 @@
+ package org.elasticsearch.index.query;
+ 
+ import org.elasticsearch.action.ActionListener;
++import org.elasticsearch.common.ParsingException;
+ 
+ import java.io.IOException;
+ import java.util.ArrayList;
+@@ -111,7 +112,7 @@
+                 }
+             }
+             rewriteResponse.onResponse(builder);
+-        } catch (IOException ex) {
++        } catch (IOException|IllegalArgumentException|ParsingException ex) {
+             rewriteResponse.onFailure(ex);
+         }
+     }
+diff --git a/server/src/test/java/org/elasticsearch/validate/SimpleValidateQueryIT.java b/server/src/test/java/org/elasticsearch/validate/SimpleValidateQueryIT.java
+index a87f428fec51..66fdf8174441 100644
+--- a/server/src/test/java/org/elasticsearch/validate/SimpleValidateQueryIT.java
++++ b/server/src/test/java/org/elasticsearch/validate/SimpleValidateQueryIT.java
+@@ -29,6 +29,8 @@
+ import org.elasticsearch.index.query.MoreLikeThisQueryBuilder;
+ import org.elasticsearch.index.query.QueryBuilder;
+ import org.elasticsearch.index.query.QueryBuilders;
++import org.elasticsearch.index.query.TermsQueryBuilder;
++import org.elasticsearch.indices.TermsLookup;
+ import org.elasticsearch.test.ESIntegTestCase;
+ import org.elasticsearch.test.ESIntegTestCase.ClusterScope;
+ import org.elasticsearch.test.ESIntegTestCase.Scope;
+@@ -330,4 +332,21 @@ private static void assertExplanations(QueryBuilder queryBuilder,
+             assertThat(response.isValid(), equalTo(true));
+         }
+     }
++
++    public void testExplainTermsQueryWithLookup() throws Exception {
++        client().admin().indices().prepareCreate("twitter")
++            .addMapping("_doc", "user", "type=integer", "followers", "type=integer")
++            .setSettings(Settings.builder().put(SETTING_NUMBER_OF_SHARDS, 2).put("index.number_of_routing_shards", 2)).get();
++        client().prepareIndex("twitter", "_doc", "1")
++            .setSource("followers", new int[] {1, 2, 3}).get();
++        refresh();
++
++        TermsQueryBuilder termsLookupQuery = QueryBuilders.termsLookupQuery("user", new TermsLookup("twitter", "_doc", "1", "followers"));
++        ValidateQueryResponse response = client().admin().indices().prepareValidateQuery("twitter")
++            .setTypes("_doc")
++            .setQuery(termsLookupQuery)
++            .setExplain(true)
++            .execute().actionGet();
++        assertThat(response.isValid(), is(true));
++    }
+ }

@@ -1,0 +1,357 @@
+diff --git a/core/src/main/java/org/elasticsearch/cluster/metadata/MetaDataUpdateSettingsService.java b/core/src/main/java/org/elasticsearch/cluster/metadata/MetaDataUpdateSettingsService.java
+index 41dd64cf86cb..bd8b09e8e175 100644
+--- a/core/src/main/java/org/elasticsearch/cluster/metadata/MetaDataUpdateSettingsService.java
++++ b/core/src/main/java/org/elasticsearch/cluster/metadata/MetaDataUpdateSettingsService.java
+@@ -227,6 +227,9 @@ public ClusterState execute(ClusterState currentState) {
+ 
+                 int updatedNumberOfReplicas = openSettings.getAsInt(IndexMetaData.SETTING_NUMBER_OF_REPLICAS, -1);
+                 if (updatedNumberOfReplicas != -1 && preserveExisting == false) {
++                    // we do *not* update the in sync allocation ids as they will be removed upon the first index
++                    // operation which make these copies stale
++                    // TODO: update the list once the data is deleted by the node?
+                     routingTableBuilder.updateNumberOfReplicas(updatedNumberOfReplicas, actualIndices);
+                     metaDataBuilder.updateNumberOfReplicas(updatedNumberOfReplicas, actualIndices);
+                     logger.info("updating number_of_replicas to [{}] for indices {}", updatedNumberOfReplicas, actualIndices);
+diff --git a/core/src/main/java/org/elasticsearch/cluster/routing/RoutingNode.java b/core/src/main/java/org/elasticsearch/cluster/routing/RoutingNode.java
+index 8403f45a550b..4ba277d99cd5 100644
+--- a/core/src/main/java/org/elasticsearch/cluster/routing/RoutingNode.java
++++ b/core/src/main/java/org/elasticsearch/cluster/routing/RoutingNode.java
+@@ -19,18 +19,15 @@
+ 
+ package org.elasticsearch.cluster.routing;
+ 
+-import org.apache.lucene.util.CollectionUtil;
+ import org.elasticsearch.cluster.node.DiscoveryNode;
+ import org.elasticsearch.common.Nullable;
+ import org.elasticsearch.index.shard.ShardId;
+ 
+ import java.util.ArrayList;
+ import java.util.Collections;
+-import java.util.Comparator;
+ import java.util.Iterator;
+ import java.util.LinkedHashMap;
+ import java.util.List;
+-import java.util.Map;
+ 
+ /**
+  * A {@link RoutingNode} represents a cluster node associated with a single {@link DiscoveryNode} including all shards
+@@ -103,7 +100,8 @@ public int size() {
+      */
+     void add(ShardRouting shard) {
+         if (shards.containsKey(shard.shardId())) {
+-            throw new IllegalStateException("Trying to add a shard " + shard.shardId() + " to a node [" + nodeId + "] where it already exists");
++            throw new IllegalStateException("Trying to add a shard " + shard.shardId() + " to a node [" + nodeId
++                + "] where it already exists. current [" + shards.get(shard.shardId()) + "]. new [" + shard + "]");
+         }
+         shards.put(shard.shardId(), shard);
+     }
+diff --git a/core/src/main/java/org/elasticsearch/cluster/routing/allocation/allocator/BalancedShardsAllocator.java b/core/src/main/java/org/elasticsearch/cluster/routing/allocation/allocator/BalancedShardsAllocator.java
+index 7087ae57c4b3..50c2d28cf014 100644
+--- a/core/src/main/java/org/elasticsearch/cluster/routing/allocation/allocator/BalancedShardsAllocator.java
++++ b/core/src/main/java/org/elasticsearch/cluster/routing/allocation/allocator/BalancedShardsAllocator.java
+@@ -792,10 +792,8 @@ private boolean tryRelocateShard(ModelNode minNode, ModelNode maxNode, String id
+                     long shardSize = allocation.clusterInfo().getShardSize(candidate, ShardRouting.UNAVAILABLE_EXPECTED_SHARD_SIZE);
+ 
+                     if (decision.type() == Type.YES) { /* only allocate on the cluster if we are not throttled */
+-                        if (logger.isTraceEnabled()) {
+-                            logger.trace("Relocate shard [{}] from node [{}] to node [{}]", candidate, maxNode.getNodeId(),
++                        logger.debug("Relocate shard [{}] from node [{}] to node [{}]", candidate, maxNode.getNodeId(),
+                                     minNode.getNodeId());
+-                        }
+                         /* now allocate on the cluster */
+                         minNode.addShard(routingNodes.relocateShard(candidate, minNode.getNodeId(), shardSize, allocation.changes()).v1());
+                         return true;
+diff --git a/core/src/main/java/org/elasticsearch/index/shard/IndexShard.java b/core/src/main/java/org/elasticsearch/index/shard/IndexShard.java
+index 1522200f894c..1eb21d55e226 100644
+--- a/core/src/main/java/org/elasticsearch/index/shard/IndexShard.java
++++ b/core/src/main/java/org/elasticsearch/index/shard/IndexShard.java
+@@ -336,8 +336,21 @@ public long getPrimaryTerm() {
+     public void updatePrimaryTerm(final long newTerm) {
+         synchronized (mutex) {
+             if (newTerm != primaryTerm) {
+-                assert shardRouting.primary() == false : "a primary shard should never update it's term. shard: " + shardRouting
+-                    + " current term [" + primaryTerm + "] new term [" + newTerm + "]";
++                // Note that due to cluster state batching an initializing primary shard term can failed and re-assigned
++                // in one state causing it's term to be incremented. Note that if both current shard state and new
++                // shard state are initializing, we could replace the current shard and reinitialize it. It is however
++                // possible that this shard is being started. This can happen if:
++                // 1) Shard is post recovery and sends shard started to the master
++                // 2) Node gets disconnected and rejoins
++                // 3) Master assigns the shard back to the node
++                // 4) Master processes the shard started and starts the shard
++                // 5) The node process the cluster state where the shard is both started and primary term is incremented.
++                //
++                // We could fail the shard in that case, but this will cause it to be removed from the insync allocations list
++                // potentially preventing re-allocation.
++                assert shardRouting.primary() == false || shardRouting.initializing() == false :
++                    "a started primary shard should never update it's term. shard: " + shardRouting
++                        + " current term [" + primaryTerm + "] new term [" + newTerm + "]";
+                 assert newTerm > primaryTerm : "primary terms can only go up. current [" + primaryTerm + "], new [" + newTerm + "]";
+                 primaryTerm = newTerm;
+             }
+diff --git a/core/src/main/java/org/elasticsearch/indices/cluster/IndicesClusterStateService.java b/core/src/main/java/org/elasticsearch/indices/cluster/IndicesClusterStateService.java
+index e766f6ecefb6..920de8ae4679 100644
+--- a/core/src/main/java/org/elasticsearch/indices/cluster/IndicesClusterStateService.java
++++ b/core/src/main/java/org/elasticsearch/indices/cluster/IndicesClusterStateService.java
+@@ -186,7 +186,7 @@ public synchronized void clusterChanged(final ClusterChangedEvent event) {
+ 
+         failMissingShards(state);
+ 
+-        removeShards(state);
++        removeShards(state);   // removes any local shards that doesn't match what the master expects
+ 
+         updateIndices(event); // can also fail shards, but these are then guaranteed to be in failedShardsCache
+ 
+@@ -370,11 +370,21 @@ private void removeShards(final ClusterState state) {
+                 ShardRouting currentRoutingEntry = shard.routingEntry();
+                 ShardId shardId = currentRoutingEntry.shardId();
+                 ShardRouting newShardRouting = localRoutingNode == null ? null : localRoutingNode.getByShardId(shardId);
+-                if (newShardRouting == null || newShardRouting.isSameAllocation(currentRoutingEntry) == false) {
++                if (newShardRouting == null) {
+                     // we can just remove the shard without cleaning it locally, since we will clean it in IndicesStore
+                     // once all shards are allocated
+                     logger.debug("{} removing shard (not allocated)", shardId);
+                     indexService.removeShard(shardId.id(), "removing shard (not allocated)");
++                } else if (newShardRouting.isSameAllocation(currentRoutingEntry) == false) {
++                    logger.debug("{} removing shard (stale allocation id, stale {}, new {})", shardId,
++                        currentRoutingEntry, newShardRouting);
++                    indexService.removeShard(shardId.id(), "removing shard (stale copy)");
++                } else if (newShardRouting.initializing() && currentRoutingEntry.active()) {
++                    // this can happen if the node was isolated/gc-ed, rejoins the cluster and a new shard with the same allocation id
++                    // is assigned to it. Batch cluster state processing or if shard fetching completes before the node gets a new cluster
++                    // state may result in a new shard being initialized while having the same allocation id as the currently started shard.
++                    logger.debug("{} removing shard (not active, current {}, new {})", shardId, currentRoutingEntry, newShardRouting);
++                    indexService.removeShard(shardId.id(), "removing shard (stale copy)");
+                 } else {
+                     // remove shards where recovery source has changed. This re-initializes shards later in createOrUpdateShards
+                     if (newShardRouting.recoverySource() != null && newShardRouting.recoverySource().getType() == Type.PEER) {
+diff --git a/core/src/test/java/org/elasticsearch/indices/cluster/AbstractIndicesClusterStateServiceTestCase.java b/core/src/test/java/org/elasticsearch/indices/cluster/AbstractIndicesClusterStateServiceTestCase.java
+index 5cb57152a3cd..19b55e2c7738 100644
+--- a/core/src/test/java/org/elasticsearch/indices/cluster/AbstractIndicesClusterStateServiceTestCase.java
++++ b/core/src/test/java/org/elasticsearch/indices/cluster/AbstractIndicesClusterStateServiceTestCase.java
+@@ -37,10 +37,10 @@
+ import org.elasticsearch.index.shard.ShardId;
+ import org.elasticsearch.indices.IndicesService;
+ import org.elasticsearch.indices.cluster.IndicesClusterStateService.AllocatedIndex;
+-import org.elasticsearch.indices.cluster.IndicesClusterStateService.Shard;
+ import org.elasticsearch.indices.cluster.IndicesClusterStateService.AllocatedIndices;
+-import org.elasticsearch.indices.recovery.RecoveryState;
++import org.elasticsearch.indices.cluster.IndicesClusterStateService.Shard;
+ import org.elasticsearch.indices.recovery.PeerRecoveryTargetService;
++import org.elasticsearch.indices.recovery.RecoveryState;
+ import org.elasticsearch.repositories.RepositoriesService;
+ import org.elasticsearch.test.ESTestCase;
+ import org.junit.Before;
+@@ -55,7 +55,9 @@
+ import static java.util.Collections.emptyMap;
+ import static java.util.Collections.unmodifiableMap;
+ import static org.elasticsearch.common.collect.MapBuilder.newMapBuilder;
++import static org.hamcrest.Matchers.empty;
+ import static org.hamcrest.Matchers.equalTo;
++import static org.hamcrest.Matchers.greaterThanOrEqualTo;
+ 
+ /**
+  * Abstract base class for tests against {@link IndicesClusterStateService}
+@@ -87,7 +89,7 @@ public void assertClusterStateMatchesNodeState(ClusterState state, IndicesCluste
+         RoutingNode localRoutingNode = state.getRoutingNodes().node(state.getNodes().getLocalNodeId());
+         if (localRoutingNode != null) {
+             if (enableRandomFailures == false) {
+-                assertTrue("failed shard cache should be empty", failedShardsCache.isEmpty());
++                assertThat("failed shard cache should be empty", failedShardsCache.values(), empty());
+             }
+             // check that all shards in local routing nodes have been allocated
+             for (ShardRouting shardRouting : localRoutingNode) {
+@@ -261,6 +263,9 @@ public boolean updateMapping(IndexMetaData indexMetaData) throws IOException {
+         @Override
+         public void updateMetaData(IndexMetaData indexMetaData) {
+             indexSettings.updateIndexMetaData(indexMetaData);
++            for (MockIndexShard shard: shards.values()) {
++                shard.updateTerm(indexMetaData.primaryTerm(shard.shardId().id()));
++            }
+         }
+ 
+         @Override
+@@ -270,7 +275,7 @@ public MockIndexShard getShardOrNull(int shardId) {
+ 
+         public synchronized MockIndexShard createShard(ShardRouting routing) throws IOException {
+             failRandomly();
+-            MockIndexShard shard = new MockIndexShard(routing);
++            MockIndexShard shard = new MockIndexShard(routing, indexSettings.getIndexMetaData().primaryTerm(routing.shardId().id()));
+             shards = newMapBuilder(shards).put(routing.id(), shard).immutableMap();
+             return shard;
+         }
+@@ -303,9 +308,11 @@ public Index index() {
+     protected class MockIndexShard implements IndicesClusterStateService.Shard {
+         private volatile ShardRouting shardRouting;
+         private volatile RecoveryState recoveryState;
++        private volatile long term;
+ 
+-        public MockIndexShard(ShardRouting shardRouting) {
++        public MockIndexShard(ShardRouting shardRouting, long term) {
+             this.shardRouting = shardRouting;
++            this.term = term;
+         }
+ 
+         @Override
+@@ -331,9 +338,21 @@ public IndexShardState state() {
+         @Override
+         public void updateRoutingEntry(ShardRouting shardRouting) throws IOException {
+             failRandomly();
+-            assert this.shardId().equals(shardRouting.shardId());
+-            assert this.shardRouting.isSameAllocation(shardRouting);
++            assertThat(this.shardId(), equalTo(shardRouting.shardId()));
++            assertTrue("current: " + this.shardRouting + ", got: " + shardRouting, this.shardRouting.isSameAllocation(shardRouting));
++            if (this.shardRouting.active()) {
++                assertTrue("and active shard must stay active, current: " + this.shardRouting + ", got: " + shardRouting,
++                    shardRouting.active());
++            }
+             this.shardRouting = shardRouting;
+         }
++
++        public void updateTerm(long newTerm) {
++            assertThat("term can only be incremented: " + shardRouting, newTerm, greaterThanOrEqualTo(term));
++            if (shardRouting.primary() && shardRouting.active()) {
++                assertThat("term can not be changed on an active primary shard: " + shardRouting, newTerm, equalTo(term));
++            }
++            this.term = newTerm;
++        }
+     }
+ }
+diff --git a/core/src/test/java/org/elasticsearch/indices/cluster/IndicesClusterStateServiceRandomUpdatesTests.java b/core/src/test/java/org/elasticsearch/indices/cluster/IndicesClusterStateServiceRandomUpdatesTests.java
+index a711ccbe02ec..48a105874fbf 100644
+--- a/core/src/test/java/org/elasticsearch/indices/cluster/IndicesClusterStateServiceRandomUpdatesTests.java
++++ b/core/src/test/java/org/elasticsearch/indices/cluster/IndicesClusterStateServiceRandomUpdatesTests.java
+@@ -19,6 +19,7 @@
+ 
+ package org.elasticsearch.indices.cluster;
+ 
++import org.apache.logging.log4j.message.ParameterizedMessage;
+ import org.elasticsearch.Version;
+ import org.elasticsearch.action.admin.cluster.reroute.ClusterRerouteRequest;
+ import org.elasticsearch.action.admin.indices.close.CloseIndexRequest;
+@@ -62,6 +63,7 @@
+ import java.util.Map.Entry;
+ import java.util.Set;
+ import java.util.concurrent.Executor;
++import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.function.Supplier;
+ 
+ import static org.elasticsearch.cluster.metadata.IndexMetaData.SETTING_NUMBER_OF_REPLICAS;
+@@ -78,7 +80,6 @@ public void testRandomClusterStateUpdates() {
+         // we have an IndicesClusterStateService per node in the cluster
+         final Map<DiscoveryNode, IndicesClusterStateService> clusterStateServiceMap = new HashMap<>();
+         ClusterState state = randomInitialClusterState(clusterStateServiceMap, MockIndicesService::new);
+-
+         // each of the following iterations represents a new cluster state update processed on all nodes
+         for (int i = 0; i < 30; i++) {
+             logger.info("Iteration {}", i);
+@@ -86,7 +87,14 @@ public void testRandomClusterStateUpdates() {
+ 
+             // calculate new cluster state
+             for (int j = 0; j < randomInt(3); j++) { // multiple iterations to simulate batching of cluster states
+-                state = randomlyUpdateClusterState(state, clusterStateServiceMap, MockIndicesService::new);
++                try {
++                    state = randomlyUpdateClusterState(state, clusterStateServiceMap, MockIndicesService::new);
++                } catch (AssertionError error) {
++                    ClusterState finalState = state;
++                    logger.error((org.apache.logging.log4j.util.Supplier<?>) () ->
++                        new ParameterizedMessage("failed to random change state. last good state: \n{}", finalState.prettyPrint()), error);
++                    throw error;
++                }
+             }
+ 
+             // apply cluster state to nodes (incl. master)
+@@ -94,7 +102,15 @@ public void testRandomClusterStateUpdates() {
+                 IndicesClusterStateService indicesClusterStateService = clusterStateServiceMap.get(node);
+                 ClusterState localState = adaptClusterStateToLocalNode(state, node);
+                 ClusterState previousLocalState = adaptClusterStateToLocalNode(previousState, node);
+-                indicesClusterStateService.clusterChanged(new ClusterChangedEvent("simulated change " + i, localState, previousLocalState));
++                final ClusterChangedEvent event = new ClusterChangedEvent("simulated change " + i, localState, previousLocalState);
++                try {
++                    indicesClusterStateService.clusterChanged(event);
++                } catch (AssertionError error) {
++                    logger.error((org.apache.logging.log4j.util.Supplier<?>) () -> new ParameterizedMessage(
++                            "failed to apply change on [{}].\n ***  Previous state ***\n{}\n ***  New state ***\n{}",
++                            node, event.previousState().prettyPrint(), event.state().prettyPrint()), error);
++                    throw error;
++                }
+ 
+                 // check that cluster state has been properly applied to node
+                 assertClusterStateMatchesNodeState(localState, indicesClusterStateService);
+@@ -137,7 +153,7 @@ public void testJoiningNewClusterOnlyRemovesInMemoryIndexStructures() {
+         // simulate the cluster state change on the node
+         ClusterState localState = adaptClusterStateToLocalNode(stateWithIndex, node);
+         ClusterState previousLocalState = adaptClusterStateToLocalNode(initialState, node);
+-        IndicesClusterStateService indicesCSSvc = createIndicesClusterStateService(RecordingIndicesService::new);
++        IndicesClusterStateService indicesCSSvc = createIndicesClusterStateService(node, RecordingIndicesService::new);
+         indicesCSSvc.start();
+         indicesCSSvc.clusterChanged(new ClusterChangedEvent("cluster state change that adds the index", localState, previousLocalState));
+ 
+@@ -183,7 +199,7 @@ private void updateNodes(ClusterState state, Map<DiscoveryNode, IndicesClusterSt
+                              Supplier<MockIndicesService> indicesServiceSupplier) {
+         for (DiscoveryNode node : state.nodes()) {
+             clusterStateServiceMap.computeIfAbsent(node, discoveryNode -> {
+-                IndicesClusterStateService ics = createIndicesClusterStateService(indicesServiceSupplier);
++                IndicesClusterStateService ics = createIndicesClusterStateService(discoveryNode, indicesServiceSupplier);
+                 ics.start();
+                 return ics;
+             });
+@@ -313,6 +329,13 @@ public ClusterState randomlyUpdateClusterState(ClusterState state,
+                         state = cluster.deassociateDeadNodes(state, true, "removed and added a node");
+                         updateNodes(state, clusterStateServiceMap, indicesServiceSupplier);
+                     }
++                    if (randomBoolean()) {
++                        // and add it back
++                        DiscoveryNodes newNodes = DiscoveryNodes.builder(state.nodes()).add(discoveryNode).build();
++                        state = ClusterState.builder(state).nodes(newNodes).build();
++                        state = cluster.reroute(state, new ClusterRerouteRequest());
++                        updateNodes(state, clusterStateServiceMap, indicesServiceSupplier);
++                    }
+                 }
+             }
+         }
+@@ -322,12 +345,15 @@ public ClusterState randomlyUpdateClusterState(ClusterState state,
+         return state;
+     }
+ 
++    private static final AtomicInteger nodeIdGenerator = new AtomicInteger();
++
+     protected DiscoveryNode createNode(DiscoveryNode.Role... mustHaveRoles) {
+         Set<DiscoveryNode.Role> roles = new HashSet<>(randomSubsetOf(Sets.newHashSet(DiscoveryNode.Role.values())));
+         for (DiscoveryNode.Role mustHaveRole : mustHaveRoles) {
+             roles.add(mustHaveRole);
+         }
+-        return new DiscoveryNode("node_" + randomAsciiOfLength(8), LocalTransportAddress.buildUnique(), Collections.emptyMap(), roles,
++        final String id = String.format(Locale.ROOT, "node_%03d", nodeIdGenerator.incrementAndGet());
++        return new DiscoveryNode(id, id, LocalTransportAddress.buildUnique(), Collections.emptyMap(), roles,
+             Version.CURRENT);
+     }
+ 
+@@ -335,20 +361,22 @@ private static ClusterState adaptClusterStateToLocalNode(ClusterState state, Dis
+         return ClusterState.builder(state).nodes(DiscoveryNodes.builder(state.nodes()).localNodeId(node.getId())).build();
+     }
+ 
+-    private IndicesClusterStateService createIndicesClusterStateService(final Supplier<MockIndicesService> indicesServiceSupplier) {
++    private IndicesClusterStateService createIndicesClusterStateService(DiscoveryNode discoveryNode,
++                                                                        final Supplier<MockIndicesService> indicesServiceSupplier) {
+         final ThreadPool threadPool = mock(ThreadPool.class);
+         final Executor executor = mock(Executor.class);
+         when(threadPool.generic()).thenReturn(executor);
+         final MockIndicesService indicesService = indicesServiceSupplier.get();
+-        final TransportService transportService = new TransportService(Settings.EMPTY, null, threadPool,
++        final Settings settings = Settings.builder().put("node.name", discoveryNode.getName()).build();
++        final TransportService transportService = new TransportService(settings, null, threadPool,
+             TransportService.NOOP_TRANSPORT_INTERCEPTOR);
+         final ClusterService clusterService = mock(ClusterService.class);
+-        final RepositoriesService repositoriesService = new RepositoriesService(Settings.EMPTY, clusterService,
++        final RepositoriesService repositoriesService = new RepositoriesService(settings, clusterService,
+             transportService, null);
+-        final PeerRecoveryTargetService recoveryTargetService = new PeerRecoveryTargetService(Settings.EMPTY, threadPool,
++        final PeerRecoveryTargetService recoveryTargetService = new PeerRecoveryTargetService(settings, threadPool,
+             transportService, null, clusterService);
+         final ShardStateAction shardStateAction = mock(ShardStateAction.class);
+-        return new IndicesClusterStateService(Settings.EMPTY, indicesService, clusterService,
++        return new IndicesClusterStateService(settings, indicesService, clusterService,
+             threadPool, recoveryTargetService, shardStateAction, null, repositoriesService, null, null, null, null, null);
+     }
+ 

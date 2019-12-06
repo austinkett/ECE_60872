@@ -1,0 +1,251 @@
+diff --git a/docs/reference/ml/apis/put-datafeed.asciidoc b/docs/reference/ml/apis/put-datafeed.asciidoc
+index 2e0f6700191c..78ad9ee25a94 100644
+--- a/docs/reference/ml/apis/put-datafeed.asciidoc
++++ b/docs/reference/ml/apis/put-datafeed.asciidoc
+@@ -59,6 +59,11 @@ IMPORTANT:  You must use {kib} or this API to create a {dfeed}. Do not put a {df
+ `indices` (required)::
+   (array) An array of index names. Wildcards are supported. For example:
+   `["it_ops_metrics", "server*"]`.
+++
++--
++NOTE: If any indices are in remote clusters then `cluster.remote.connect` must
++not be set to `false` on any ML node.
++--
+ 
+ `job_id` (required)::
+  (string) A numerical character string that uniquely identifies the job.
+diff --git a/x-pack/plugin/core/src/main/java/org/elasticsearch/xpack/core/ml/job/messages/Messages.java b/x-pack/plugin/core/src/main/java/org/elasticsearch/xpack/core/ml/job/messages/Messages.java
+index 80542909efda..8e736593145d 100644
+--- a/x-pack/plugin/core/src/main/java/org/elasticsearch/xpack/core/ml/job/messages/Messages.java
++++ b/x-pack/plugin/core/src/main/java/org/elasticsearch/xpack/core/ml/job/messages/Messages.java
+@@ -49,6 +49,9 @@
+     public static final String DATAFEED_FREQUENCY_MUST_BE_MULTIPLE_OF_AGGREGATIONS_INTERVAL =
+             "Datafeed frequency [{0}] must be a multiple of the aggregation interval [{1}]";
+     public static final String DATAFEED_ID_ALREADY_TAKEN = "A datafeed with id [{0}] already exists";
++    public static final String DATAFEED_NEEDS_REMOTE_CLUSTER_SEARCH = "Datafeed [{0}] is configured with a remote index pattern(s) {1}" +
++        " but the current node [{2}] is not allowed to connect to remote clusters." +
++        " Please enable cluster.remote.connect for all machine learning nodes.";
+ 
+     public static final String FILTER_CANNOT_DELETE = "Cannot delete filter [{0}] currently used by jobs {1}";
+     public static final String FILTER_CONTAINS_TOO_MANY_ITEMS = "Filter [{0}] contains too many items; up to [{1}] items are allowed";
+diff --git a/x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/MachineLearning.java b/x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/MachineLearning.java
+index 770eaa0a40f8..5a9b3008c028 100644
+--- a/x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/MachineLearning.java
++++ b/x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/MachineLearning.java
+@@ -445,7 +445,7 @@ protected Clock getClock() {
+                 normalizerFactory, xContentRegistry, auditor, clusterService);
+         this.autodetectProcessManager.set(autodetectProcessManager);
+         DatafeedJobBuilder datafeedJobBuilder = new DatafeedJobBuilder(client, settings, xContentRegistry,
+-                auditor, System::currentTimeMillis);
++                auditor, System::currentTimeMillis, clusterService.getNodeName());
+         DatafeedManager datafeedManager = new DatafeedManager(threadPool, client, clusterService, datafeedJobBuilder,
+                 System::currentTimeMillis, auditor, autodetectProcessManager);
+         this.datafeedManager.set(datafeedManager);
+diff --git a/x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/action/TransportStartDatafeedAction.java b/x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/action/TransportStartDatafeedAction.java
+index 1a0d1b84c87d..cb3e0643df1e 100644
+--- a/x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/action/TransportStartDatafeedAction.java
++++ b/x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/action/TransportStartDatafeedAction.java
+@@ -35,6 +35,7 @@
+ import org.elasticsearch.rest.RestStatus;
+ import org.elasticsearch.tasks.TaskId;
+ import org.elasticsearch.threadpool.ThreadPool;
++import org.elasticsearch.transport.RemoteClusterService;
+ import org.elasticsearch.transport.TransportService;
+ import org.elasticsearch.xpack.core.XPackField;
+ import org.elasticsearch.xpack.core.ml.MlTasks;
+@@ -44,6 +45,7 @@
+ import org.elasticsearch.xpack.core.ml.datafeed.DatafeedState;
+ import org.elasticsearch.xpack.core.ml.job.config.Job;
+ import org.elasticsearch.xpack.core.ml.job.config.JobState;
++import org.elasticsearch.xpack.core.ml.job.messages.Messages;
+ import org.elasticsearch.xpack.core.ml.utils.ExceptionsHelper;
+ import org.elasticsearch.xpack.ml.MachineLearning;
+ import org.elasticsearch.xpack.ml.MlConfigMigrationEligibilityCheck;
+@@ -80,6 +82,7 @@ To ensure that a subsequent stop datafeed call will see that same task status (a
+     private final Auditor auditor;
+     private final MlConfigMigrationEligibilityCheck migrationEligibilityCheck;
+     private final NamedXContentRegistry xContentRegistry;
++    private final boolean remoteClusterSearchSupported;
+ 
+     @Inject
+     public TransportStartDatafeedAction(Settings settings, TransportService transportService, ThreadPool threadPool,
+@@ -98,6 +101,7 @@ public TransportStartDatafeedAction(Settings settings, TransportService transpor
+         this.auditor = auditor;
+         this.migrationEligibilityCheck = new MlConfigMigrationEligibilityCheck(settings, clusterService);
+         this.xContentRegistry = xContentRegistry;
++        this.remoteClusterSearchSupported = RemoteClusterService.ENABLE_REMOTE_CLUSTERS.get(settings);
+     }
+ 
+     static void validate(Job job,
+@@ -175,7 +179,7 @@ public void onFailure(Exception e) {
+                 };
+ 
+         // Verify data extractor factory can be created, then start persistent task
+-        Consumer<Job> createDataExtrator = job -> {
++        Consumer<Job> createDataExtractor = job -> {
+                 if (RemoteClusterLicenseChecker.containsRemoteIndex(params.getDatafeedIndices())) {
+                     final RemoteClusterLicenseChecker remoteClusterLicenseChecker =
+                             new RemoteClusterLicenseChecker(client, XPackLicenseState::isMachineLearningAllowedForOperationMode);
+@@ -187,6 +191,13 @@ public void onFailure(Exception e) {
+                                     response -> {
+                                         if (response.isSuccess() == false) {
+                                             listener.onFailure(createUnlicensedError(params.getDatafeedId(), response));
++                                        } else if (remoteClusterSearchSupported == false) {
++                                            listener.onFailure(
++                                                ExceptionsHelper.badRequestException(Messages.getMessage(
++                                                    Messages.DATAFEED_NEEDS_REMOTE_CLUSTER_SEARCH,
++                                                    datafeedConfigHolder.get().getId(),
++                                                    RemoteClusterLicenseChecker.remoteIndices(datafeedConfigHolder.get().getIndices()),
++                                                    clusterService.getNodeName())));
+                                         } else {
+                                             createDataExtractor(job, datafeedConfigHolder.get(), params, waitForTaskListener);
+                                         }
+@@ -208,7 +219,7 @@ public void onFailure(Exception e) {
+                         Job job = jobBuilder.build();
+                         validate(job, datafeedConfigHolder.get(), tasks, xContentRegistry);
+                         auditDeprecations(datafeedConfigHolder.get(), job, auditor, xContentRegistry);
+-                        createDataExtrator.accept(job);
++                        createDataExtractor.accept(job);
+                     } catch (Exception e) {
+                         listener.onFailure(e);
+                     }
+diff --git a/x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/datafeed/DatafeedJobBuilder.java b/x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/datafeed/DatafeedJobBuilder.java
+index 969bb53571ea..3fa9841e2d03 100644
+--- a/x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/datafeed/DatafeedJobBuilder.java
++++ b/x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/datafeed/DatafeedJobBuilder.java
+@@ -11,14 +11,18 @@
+ import org.elasticsearch.common.settings.Settings;
+ import org.elasticsearch.common.unit.TimeValue;
+ import org.elasticsearch.common.xcontent.NamedXContentRegistry;
++import org.elasticsearch.license.RemoteClusterLicenseChecker;
++import org.elasticsearch.transport.RemoteClusterService;
+ import org.elasticsearch.xpack.core.ml.action.util.QueryPage;
+ import org.elasticsearch.xpack.core.ml.datafeed.DatafeedConfig;
+ import org.elasticsearch.xpack.core.ml.datafeed.DatafeedJobValidator;
+ import org.elasticsearch.xpack.core.ml.job.config.DataDescription;
+ import org.elasticsearch.xpack.core.ml.job.config.Job;
++import org.elasticsearch.xpack.core.ml.job.messages.Messages;
+ import org.elasticsearch.xpack.core.ml.job.process.autodetect.state.DataCounts;
+ import org.elasticsearch.xpack.core.ml.job.results.Bucket;
+ import org.elasticsearch.xpack.core.ml.job.results.Result;
++import org.elasticsearch.xpack.core.ml.utils.ExceptionsHelper;
+ import org.elasticsearch.xpack.ml.datafeed.delayeddatacheck.DelayedDataDetector;
+ import org.elasticsearch.xpack.ml.datafeed.delayeddatacheck.DelayedDataDetectorFactory;
+ import org.elasticsearch.xpack.ml.datafeed.extractor.DataExtractorFactory;
+@@ -29,6 +33,7 @@
+ import org.elasticsearch.xpack.ml.notifications.Auditor;
+ 
+ import java.util.Collections;
++import java.util.List;
+ import java.util.Objects;
+ import java.util.concurrent.atomic.AtomicReference;
+ import java.util.function.Consumer;
+@@ -41,14 +46,18 @@
+     private final NamedXContentRegistry xContentRegistry;
+     private final Auditor auditor;
+     private final Supplier<Long> currentTimeSupplier;
++    private final boolean remoteClusterSearchSupported;
++    private final String nodeName;
+ 
+     public DatafeedJobBuilder(Client client, Settings settings, NamedXContentRegistry xContentRegistry,
+-                              Auditor auditor, Supplier<Long> currentTimeSupplier) {
++                              Auditor auditor, Supplier<Long> currentTimeSupplier, String nodeName) {
+         this.client = client;
+         this.settings = Objects.requireNonNull(settings);
+         this.xContentRegistry = Objects.requireNonNull(xContentRegistry);
+         this.auditor = Objects.requireNonNull(auditor);
+         this.currentTimeSupplier = Objects.requireNonNull(currentTimeSupplier);
++        this.remoteClusterSearchSupported = RemoteClusterService.ENABLE_REMOTE_CLUSTERS.get(settings);
++        this.nodeName = nodeName;
+     }
+ 
+     void build(String datafeedId, ActionListener<DatafeedJob> listener) {
+@@ -151,6 +160,18 @@ void build(String datafeedId, JobResultsProvider jobResultsProvider, JobConfigPr
+                 configBuilder -> {
+                     try {
+                         datafeedConfigHolder.set(configBuilder.build());
++                        if (remoteClusterSearchSupported == false) {
++                            List<String> remoteIndices = RemoteClusterLicenseChecker.remoteIndices(datafeedConfigHolder.get().getIndices());
++                            if (remoteIndices.isEmpty() == false) {
++                                listener.onFailure(
++                                    ExceptionsHelper.badRequestException(Messages.getMessage(
++                                        Messages.DATAFEED_NEEDS_REMOTE_CLUSTER_SEARCH,
++                                        configBuilder.getId(),
++                                        remoteIndices,
++                                        nodeName)));
++                                return;
++                            }
++                        }
+                         jobConfigProvider.getJob(datafeedConfigHolder.get().getJobId(), jobConfigListener);
+                     } catch (Exception e) {
+                         listener.onFailure(e);
+diff --git a/x-pack/plugin/ml/src/test/java/org/elasticsearch/xpack/ml/datafeed/DatafeedJobBuilderTests.java b/x-pack/plugin/ml/src/test/java/org/elasticsearch/xpack/ml/datafeed/DatafeedJobBuilderTests.java
+index 7595346d0c70..53cb70ae63f6 100644
+--- a/x-pack/plugin/ml/src/test/java/org/elasticsearch/xpack/ml/datafeed/DatafeedJobBuilderTests.java
++++ b/x-pack/plugin/ml/src/test/java/org/elasticsearch/xpack/ml/datafeed/DatafeedJobBuilderTests.java
+@@ -13,10 +13,12 @@
+ import org.elasticsearch.mock.orig.Mockito;
+ import org.elasticsearch.test.ESTestCase;
+ import org.elasticsearch.threadpool.ThreadPool;
++import org.elasticsearch.transport.RemoteClusterService;
+ import org.elasticsearch.xpack.core.ml.action.util.QueryPage;
+ import org.elasticsearch.xpack.core.ml.datafeed.DatafeedConfig;
+ import org.elasticsearch.xpack.core.ml.job.config.DataDescription;
+ import org.elasticsearch.xpack.core.ml.job.config.Job;
++import org.elasticsearch.xpack.core.ml.job.messages.Messages;
+ import org.elasticsearch.xpack.core.ml.job.process.autodetect.state.DataCounts;
+ import org.elasticsearch.xpack.core.ml.job.results.Bucket;
+ import org.elasticsearch.xpack.ml.datafeed.persistence.DatafeedConfigProvider;
+@@ -60,7 +62,8 @@ public void init() {
+         when(client.settings()).thenReturn(Settings.EMPTY);
+         auditor = mock(Auditor.class);
+         taskHandler = mock(Consumer.class);
+-        datafeedJobBuilder = new DatafeedJobBuilder(client, Settings.EMPTY, xContentRegistry(), auditor, System::currentTimeMillis);
++        datafeedJobBuilder = 
++            new DatafeedJobBuilder(client, Settings.EMPTY, xContentRegistry(), auditor, System::currentTimeMillis, "test_node");
+ 
+         jobResultsProvider = mock(JobResultsProvider.class);
+         Mockito.doAnswer(invocationOnMock -> {
+@@ -190,6 +193,42 @@ public void testBuild_GivenBucketsRequestFails() {
+         verify(taskHandler).accept(error);
+     }
+ 
++    public void testBuildGivenRemoteIndicesButNoRemoteSearching() throws Exception {
++        Settings settings = Settings.builder().put(RemoteClusterService.ENABLE_REMOTE_CLUSTERS.getKey(), false).build();
++        datafeedJobBuilder =
++            new DatafeedJobBuilder(
++                client,
++                settings,
++                xContentRegistry(),
++                auditor,
++                System::currentTimeMillis,
++                "test_node");
++        DataDescription.Builder dataDescription = new DataDescription.Builder();
++        dataDescription.setTimeField("time");
++        Job.Builder jobBuilder = DatafeedManagerTests.createDatafeedJob();
++        jobBuilder.setDataDescription(dataDescription);
++        jobBuilder.setCreateTime(new Date());
++        DatafeedConfig.Builder datafeed = DatafeedManagerTests.createDatafeedConfig("datafeed1", jobBuilder.getId());
++        datafeed.setIndices(Collections.singletonList("remotecluster:index-*"));
++
++        AtomicBoolean wasHandlerCalled = new AtomicBoolean(false);
++        ActionListener<DatafeedJob> datafeedJobHandler = ActionListener.wrap(
++            datafeedJob -> fail("datafeed builder did not fail when remote index was given and remote clusters were not enabled"),
++            e -> {
++                assertThat(e.getMessage(), equalTo(Messages.getMessage(Messages.DATAFEED_NEEDS_REMOTE_CLUSTER_SEARCH,
++                    "datafeed1",
++                    "[remotecluster:index-*]",
++                    "test_node")));
++                wasHandlerCalled.compareAndSet(false, true);
++            }
++        );
++
++        givenJob(jobBuilder);
++        givenDatafeed(datafeed);
++        datafeedJobBuilder.build("datafeed1", jobResultsProvider, jobConfigProvider, datafeedConfigProvider, datafeedJobHandler);
++        assertBusy(() -> wasHandlerCalled.get());
++    }
++
+     private void givenJob(Job.Builder job) {
+         Mockito.doAnswer(invocationOnMock -> {
+             @SuppressWarnings("unchecked")

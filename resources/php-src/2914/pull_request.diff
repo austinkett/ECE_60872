@@ -1,0 +1,678 @@
+diff --git a/ext/pdo_dblib/dblib_driver.c b/ext/pdo_dblib/dblib_driver.c
+index 502238219f0d..b161a18a2548 100644
+--- a/ext/pdo_dblib/dblib_driver.c
++++ b/ext/pdo_dblib/dblib_driver.c
+@@ -102,6 +102,7 @@ static int dblib_handle_preparer(pdo_dbh_t *dbh, const char *sql, size_t sql_len
+ {
+ 	pdo_dblib_db_handle *H = (pdo_dblib_db_handle *)dbh->driver_data;
+ 	pdo_dblib_stmt *S = ecalloc(1, sizeof(*S));
++	pdo_dblib_rpc_stmt *rpc;
+ 
+ 	S->H = H;
+ 	stmt->driver_data = S;
+@@ -109,6 +110,16 @@ static int dblib_handle_preparer(pdo_dbh_t *dbh, const char *sql, size_t sql_len
+ 	stmt->supports_placeholders = PDO_PLACEHOLDER_NONE;
+ 	S->computed_column_name_count = 0;
+ 	S->err.sqlstate = stmt->error_code;
++	S->rpc = NULL;
++
++	if (pdo_attr_lval(driver_options, PDO_DBLIB_ATTR_RPC, 0)) {
++		S->rpc = emalloc(sizeof(*rpc));
++		rpc = S->rpc;
++		rpc->return_count = 0;
++		rpc->skip_results = pdo_attr_lval(driver_options, PDO_DBLIB_ATTR_RPC_SKIP_RESULTS, 0);
++
++		stmt->supports_placeholders = PDO_PLACEHOLDER_NAMED|PDO_PLACEHOLDER_POSITIONAL;
++	}
+ 
+ 	return 1;
+ }
+diff --git a/ext/pdo_dblib/dblib_stmt.c b/ext/pdo_dblib/dblib_stmt.c
+index b4e437282126..fa6b975ee4da 100644
+--- a/ext/pdo_dblib/dblib_stmt.c
++++ b/ext/pdo_dblib/dblib_stmt.c
+@@ -33,6 +33,8 @@
+ #include "php_pdo_dblib_int.h"
+ #include "zend_exceptions.h"
+ 
++static int pdo_dblib_rpc_exec(pdo_stmt_t *stmt);
++
+ 
+ /* {{{ pdo_dblib_get_field_name
+  *
+@@ -112,6 +114,10 @@ static int pdo_dblib_stmt_dtor(pdo_stmt_t *stmt)
+ {
+ 	pdo_dblib_stmt *S = (pdo_dblib_stmt*)stmt->driver_data;
+ 
++	if (S->rpc) {
++		efree(S->rpc);
++	}
++
+ 	pdo_dblib_err_dtor(&S->err);
+ 
+ 	efree(S);
+@@ -181,12 +187,25 @@ static int pdo_dblib_stmt_execute(pdo_stmt_t *stmt)
+ 
+ 	pdo_dblib_stmt_cursor_closer(stmt);
+ 
+-	if (FAIL == dbcmd(H->link, stmt->active_query_string)) {
+-		return 0;
+-	}
++	if (S->rpc) {
++		if (!pdo_dblib_rpc_exec(stmt)) {
++			return 0;
++		}
+ 
+-	if (FAIL == dbsqlexec(H->link)) {
+-		return 0;
++		if (S->rpc->skip_results) {
++			while (SUCCEED == dbresults(H->link)) {
++				while(NO_MORE_ROWS != dbnextrow(H->link)) {};
++			}
++			return 1;
++		}
++	} else {
++		if (FAIL == dbcmd(H->link, stmt->active_query_string)) {
++			return 0;
++		}
++
++		if (FAIL == dbsqlexec(H->link)) {
++			return 0;
++		}
+ 	}
+ 
+ 	pdo_dblib_stmt_next_rowset_no_cancel(stmt);
+@@ -350,10 +369,9 @@ static void pdo_dblib_stmt_stringify_col(int coltype, LPBYTE data, DBINT data_le
+ 	*ptr = zv;
+ }
+ 
+-static int pdo_dblib_stmt_get_col(pdo_stmt_t *stmt, int colno, char **ptr,
+-	 zend_ulong *len, int *caller_frees)
++static int pdo_dblib_stmt_get_col_or_ret(pdo_stmt_t *stmt, int colno, char **ptr,
++	 zend_ulong *len, int is_ret)
+ {
+-
+ 	pdo_dblib_stmt *S = (pdo_dblib_stmt*)stmt->driver_data;
+ 	pdo_dblib_db_handle *H = S->H;
+ 
+@@ -363,9 +381,15 @@ static int pdo_dblib_stmt_get_col(pdo_stmt_t *stmt, int colno, char **ptr,
+ 	DBINT data_len, tmp_data_len;
+ 	zval *zv = NULL;
+ 
+-	coltype = dbcoltype(H->link, colno+1);
+-	data = dbdata(H->link, colno+1);
+-	data_len = dbdatlen(H->link, colno+1);
++	if (is_ret) {
++		coltype = dbrettype(H->link, colno+1);
++		data = dbretdata(H->link, colno+1);
++		data_len = dbretlen(H->link, colno+1);
++	} else {
++		coltype = dbcoltype(H->link, colno+1);
++		data = dbdata(H->link, colno+1);
++		data_len = dbdatlen(H->link, colno+1);
++	}
+ 
+ 	if (data_len != 0 || data != NULL) {
+ 		if (pdo_dblib_stmt_should_stringify_col(stmt, coltype) && dbwillconvert(coltype, SQLCHAR)) {
+@@ -506,11 +530,16 @@ static int pdo_dblib_stmt_get_col(pdo_stmt_t *stmt, int colno, char **ptr,
+ 		*len = 0;
+ 	}
+ 
+-	*caller_frees = 1;
+-
+ 	return 1;
+ }
+ 
++static int pdo_dblib_stmt_get_col(pdo_stmt_t *stmt, int colno, char **ptr,
++	 zend_ulong *len, int *caller_frees)
++{
++	*caller_frees = 1;
++	return pdo_dblib_stmt_get_col_or_ret(stmt, colno, ptr, len, 0);
++}
++
+ static int pdo_dblib_stmt_get_column_meta(pdo_stmt_t *stmt, zend_long colno, zval *return_value)
+ {
+ 	pdo_dblib_stmt *S = (pdo_dblib_stmt*)stmt->driver_data;
+@@ -553,6 +582,329 @@ static int pdo_dblib_stmt_get_column_meta(pdo_stmt_t *stmt, zend_long colno, zva
+ 	return 1;
+ }
+ 
++static int pdo_dblib_rpc_param_cmp(const void* a, const void* b)
++{
++	/* sort by paramno, pushing -1 at the end */
++	int a_no = ((struct pdo_bound_param_data *)Z_PTR(((Bucket *)a)->val))->paramno;
++	int b_no = ((struct pdo_bound_param_data *)Z_PTR(((Bucket *)b)->val))->paramno;
++
++	if (a_no == b_no) return 0;
++	if (a_no == -1) return 1;
++	if (b_no == -1) return -1;
++	if (a_no < b_no) return -1;
++	return 1;
++}
++
++static int pdo_dblib_rpc_param_hook(pdo_stmt_t *stmt, struct pdo_bound_param_data *param,
++	enum pdo_param_event event_type, int init_post)
++{
++	pdo_dblib_stmt *S = (pdo_dblib_stmt*)stmt->driver_data;
++	pdo_dblib_db_handle *H = S->H;
++	pdo_dblib_rpc_stmt *rpc = S->rpc;
++	pdo_dblib_param *P = (pdo_dblib_param*)param->driver_data;
++	zval *parameter;
++	char *param_name = NULL;
++
++	/* FREE: free driver_data */
++	if (event_type == PDO_PARAM_EVT_FREE) {
++		if (P) {
++			efree(P);
++		}
++		return 1;
++	}
++
++	if (!Z_ISREF(param->parameter)) {
++		parameter = &param->parameter;
++	} else {
++		parameter = Z_REFVAL(param->parameter);
++	}
++
++	if (param->paramno == -1) {
++		param_name = ZSTR_VAL(param->name);
++	}
++
++
++	/* NORMALIZE: init/check param */
++	if (event_type == PDO_PARAM_EVT_NORMALIZE) {
++		/* force "@" prefix instead of ":" */
++		if (param_name) {
++			param_name[0] = '@';
++		}
++
++		return 1;
++	}
++
++
++	/* ALLOC: init driver_data (+ sort?) */
++	if (event_type == PDO_PARAM_EVT_ALLOC) {
++
++		if ((param->param_type & PDO_PARAM_INPUT_OUTPUT) == PDO_PARAM_INPUT_OUTPUT) {
++			P = emalloc(sizeof(*P));
++			param->driver_data = P;
++			P->retval = 0;
++
++			if (param_name && !strncmp(param_name, "@RETVAL", sizeof("@RETVAL")-1)) {
++				P->retval = 1;
++			}
++		}
++
++		/* done in rpc_exec, before INIT_POST
++		zend_hash_sort(stmt->bound_params, pdo_dblib_rpc_param_cmp, 0);
++		*/
++
++		return 1;
++	}
++
++
++	/* INIT_POST: prepare data & call dbrpcparam */
++	/*
++	 * dbrpcinit and dbrpcparam must be called must be called before each execution
++	 * instead of calling dbrpcparam in EXEC_PRE we trigger another event in exec, after calling dbrpcinit
++	 */
++	if (event_type == PDO_PARAM_EVT_EXEC_PRE && init_post) {
++		char *value = NULL;
++		int datalen = 0, status = 0;
++		long type = 0, maxlen = -1, zendtype = 0, pdotype = 0;
++
++		if (P && P->retval) {
++			return 1;
++		}
++
++		/* set zendtype and convert value, according to the pdotype hint */
++		pdotype = PDO_PARAM_TYPE(param->param_type);
++		zendtype = Z_TYPE_P(parameter);
++		if (pdotype == PDO_PARAM_NULL || zendtype == IS_NULL) {
++			zendtype = IS_NULL;
++		} else if (pdotype == PDO_PARAM_BOOL || zendtype == IS_FALSE || zendtype == IS_TRUE) {
++			convert_to_long_ex(parameter);
++			zendtype = _IS_BOOL;
++		} else if (pdotype == PDO_PARAM_INT) {
++			if (zendtype != IS_DOUBLE && zendtype != IS_LONG) {
++				convert_to_long_ex(parameter);
++				zendtype = IS_LONG;
++			}
++		} else if (pdotype != PDO_PARAM_ZVAL && zendtype != IS_STRING) {
++			/* default = STRING */
++			convert_to_string_ex(parameter);
++			zendtype = IS_STRING;
++		}
++
++		/* set rpc bind data */
++		switch(zendtype) {
++			case IS_NULL:
++				datalen = 0;
++				value = NULL;
++				type = SQLVARCHAR;
++				break;
++			case IS_FALSE:
++			case IS_TRUE:
++			case _IS_BOOL:
++				datalen = -1;
++				value = (LPBYTE)(&Z_LVAL_P(parameter));
++				type = SQLINT1;
++				break;
++			case IS_LONG:
++				datalen = -1;
++				value = (LPBYTE)(&Z_LVAL_P(parameter));
++				/* TODO: smaller if possible */
++				type = SQLINT8;
++				break;
++			case IS_DOUBLE:
++				datalen = -1;
++				value = (LPBYTE)(&Z_DVAL_P(parameter));
++				type = SQLFLT8;
++				break;
++			case IS_STRING:
++				datalen = Z_STRLEN_P(parameter);
++				value = Z_STRVAL_P(parameter);
++				type = datalen > 8000 ? SQLTEXT : SQLVARCHAR;
++				break;
++			/* TODO */
++			case IS_OBJECT:
++			case IS_RESOURCE:
++			case IS_ARRAY:
++			default:
++				pdo_raise_impl_error(stmt->dbh, stmt, "HY000", "PDO_DBLIB: RPC: Unsupported variable type.");
++				return 0;
++		}
++
++		if (P) {
++			status = DBRPCRETURN;
++			P->return_pos = rpc->return_count++;
++			if (type == SQLTEXT) {
++				if (dbtds(H->link) < DBTDS_7_2) {
++					php_error_docref(NULL, E_WARNING, "Falling back to varchar(8000)");
++					type = SQLVARCHAR;
++				}
++				maxlen = datalen;
++			} else if (type == SQLVARCHAR) {
++				maxlen = 8000;
++			}
++		}
++
++		if (FAIL == dbrpcparam(H->link, param_name, (BYTE)status, type, maxlen, datalen, (LPBYTE)value)) {
++			pdo_raise_impl_error(stmt->dbh, stmt, "HY000", "PDO_DBLIB: RPC: Unable to set parameter.");
++
++			/* dbrpcinit has been called / need to reset it */
++			dbrpcinit(H->link, "", DBRPCRESET);
++
++			return 0;
++		}
++
++		return 1;
++	}
++
++
++	/* FETCH/EXEC: get return value */
++	if (
++		/* after FETCH with results / EXEC without */
++		(event_type == PDO_PARAM_EVT_EXEC_POST || event_type == PDO_PARAM_EVT_FETCH_POST) &&
++		(param->param_type & PDO_PARAM_INPUT_OUTPUT) == PDO_PARAM_INPUT_OUTPUT
++	) {
++		/* get RETVAL */
++		if (P->retval) {
++			if (dbhasretstat(H->link)) {
++				convert_to_long_ex(parameter);
++				Z_LVAL_P(parameter) = dbretstatus(H->link);
++			}
++
++			return 1;
++		}
++
++		/* fetch value from returns */
++		int num_rets;
++		char *value = NULL;
++		size_t value_len = 0;
++
++		if (!(num_rets = dbnumrets(H->link))) {
++			return 1;
++		}
++
++		if (P->return_pos >= num_rets) {
++			pdo_raise_impl_error(stmt->dbh, stmt, "HY000", "PDO_DBLIB: RPC: Missing output parameter.");
++			return 0;
++		}
++
++		/* not worth checking
++		if (param_name && strcmp(param_name, dbretname(H->link, P->return_pos+1))) {
++			pdo_raise_impl_error(stmt->dbh, stmt, "HY000", "PDO_DBLIB: RPC: Output param name error.");
++			return 0;
++		} */
++
++		pdo_dblib_stmt_get_col_or_ret(stmt, P->return_pos, &value, &value_len, 1);
++
++		if (value && value_len == sizeof(zval)) {
++			ZVAL_COPY_VALUE(parameter, (zval *)value);
++		} else {
++			ZVAL_NULL(parameter);
++		}
++		efree(value);
++
++		return 1;
++	}
++
++	return 1;
++};
++
++static int pdo_dblib_rpc_exec(pdo_stmt_t *stmt)
++{
++	pdo_dblib_stmt *S = (pdo_dblib_stmt*)stmt->driver_data;
++	pdo_dblib_db_handle *H = S->H;
++	pdo_dblib_rpc_stmt *rpc = S->rpc;
++	RETCODE ret;
++
++	/* rpc init */
++	if (FAIL == dbrpcinit(H->link, stmt->query_string, 0)) {
++		pdo_raise_impl_error(stmt->dbh, stmt, "HY000", "PDO_DBLIB: RPC: Unable to init.");
++		return 0;
++	}
++
++	/* rpc bind via INIT_POST */
++	rpc->return_count = 0;
++	if (stmt->bound_params) {
++		struct pdo_bound_param_data *param;
++
++		zend_hash_sort(stmt->bound_params, pdo_dblib_rpc_param_cmp, 0);
++
++		ZEND_HASH_FOREACH_PTR(stmt->bound_params, param) {
++			if (!pdo_dblib_rpc_param_hook(stmt, param, PDO_PARAM_EVT_EXEC_PRE, 1)) {
++				return 0;
++			}
++		} ZEND_HASH_FOREACH_END();
++	}
++
++	/* rpc exec */
++	ret = dbrpcexec(H->link);
++	if (FAIL == ret || FAIL == dbsqlok(H->link)) {
++		if (FAIL == ret) {
++			dbcancel(H->link);
++		}
++
++		return 0;
++	}
++
++	return 1;
++}
++
++static int pdo_dblib_stmt_param_hook(pdo_stmt_t *stmt, struct pdo_bound_param_data *param,
++	enum pdo_param_event event_type)
++{
++	if (
++		event_type == PDO_PARAM_EVT_EXEC_PRE ||
++		event_type == PDO_PARAM_EVT_FETCH_PRE
++	) {
++		return 1;
++	}
++
++	pdo_dblib_stmt *S = (pdo_dblib_stmt*)stmt->driver_data;
++
++	if (!S->rpc) {
++		return 1;
++	}
++
++	if (PDO_PARAM_TYPE(param->param_type) == PDO_PARAM_STMT) {
++		return 0;
++	}
++
++	return pdo_dblib_rpc_param_hook(stmt, param, event_type, 0);
++}
++
++static int pdo_dblib_stmt_set_attr(pdo_stmt_t *stmt, zend_long attr, zval *val)
++{
++	pdo_dblib_stmt *S = (pdo_dblib_stmt*)stmt->driver_data;
++	pdo_dblib_rpc_stmt *rpc = S->rpc;
++
++	switch(attr) {
++		/* must be set at prepare time */
++		case PDO_DBLIB_ATTR_RPC:
++			return 0;
++		case PDO_DBLIB_ATTR_RPC_SKIP_RESULTS:
++			if (rpc) {
++				rpc->skip_results = zval_is_true(val);
++				return 1;
++			}
++			return 0;
++		default:
++			return 0;
++	}
++}
++
++static int pdo_dblib_stmt_get_attr(pdo_stmt_t *stmt, zend_long attr, zval *return_value)
++{
++	pdo_dblib_stmt *S = (pdo_dblib_stmt*)stmt->driver_data;
++	pdo_dblib_rpc_stmt *rpc = S->rpc;
++
++	switch(attr) {
++		case PDO_DBLIB_ATTR_RPC:
++			ZVAL_BOOL(return_value, rpc);
++			return 1;
++		case PDO_DBLIB_ATTR_RPC_SKIP_RESULTS:
++			ZVAL_BOOL(return_value, rpc ? rpc->skip_results : 0);
++			return 1;
++		default:
++			return 0;
++	}
++}
+ 
+ struct pdo_stmt_methods dblib_stmt_methods = {
+ 	pdo_dblib_stmt_dtor,
+@@ -560,9 +912,9 @@ struct pdo_stmt_methods dblib_stmt_methods = {
+ 	pdo_dblib_stmt_fetch,
+ 	pdo_dblib_stmt_describe,
+ 	pdo_dblib_stmt_get_col,
+-	NULL, /* param hook */
+-	NULL, /* set attr */
+-	NULL, /* get attr */
++	pdo_dblib_stmt_param_hook,
++	pdo_dblib_stmt_set_attr,
++	pdo_dblib_stmt_get_attr,
+ 	pdo_dblib_stmt_get_column_meta, /* meta */
+ 	pdo_dblib_stmt_next_rowset, /* nextrow */
+ 	pdo_dblib_stmt_cursor_closer
+diff --git a/ext/pdo_dblib/pdo_dblib.c b/ext/pdo_dblib/pdo_dblib.c
+index 223d7bc18d5b..b70935a50215 100644
+--- a/ext/pdo_dblib/pdo_dblib.c
++++ b/ext/pdo_dblib/pdo_dblib.c
+@@ -198,6 +198,8 @@ PHP_MINIT_FUNCTION(pdo_dblib)
+ 	REGISTER_PDO_CLASS_CONST_LONG("DBLIB_ATTR_TDS_VERSION", (long) PDO_DBLIB_ATTR_TDS_VERSION);
+ 	REGISTER_PDO_CLASS_CONST_LONG("DBLIB_ATTR_SKIP_EMPTY_ROWSETS", (long) PDO_DBLIB_ATTR_SKIP_EMPTY_ROWSETS);
+ 	REGISTER_PDO_CLASS_CONST_LONG("DBLIB_ATTR_DATETIME_CONVERT", (long) PDO_DBLIB_ATTR_DATETIME_CONVERT);
++	REGISTER_PDO_CLASS_CONST_LONG("DBLIB_ATTR_RPC", (long) PDO_DBLIB_ATTR_RPC);
++	REGISTER_PDO_CLASS_CONST_LONG("DBLIB_ATTR_RPC_SKIP_RESULTS", (long) PDO_DBLIB_ATTR_RPC_SKIP_RESULTS);
+ 
+ 	if (FAIL == dbinit()) {
+ 		return FAILURE;
+diff --git a/ext/pdo_dblib/php_pdo_dblib_int.h b/ext/pdo_dblib/php_pdo_dblib_int.h
+index cae7b77394ec..8a67126e533d 100644
+--- a/ext/pdo_dblib/php_pdo_dblib_int.h
++++ b/ext/pdo_dblib/php_pdo_dblib_int.h
+@@ -130,12 +130,23 @@ typedef struct {
+ 	unsigned datetime_convert:1;
+ } pdo_dblib_db_handle;
+ 
++typedef struct {
++	unsigned skip_results:1;
++	unsigned int return_count;
++} pdo_dblib_rpc_stmt;
++
+ typedef struct {
+ 	pdo_dblib_db_handle *H;
+ 	pdo_dblib_err err;
+ 	unsigned int computed_column_name_count;
++	pdo_dblib_rpc_stmt *rpc;
+ } pdo_dblib_stmt;
+ 
++typedef struct {
++	unsigned retval:1;
++	unsigned int return_pos;
++} pdo_dblib_param;
++
+ typedef struct {
+ 	const char* key;
+ 	int value;
+@@ -163,6 +174,8 @@ enum {
+ 	PDO_DBLIB_ATTR_TDS_VERSION,
+ 	PDO_DBLIB_ATTR_SKIP_EMPTY_ROWSETS,
+ 	PDO_DBLIB_ATTR_DATETIME_CONVERT,
++	PDO_DBLIB_ATTR_RPC,
++	PDO_DBLIB_ATTR_RPC_SKIP_RESULTS,
+ };
+ 
+ #endif
+diff --git a/ext/pdo_dblib/tests/rpc.phpt b/ext/pdo_dblib/tests/rpc.phpt
+new file mode 100644
+index 000000000000..770f950381d0
+--- /dev/null
++++ b/ext/pdo_dblib/tests/rpc.phpt
+@@ -0,0 +1,144 @@
++--TEST--
++PDO_DBLIB: RPC Support
++--SKIPIF--
++<?php
++if (!extension_loaded('pdo_dblib')) die('skip not loaded');
++require dirname(__FILE__) . '/config.inc';
++?>
++--FILE--
++<?php
++require dirname(__FILE__) . '/config.inc';
++$db->query('set language english');
++
++/* non RPC */
++$st = $db->prepare('select :test as test');
++var_dump($st->getAttribute(PDO::DBLIB_ATTR_RPC));
++$st->execute([':test' => 1]);
++var_dump($st->fetch(PDO::FETCH_ASSOC));
++
++/* RPC */
++$prms = [];
++$st = $db->prepare('sp_executesql', [PDO::DBLIB_ATTR_RPC => 1]);
++var_dump($st->getAttribute(PDO::DBLIB_ATTR_RPC));
++var_dump($st->getAttribute(PDO::DBLIB_ATTR_RPC_SKIP_RESULTS));
++$st->bindValue('stmt', 'set @b = @a');
++$st->bindValue('params', '@a varchar(10), @b varchar(10) out');
++$st->bindValue('a', 'test!');
++$st->bindParam('b', $prms['b'], PDO::PARAM_INPUT_OUTPUT);
++$st->bindParam('RETVAL', $prms['r'], PDO::PARAM_INPUT_OUTPUT);
++$st->execute();
++var_dump($prms);
++
++/* error */
++$st = $db->prepare('sp_doesnt_exist', [PDO::DBLIB_ATTR_RPC => 1]);
++try {
++  $st->execute();
++} catch (PDOException $e) {
++  $st = null;
++  if (strpos($e->getMessage(), "not find stored procedure 'sp_doesnt_exist'") > -1) echo "ok\n";
++}
++
++/* numbered params / mixed / unsorted */
++$prms = [];
++$st = $db->prepare('sp_executesql', [PDO::DBLIB_ATTR_RPC => 1]);
++$st->bindValue('a', 'numbered');
++$st->bindValue(2, '@a varchar(10), @b varchar(10) out');
++$st->bindParam('RETVAL', $prms['r'], PDO::PARAM_INPUT_OUTPUT);
++$st->bindValue(1, 'set @b = @a');
++$st->bindParam('b', $prms['b'], PDO::PARAM_INPUT_OUTPUT);
++$st->execute();
++var_dump($prms);
++
++/* re-bind */
++$st->bindValue('a', 're-bound');
++$st->execute();
++var_dump($prms['b']);
++
++/* types */
++$prms = ['c' => 1, 'd' => 1.2, 'e' => 'test'];
++for ($i=0; $i<12; $i++) $prms['e'] .= $prms['e'];
++$st = $db->prepare('sp_executesql', [PDO::DBLIB_ATTR_RPC => 1]);
++$st->bindValue('stmt', 'set @b = @a; select b=@b, c=@c, d=@d, e=len(@e)');
++$st->bindValue('params', '@a varchar(10), @c float=null, @d float=null, @e varchar(max)=null, @b varchar(10) out');
++$st->bindValue('a', 'select');
++$st->bindParam('b', $prms['b'], PDO::PARAM_INPUT_OUTPUT);
++$st->bindParam('c', $prms['c'], PDO::PARAM_INT);
++$st->bindParam('d', $prms['d'], PDO::PARAM_INT);
++$st->bindParam('e', $prms['e']);
++$st->execute();
++var_dump($st->fetch(PDO::FETCH_ASSOC));
++var_dump($prms['b']);
++
++/* skip results */
++$prms = ['a' => 'selectskip'];
++$st = $db->prepare('sp_executesql', [PDO::DBLIB_ATTR_RPC => 1, PDO::DBLIB_ATTR_RPC_SKIP_RESULTS => 1]);
++var_dump($st->getAttribute(PDO::DBLIB_ATTR_RPC_SKIP_RESULTS));
++$st->bindValue(1, 'set @b = @a; select @a, @b');
++$st->bindValue(2, '@a varchar(10), @b varchar(10) out');
++$st->bindParam(3, $prms['a']);
++$st->bindParam(4, $prms['b'], PDO::PARAM_INPUT_OUTPUT);
++$st->bindParam('RETVAL', $prms['r'], PDO::PARAM_INPUT_OUTPUT);
++$st->execute();
++var_dump($prms);
++
++/* redo */
++$prms['a'] = 'redo';
++$st->execute();
++var_dump($prms['b']);
++
++/* bindValue shortcut */
++$st = $db->prepare('sp_executesql', [PDO::DBLIB_ATTR_RPC => 1]);
++$st->execute([
++  'select a=@a',
++  '@a varchar(10)',
++  "sim'ple"
++]);
++var_dump($st->fetch(PDO::FETCH_ASSOC));
++?>
++--EXPECT--
++bool(false)
++array(1) {
++  ["test"]=>
++  string(1) "1"
++}
++bool(true)
++bool(false)
++array(2) {
++  ["b"]=>
++  &string(5) "test!"
++  ["r"]=>
++  &int(0)
++}
++ok
++array(2) {
++  ["r"]=>
++  &int(0)
++  ["b"]=>
++  &string(8) "numbered"
++}
++string(8) "re-bound"
++array(4) {
++  ["b"]=>
++  string(6) "select"
++  ["c"]=>
++  float(1)
++  ["d"]=>
++  float(1.2)
++  ["e"]=>
++  int(16384)
++}
++string(6) "select"
++bool(true)
++array(3) {
++  ["a"]=>
++  &string(10) "selectskip"
++  ["b"]=>
++  &string(10) "selectskip"
++  ["r"]=>
++  &int(0)
++}
++string(4) "redo"
++array(1) {
++  ["a"]=>
++  string(7) "sim'ple"
++}

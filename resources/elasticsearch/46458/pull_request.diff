@@ -1,0 +1,110 @@
+diff --git a/server/src/main/java/org/elasticsearch/action/bulk/TransportShardBulkAction.java b/server/src/main/java/org/elasticsearch/action/bulk/TransportShardBulkAction.java
+index e761c10ead14..a2fae5f5bbca 100644
+--- a/server/src/main/java/org/elasticsearch/action/bulk/TransportShardBulkAction.java
++++ b/server/src/main/java/org/elasticsearch/action/bulk/TransportShardBulkAction.java
+@@ -393,22 +393,20 @@ private static BulkItemResponse processUpdateResponse(final UpdateRequest update
+     public static Translog.Location performOnReplica(BulkShardRequest request, IndexShard replica) throws Exception {
+         Translog.Location location = null;
+         for (int i = 0; i < request.items().length; i++) {
+-            BulkItemRequest item = request.items()[i];
+-            final Engine.Result operationResult;
+-            DocWriteRequest<?> docWriteRequest = item.request();
++            final BulkItemRequest item = request.items()[i];
+             final BulkItemResponse response = item.getPrimaryResponse();
+-            final BulkItemResponse.Failure failure = response.getFailure();
+-            final DocWriteResponse writeResponse = response.getResponse();
+-            final long seqNum = failure == null ? writeResponse.getSeqNo() : failure.getSeqNo();
+-            if (seqNum == SequenceNumbers.UNASSIGNED_SEQ_NO) {
+-                assert failure != null || writeResponse.getResult() == DocWriteResponse.Result.NOOP
+-                    || writeResponse.getResult() == DocWriteResponse.Result.NOT_FOUND;
+-                continue;
+-            }
+-            if (failure == null) {
+-                operationResult = performOpOnReplica(writeResponse, docWriteRequest, replica);
++            final Engine.Result operationResult;
++            if (item.getPrimaryResponse().isFailed()) {
++                if (response.getFailure().getSeqNo() == SequenceNumbers.UNASSIGNED_SEQ_NO) {
++                    continue; // ignore replication as we didn't generate a sequence number for this request.
++                }
++                operationResult = replica.markSeqNoAsNoop(response.getFailure().getSeqNo(), response.getFailure().getMessage());
+             } else {
+-                operationResult = replica.markSeqNoAsNoop(seqNum, failure.getMessage());
++                if (response.getResponse().getResult() == DocWriteResponse.Result.NOOP) {
++                    continue; // ignore replication as it's a noop
++                }
++                assert response.getResponse().getSeqNo() != SequenceNumbers.UNASSIGNED_SEQ_NO;
++                operationResult = performOpOnReplica(response.getResponse(), item.request(), replica);
+             }
+             assert operationResult != null : "operation result must never be null when primary response has no failure";
+             location = syncOperationResultOrThrow(operationResult, location);
+@@ -435,8 +433,8 @@ private static BulkItemResponse processUpdateResponse(final UpdateRequest update
+                     deleteRequest.type(), deleteRequest.id());
+                 break;
+             default:
+-                throw new IllegalStateException("Unexpected request operation type on replica: "
+-                    + docWriteRequest.opType().getLowercase());
++                assert false : "Unexpected request operation type on replica: " + docWriteRequest + ";primary result: " + primaryResponse;
++                throw new IllegalStateException("Unexpected request operation type on replica: " + docWriteRequest.opType().getLowercase());
+         }
+         if (result.getResultType() == Engine.Result.Type.MAPPING_UPDATE_REQUIRED) {
+             // Even though the primary waits on all nodes to ack the mapping changes to the master
+diff --git a/server/src/test/java/org/elasticsearch/action/bulk/BulkWithUpdatesIT.java b/server/src/test/java/org/elasticsearch/action/bulk/BulkWithUpdatesIT.java
+index f74137d4a418..8d52fbad097f 100644
+--- a/server/src/test/java/org/elasticsearch/action/bulk/BulkWithUpdatesIT.java
++++ b/server/src/test/java/org/elasticsearch/action/bulk/BulkWithUpdatesIT.java
+@@ -25,6 +25,7 @@
+ import org.elasticsearch.action.delete.DeleteRequest;
+ import org.elasticsearch.action.get.GetResponse;
+ import org.elasticsearch.action.index.IndexRequest;
++import org.elasticsearch.action.index.IndexResponse;
+ import org.elasticsearch.action.search.SearchResponse;
+ import org.elasticsearch.action.support.WriteRequest.RefreshPolicy;
+ import org.elasticsearch.action.update.UpdateRequest;
+@@ -32,6 +33,7 @@
+ import org.elasticsearch.action.update.UpdateResponse;
+ import org.elasticsearch.client.Requests;
+ import org.elasticsearch.cluster.metadata.IndexMetaData;
++import org.elasticsearch.common.Strings;
+ import org.elasticsearch.common.settings.Settings;
+ import org.elasticsearch.common.xcontent.XContentType;
+ import org.elasticsearch.index.VersionType;
+@@ -57,6 +59,7 @@
+ import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;
+ import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertHitCount;
+ import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertNoFailures;
++import static org.hamcrest.Matchers.arrayWithSize;
+ import static org.hamcrest.Matchers.containsString;
+ import static org.hamcrest.Matchers.equalTo;
+ import static org.hamcrest.Matchers.instanceOf;
+@@ -618,5 +621,31 @@ public void testInvalidIndexNamesCorrectOpType() {
+         assertThat(bulkResponse.getItems()[1].getOpType(), is(OpType.UPDATE));
+         assertThat(bulkResponse.getItems()[2].getOpType(), is(OpType.DELETE));
+     }
++
++    public void testNoopUpdate() {
++        String indexName = "test";
++        createIndex(indexName, Settings.builder().put(IndexMetaData.SETTING_NUMBER_OF_REPLICAS, 1).build());
++        internalCluster().ensureAtLeastNumDataNodes(2);
++        ensureGreen(indexName);
++        IndexResponse doc = index(indexName, "_doc", "1", Map.of("user", "xyz"));
++        assertThat(doc.getShardInfo().getSuccessful(), equalTo(2));
++        final BulkResponse bulkResponse = client().prepareBulk()
++            .add(new UpdateRequest().index(indexName).id("1").detectNoop(true).doc("user", "xyz")) // noop update
++            .add(new UpdateRequest().index(indexName).id("2").docAsUpsert(false).doc("f", "v")) // not_found update
++            .add(new DeleteRequest().index(indexName).id("2")) // not_found delete
++            .get();
++        assertThat(bulkResponse.getItems(), arrayWithSize(3));
++
++        final BulkItemResponse noopUpdate = bulkResponse.getItems()[0];
++        assertThat(noopUpdate.getResponse().getResult(), equalTo(DocWriteResponse.Result.NOOP));
++        assertThat(Strings.toString(noopUpdate), noopUpdate.getResponse().getShardInfo().getSuccessful(), equalTo(2));
++
++        final BulkItemResponse notFoundUpdate = bulkResponse.getItems()[1];
++        assertNotNull(notFoundUpdate.getFailure());
++
++        final BulkItemResponse notFoundDelete = bulkResponse.getItems()[2];
++        assertThat(notFoundDelete.getResponse().getResult(), equalTo(DocWriteResponse.Result.NOT_FOUND));
++        assertThat(Strings.toString(notFoundDelete), notFoundDelete.getResponse().getShardInfo().getSuccessful(), equalTo(2));
++    }
+ }
+ 

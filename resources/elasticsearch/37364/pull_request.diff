@@ -1,0 +1,219 @@
+diff --git a/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/execution/search/extractor/FieldHitExtractor.java b/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/execution/search/extractor/FieldHitExtractor.java
+index 07bf0f15b0bd..7cce05652dfc 100644
+--- a/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/execution/search/extractor/FieldHitExtractor.java
++++ b/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/execution/search/extractor/FieldHitExtractor.java
+@@ -6,6 +6,7 @@
+ package org.elasticsearch.xpack.sql.execution.search.extractor;
+ 
+ import org.elasticsearch.common.Strings;
++import org.elasticsearch.common.collect.Tuple;
+ import org.elasticsearch.common.document.DocumentField;
+ import org.elasticsearch.common.io.stream.StreamInput;
+ import org.elasticsearch.common.io.stream.StreamOutput;
+@@ -16,9 +17,12 @@
+ import org.joda.time.DateTime;
+ 
+ import java.io.IOException;
++import java.util.ArrayDeque;
++import java.util.Deque;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Objects;
++import java.util.StringJoiner;
+ 
+ /**
+  * Extractor for ES fields. Works for both 'normal' fields but also nested ones (which require hitName to be set).
+@@ -141,17 +145,43 @@ private Object unwrapMultiValue(Object values) {
+ 
+     @SuppressWarnings("unchecked")
+     Object extractFromSource(Map<String, Object> map) {
+-        Object value = map;
+-        boolean first = true;
+-        // each node is a key inside the map
+-        for (String node : path) {
+-            if (value == null) {
+-                return null;
+-            } else if (first || value instanceof Map) {
+-                first = false;
+-                value = ((Map<String, Object>) value).get(node);
+-            } else {
+-                throw new SqlIllegalArgumentException("Cannot extract value [{}] from source", fieldName);
++        Object value = null;
++
++        // Used to avoid recursive method calls
++        // Holds the sub-maps in the document hierarchy that are pending to be inspected.
++        // along with the current index of the `path`.
++        Deque<Tuple<Integer, Map<String, Object>>> queue = new ArrayDeque<>();
++        queue.add(new Tuple<>(-1, map));
++
++        while (!queue.isEmpty()) {
++            Tuple<Integer, Map<String, Object>> tuple = queue.removeLast();
++            int idx = tuple.v1();
++            Map<String, Object> subMap = tuple.v2();
++
++            // Find all possible entries by examining all combinations under the current level ("idx") of the "path"
++            // e.g.: If the path == "a.b.c.d" and the idx == 0, we need to check the current subMap against the keys:
++            //       "b", "b.c" and "b.c.d"
++            StringJoiner sj = new StringJoiner(".");
++            for (int i = idx + 1; i < path.length; i++) {
++                sj.add(path[i]);
++                Object node = subMap.get(sj.toString());
++                if (node instanceof Map) {
++                    // Add the sub-map to the queue along with the current path index
++                    queue.add(new Tuple<>(i, (Map<String, Object>) node));
++                } else if (node != null) {
++                    if (i < path.length - 1) {
++                        // If we reach a concrete value without exhausting the full path, something is wrong with the mapping
++                        // e.g.: map is {"a" : { "b" : "value }} and we are looking for a path: "a.b.c.d"
++                        throw new SqlIllegalArgumentException("Cannot extract value [{}] from source", fieldName);
++                    }
++                    if (value != null) {
++                        // A value has already been found so this means that there are more than one
++                        // values in the document for the same path but different hierarchy.
++                        // e.g.: {"a" : {"b" : {"c" : "value"}}}, {"a.b" : {"c" : "value"}}, ...
++                        throw new SqlIllegalArgumentException("Multiple values (returned by [{}]) are not supported", fieldName);
++                    }
++                    value = node;
++                }
+             }
+         }
+         return unwrapMultiValue(value);
+diff --git a/x-pack/plugin/sql/src/test/java/org/elasticsearch/xpack/sql/execution/search/extractor/FieldHitExtractorTests.java b/x-pack/plugin/sql/src/test/java/org/elasticsearch/xpack/sql/execution/search/extractor/FieldHitExtractorTests.java
+index 5c3478eaea34..4f562e82b5c2 100644
+--- a/x-pack/plugin/sql/src/test/java/org/elasticsearch/xpack/sql/execution/search/extractor/FieldHitExtractorTests.java
++++ b/x-pack/plugin/sql/src/test/java/org/elasticsearch/xpack/sql/execution/search/extractor/FieldHitExtractorTests.java
+@@ -21,8 +21,10 @@
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collections;
++import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
++import java.util.StringJoiner;
+ import java.util.function.Supplier;
+ 
+ import static java.util.Arrays.asList;
+@@ -47,7 +49,7 @@ protected FieldHitExtractor createTestInstance() {
+     }
+ 
+     @Override
+-    protected FieldHitExtractor mutateInstance(FieldHitExtractor instance) throws IOException {
++    protected FieldHitExtractor mutateInstance(FieldHitExtractor instance) {
+         return new FieldHitExtractor(instance.fieldName() + "mutated", null, true, instance.hitName());
+     }
+ 
+@@ -237,7 +239,104 @@ public void testMultiValuedSource() {
+         assertThat(ex.getMessage(), is("Arrays (returned by [a]) are not supported"));
+     }
+ 
+-    public Object randomValue() {
++    public void testFieldWithDots() {
++        FieldHitExtractor fe = new FieldHitExtractor("a.b", null, false);
++        Object value = randomValue();
++        Map<String, Object> map = singletonMap("a.b", value);
++        assertEquals(value, fe.extractFromSource(map));
++    }
++
++    public void testNestedFieldWithDots() {
++        FieldHitExtractor fe = new FieldHitExtractor("a.b.c", null, false);
++        Object value = randomValue();
++        Map<String, Object> map = singletonMap("a", singletonMap("b.c", value));
++        assertEquals(value, fe.extractFromSource(map));
++    }
++
++    public void testNestedFieldWithDotsWithNestedField() {
++        FieldHitExtractor fe = new FieldHitExtractor("a.b.c.d", null, false);
++        Object value = randomValue();
++        Map<String, Object> map = singletonMap("a", singletonMap("b.c", singletonMap("d", value)));
++        assertEquals(value, fe.extractFromSource(map));
++    }
++
++    public void testNestedFieldWithDotsWithNestedFieldWithDots() {
++        FieldHitExtractor fe = new FieldHitExtractor("a.b.c.d.e", null, false);
++        Object value = randomValue();
++        Map<String, Object> map = singletonMap("a", singletonMap("b.c", singletonMap("d.e", value)));
++        assertEquals(value, fe.extractFromSource(map));
++    }
++
++    public void testNestedFieldsWithDotsAndRandomHiearachy() {
++        String[] path = new String[100];
++        StringJoiner sj = new StringJoiner(".");
++        for (int i = 0; i < 100; i++) {
++            path[i] = randomAlphaOfLength(randomIntBetween(1, 10));
++            sj.add(path[i]);
++        }
++        FieldHitExtractor fe = new FieldHitExtractor(sj.toString(), null, false);
++
++        List<String> paths = new ArrayList<>(path.length);
++        int start = 0;
++        while (start < path.length) {
++            int end = randomIntBetween(start + 1, path.length);
++            sj = new StringJoiner(".");
++            for (int j = start; j < end; j++) {
++                sj.add(path[j]);
++            }
++            paths.add(sj.toString());
++            start = end;
++        }
++
++        Object value = randomValue();
++        Map<String, Object> map = singletonMap(paths.get(paths.size() - 1), value);
++        for (int i = paths.size() - 2; i >= 0; i--) {
++            map = singletonMap(paths.get(i), map);
++        }
++        assertEquals(value, fe.extractFromSource(map));
++    }
++
++    public void testExtractSourceIncorrectPathWithFieldWithDots() {
++        FieldHitExtractor fe = new FieldHitExtractor("a.b.c.d.e", null, false);
++        Object value = randomNonNullValue();
++        Map<String, Object> map = singletonMap("a", singletonMap("b.c", singletonMap("d", value)));
++        SqlException ex = expectThrows(SqlException.class, () -> fe.extractFromSource(map));
++        assertThat(ex.getMessage(), is("Cannot extract value [a.b.c.d.e] from source"));
++    }
++
++    public void testFieldWithDotsAndCommonPrefix() {
++        FieldHitExtractor fe1 = new FieldHitExtractor("a.d", null, false);
++        FieldHitExtractor fe2 = new FieldHitExtractor("a.b.c", null, false);
++        Object value = randomNonNullValue();
++        Map<String, Object> map = new HashMap<>();
++        map.put("a", singletonMap("d", value));
++        map.put("a.b", singletonMap("c", value));
++        assertEquals(value, fe1.extractFromSource(map));
++        assertEquals(value, fe2.extractFromSource(map));
++    }
++
++    public void testFieldWithDotsAndCommonPrefixes() {
++        FieldHitExtractor fe1 = new FieldHitExtractor("a1.b.c.d1.e.f.g1", null, false);
++        FieldHitExtractor fe2 = new FieldHitExtractor("a2.b.c.d2.e.f.g2", null, false);
++        Object value = randomNonNullValue();
++        Map<String, Object> map = new HashMap<>();
++        map.put("a1", singletonMap("b.c", singletonMap("d1", singletonMap("e.f", singletonMap("g1", value)))));
++        map.put("a2", singletonMap("b.c", singletonMap("d2", singletonMap("e.f", singletonMap("g2", value)))));
++        assertEquals(value, fe1.extractFromSource(map));
++        assertEquals(value, fe2.extractFromSource(map));
++    }
++
++    public void testFieldWithDotsAndSamePathButDifferentHierarchy() {
++        FieldHitExtractor fe = new FieldHitExtractor("a.b.c.d.e.f.g", null, false);
++        Object value = randomNonNullValue();
++        Map<String, Object> map = new HashMap<>();
++        map.put("a.b", singletonMap("c", singletonMap("d.e", singletonMap("f.g", value))));
++        map.put("a", singletonMap("b.c", singletonMap("d.e", singletonMap("f", singletonMap("g", value)))));
++        SqlException ex = expectThrows(SqlException.class, () -> fe.extractFromSource(map));
++        assertThat(ex.getMessage(), is("Multiple values (returned by [a.b.c.d.e.f.g]) are not supported"));
++    }
++
++    private Object randomValue() {
+         Supplier<Object> value = randomFrom(Arrays.asList(
+                 () -> randomAlphaOfLength(10),
+                 ESTestCase::randomLong,
+@@ -246,7 +345,7 @@ public Object randomValue() {
+         return value.get();
+     }
+ 
+-    public Object randomNonNullValue() {
++    private Object randomNonNullValue() {
+         Supplier<Object> value = randomFrom(Arrays.asList(
+                 () -> randomAlphaOfLength(10),
+                 ESTestCase::randomLong,

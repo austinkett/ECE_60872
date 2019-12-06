@@ -1,0 +1,95 @@
+diff --git a/qa/rolling-upgrade/src/test/java/org/elasticsearch/upgrades/RecoveryIT.java b/qa/rolling-upgrade/src/test/java/org/elasticsearch/upgrades/RecoveryIT.java
+index d9ed33f2b377..84093108a14f 100644
+--- a/qa/rolling-upgrade/src/test/java/org/elasticsearch/upgrades/RecoveryIT.java
++++ b/qa/rolling-upgrade/src/test/java/org/elasticsearch/upgrades/RecoveryIT.java
+@@ -38,6 +38,7 @@
+ 
+ import java.io.IOException;
+ import java.util.ArrayList;
++import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Objects;
+@@ -438,13 +439,30 @@ public void testUpdateDoc() throws Exception {
+                 .put(IndexMetaData.INDEX_NUMBER_OF_SHARDS_SETTING.getKey(), 1)
+                 .put(IndexMetaData.INDEX_NUMBER_OF_REPLICAS_SETTING.getKey(), 2);
+             createIndex(index, settings.build());
++            indexDocs(index, 0, 100);
+         }
+-        ensureGreen(index);
+-        indexDocs(index, 0, 10);
+-        for (int i = 0; i < 10; i++) {
+-            Request update = new Request("POST", index + "/test/" + i + "/_update");
+-            update.setJsonEntity("{\"doc\": {\"f\": " + randomNonNegativeLong() + "}}");
+-            client().performRequest(update);
++        if (randomBoolean()) {
++            ensureGreen(index);
++        }
++        Map<Integer, Long> updates = new HashMap<>();
++        for (int docId = 0; docId < 100; docId++) {
++            final int times = randomIntBetween(0, 2);
++            for (int i = 0; i < times; i++) {
++                Request update = new Request("POST", index + "/test/" + docId + "/_update");
++                long value = randomNonNegativeLong();
++                update.setJsonEntity("{\"doc\": {\"updated_field\": " + value + "}}");
++                client().performRequest(update);
++                updates.put(docId, value);
++            }
++        }
++        client().performRequest(new Request("POST", index + "/_refresh"));
++        for (int docId : updates.keySet()) {
++            Request get = new Request("GET", index + "/test/" + docId);
++            Map<String, Object> doc = entityAsMap(client().performRequest(get));
++            assertThat(XContentMapValues.extractValue("_source.updated_field", doc), equalTo(updates.get(docId)));
++        }
++        if (randomBoolean()) {
++            syncedFlush(index);
+         }
+     }
+ 
+diff --git a/server/src/main/java/org/elasticsearch/action/update/UpdateHelper.java b/server/src/main/java/org/elasticsearch/action/update/UpdateHelper.java
+index 5155bc6d4022..c540d8c9b738 100644
+--- a/server/src/main/java/org/elasticsearch/action/update/UpdateHelper.java
++++ b/server/src/main/java/org/elasticsearch/action/update/UpdateHelper.java
+@@ -85,11 +85,15 @@ public Result prepare(UpdateRequest request, IndexShard indexShard, boolean canU
+      * noop).
+      */
+     @SuppressWarnings("unchecked")
+-    protected Result prepare(ShardId shardId, UpdateRequest request, boolean canUseIfSeqNo, GetResult getResult, LongSupplier nowInMillis) {
++    final Result prepare(ShardId shardId, UpdateRequest request, boolean canUseIfSeqNo, GetResult getResult, LongSupplier nowInMillis) {
+         if (getResult.isExists() == false) {
+             // If the document didn't exist, execute the update request as an upsert
+             return prepareUpsert(shardId, request, getResult, nowInMillis);
+-        } else if (getResult.internalSourceRef() == null) {
++        }
++        // Documents indexed a mixed cluster between 6.x and 5.x do not have sequence numbers but have primary terms.
++        // We have to fallback using the legacy versioning for updates of those documents.
++        canUseIfSeqNo &= getResult.getSeqNo() != SequenceNumbers.UNASSIGNED_SEQ_NO;
++        if (getResult.internalSourceRef() == null) {
+             // no source, we can't do anything, throw a failure...
+             throw new DocumentSourceMissingException(shardId, request.type(), request.id());
+         } else if (request.script() == null && request.doc() != null) {
+diff --git a/server/src/test/java/org/elasticsearch/action/update/UpdateRequestTests.java b/server/src/test/java/org/elasticsearch/action/update/UpdateRequestTests.java
+index 00676a614f98..60ecd4daa123 100644
+--- a/server/src/test/java/org/elasticsearch/action/update/UpdateRequestTests.java
++++ b/server/src/test/java/org/elasticsearch/action/update/UpdateRequestTests.java
+@@ -740,4 +740,19 @@ public void testOldClusterRejectIfSeqNo() {
+             () -> updateHelper.prepare(request, null, false, ESTestCase::randomNonNegativeLong));
+         assertThat(error.getMessage(), equalTo("ifSeqNo [" + ifSeqNo + "], ifPrimaryTerm [" + ifPrimaryTerm + "]"));
+     }
++
++    public void testFallbackUsingVersionIfCurrentDocumentDoesNotHaveSeqNo() throws Exception {
++        ShardId shardId = new ShardId("test", "", 0);
++        long version = randomNonNegativeLong();
++        long primaryTerm = randomBoolean() ? UNASSIGNED_PRIMARY_TERM : randomNonNegativeLong();
++        GetResult getResult = new GetResult("test", "type", "1", UNASSIGNED_SEQ_NO, primaryTerm, version, true,
++            new BytesArray("{\"body\": \"bar\"}"), null);
++        UpdateRequest updateRequest = new UpdateRequest("test", "type1", "1").fromXContent(
++            createParser(JsonXContent.jsonXContent, new BytesArray("{\"doc\": {\"body\": \"foo\"}}")));
++        IndexRequest indexRequest = updateHelper.prepare(
++            shardId, updateRequest, randomBoolean(), getResult, ESTestCase::randomNonNegativeLong).action();
++        assertThat(indexRequest.ifSeqNo(), equalTo(UNASSIGNED_SEQ_NO));
++        assertThat(indexRequest.ifPrimaryTerm(), equalTo(UNASSIGNED_PRIMARY_TERM));
++        assertThat(indexRequest.version(), equalTo(version));
++    }
+ }

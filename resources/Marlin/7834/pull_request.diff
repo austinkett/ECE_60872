@@ -1,0 +1,686 @@
+diff --git a/Marlin/src/HAL/HAL.h b/Marlin/src/HAL/HAL.h
+index fecf98c9725..60e0df6f2d5 100644
+--- a/Marlin/src/HAL/HAL.h
++++ b/Marlin/src/HAL/HAL.h
+@@ -29,7 +29,7 @@
+ #ifndef _HAL_H
+ #define _HAL_H
+ 
+-#include "src/inc/SPI.h"
++#include "../inc/SPI.h"
+ 
+ #ifdef __AVR__
+   #include "HAL_AVR/HAL_AVR.h"
+diff --git a/Marlin/src/HAL/HAL_AVR/HAL_AVR.h b/Marlin/src/HAL/HAL_AVR/HAL_AVR.h
+index 9a8a66dfc0f..fdd26b0cf11 100644
+--- a/Marlin/src/HAL/HAL_AVR/HAL_AVR.h
++++ b/Marlin/src/HAL/HAL_AVR/HAL_AVR.h
+@@ -105,6 +105,7 @@ extern "C" {
+ #define HAL_TIMER_RATE ((F_CPU) / 8.0)
+ #define HAL_STEPPER_TIMER_RATE HAL_TIMER_RATE
+ #define STEPPER_TIMER_PRESCALE INT0_PRESCALER
++#define HAL_TICKS_PER_US (((F_CPU) / 8) / 1000000) // Can not be of type double
+ 
+ #define ENABLE_STEPPER_DRIVER_INTERRUPT()  SBI(TIMSK1, OCIE1A)
+ #define DISABLE_STEPPER_DRIVER_INTERRUPT() CBI(TIMSK1, OCIE1A)
+diff --git a/Marlin/src/HAL/HAL_LPC1768/HAL.cpp b/Marlin/src/HAL/HAL_LPC1768/HAL.cpp
+index 5f5c3f047c2..037899675f4 100644
+--- a/Marlin/src/HAL/HAL_LPC1768/HAL.cpp
++++ b/Marlin/src/HAL/HAL_LPC1768/HAL.cpp
+@@ -113,6 +113,7 @@ void HAL_adc_enable_channel(int pin) {
+   };
+ }
+ 
++uint8_t active_adc = 0;
+ void HAL_adc_start_conversion(const uint8_t adc_pin) {
+   if (adc_pin >= (NUM_ANALOG_INPUTS) || adc_pin_map[adc_pin].port == 0xFF) {
+     usb_serial.printf("HAL: HAL_adc_start_conversion: no pinmap for %d\n", adc_pin);
+@@ -121,14 +122,52 @@ void HAL_adc_start_conversion(const uint8_t adc_pin) {
+   LPC_ADC->ADCR &= ~0xFF;                       // Reset
+   SBI(LPC_ADC->ADCR, adc_pin_map[adc_pin].adc); // Select Channel
+   SBI(LPC_ADC->ADCR, 24);                       // Start conversion
++  active_adc = adc_pin;
+ }
+ 
+-bool HAL_adc_finished(void) { return LPC_ADC->ADGDR & ADC_DONE; }
++bool HAL_adc_finished(void) {
++  return LPC_ADC->ADGDR & ADC_DONE;
++}
++
++// possible config options if something similar is extended to more platforms.
++#define ADC_USE_MEDIAN_FILTER      // filter out erroneous readings
++#define ADC_USE_LOWPASS_FILTER     // filter out high frequency noise
++#define ADC_LOWPASS_K_VALUE 4      // how much to smooth out noise (1:8)
++
++struct MedianFilter {
++  uint16_t values[3];
++  uint8_t next_val;
++  MedianFilter() {
++    next_val = 0;
++    values[0] = values[1] = values[2] = 0;
++  }
++  uint16_t update(uint16_t value) {
++    values[next_val++] = value;
++    next_val = next_val % 3;
++    return max(min(values[0], values[1]), min(max(values[0], values[1]), values[2]));     //median
++  }
++};
++
++uint16_t lowpass_filter(uint16_t value) {
++  const uint8_t k_data_shift = ADC_LOWPASS_K_VALUE;
++  static uint32_t data_delay[NUM_ANALOG_INPUTS] = { 0 };
++  uint32_t &active_filter = data_delay[active_adc];
++  active_filter = active_filter - (active_filter >> k_data_shift) + value;
++  return (uint16_t)(active_filter >> k_data_shift);
++}
+ 
+ uint16_t HAL_adc_get_result(void) {
+   uint32_t data = LPC_ADC->ADGDR;
+-  CBI(LPC_ADC->ADCR, 24);                       // Stop conversion
+-  return (data & ADC_OVERRUN) ? 0 : (data >> 6) & 0x3FF; // 10bit
++  CBI(LPC_ADC->ADCR, 24);    // Stop conversion
++  if (data & ADC_OVERRUN) return 0;
++  #ifdef ADC_USE_MEDIAN_FILTER
++    static MedianFilter median_filter[NUM_ANALOG_INPUTS];
++    data = median_filter[active_adc].update((uint16_t)data);
++  #endif
++  #ifdef ADC_USE_LOWPASS_FILTER
++    data = lowpass_filter((uint16_t)data);
++  #endif
++  return ((data >> 6) & 0x3ff);    // 10bit
+ }
+ 
+ #define SBIT_CNTEN     0
+diff --git a/Marlin/src/HAL/HAL_LPC1768/arduino.cpp b/Marlin/src/HAL/HAL_LPC1768/arduino.cpp
+index b3191731aaa..810a557af72 100644
+--- a/Marlin/src/HAL/HAL_LPC1768/arduino.cpp
++++ b/Marlin/src/HAL/HAL_LPC1768/arduino.cpp
+@@ -57,20 +57,9 @@ void delayMicroseconds(uint32_t us) {
+     us = us % 1000;
+   }
+ 
+-  if (us < 5) { // burn cycles, time in interrupts will not be taken into account
+-    loops = us * nop_factor;
+-    while (loops > 0) --loops;
+-  }
+-  else { // poll systick, more accurate through interrupts
+-    uint32_t start = SysTick->VAL;
+-    uint32_t load = SysTick->LOAD;
+-    uint32_t end = start - (load / 1000) * us;
+-
+-    if (end >> 31)
+-      while (!(SysTick->VAL > start && SysTick->VAL < (load + end))) __NOP();
+-    else
+-      while (SysTick->VAL > end) __NOP();
+-  }
++  // burn cycles, time in interrupts will not be taken into account
++  loops = us * nop_factor;
++  while (loops > 0) --loops;
+ }
+ 
+ extern "C" void delay(const int msec) {
+diff --git a/debug_extra_script.py b/Marlin/src/HAL/HAL_LPC1768/debug_extra_script.py
+similarity index 100%
+rename from debug_extra_script.py
+rename to Marlin/src/HAL/HAL_LPC1768/debug_extra_script.py
+diff --git a/Marlin/src/HAL/HAL_LPC1768/persistent_store_impl.cpp b/Marlin/src/HAL/HAL_LPC1768/persistent_store_impl.cpp
+index a3acfb85774..6177f62e912 100644
+--- a/Marlin/src/HAL/HAL_LPC1768/persistent_store_impl.cpp
++++ b/Marlin/src/HAL/HAL_LPC1768/persistent_store_impl.cpp
+@@ -9,6 +9,9 @@
+ #include "chanfs/diskio.h"
+ #include "chanfs/ff.h"
+ 
++extern uint32_t MSC_Aquire_Lock();
++extern uint32_t MSC_Release_Lock();
++
+ namespace HAL {
+ namespace PersistentStore {
+ 
+@@ -16,14 +19,20 @@ FATFS fat_fs;
+ FIL eeprom_file;
+ 
+ bool access_start() {
+-  f_mount(&fat_fs, "", 1);
++  MSC_Aquire_Lock();
++  if(f_mount(&fat_fs, "", 1)){
++    MSC_Release_Lock();
++    return false;
++  }
+   FRESULT res = f_open(&eeprom_file, "eeprom.dat", FA_OPEN_ALWAYS | FA_WRITE | FA_READ);
++  if(res) MSC_Release_Lock();
+   return (res == FR_OK);
+ }
+ 
+ bool access_finish() {
+   f_close(&eeprom_file);
+   f_unmount("");
++  MSC_Release_Lock();
+   return true;
+ }
+ 
+diff --git a/Marlin/src/HAL/HAL_LPC1768/serial.h b/Marlin/src/HAL/HAL_LPC1768/serial.h
+index 7a9a8333588..c1f1b5249b0 100644
+--- a/Marlin/src/HAL/HAL_LPC1768/serial.h
++++ b/Marlin/src/HAL/HAL_LPC1768/serial.h
+@@ -100,6 +100,7 @@ class HalSerial {
+   }
+ 
+   char read() {
++    if(receive_buffer.empty()) return -1;
+     return (char)receive_buffer.read();
+   }
+ 
+@@ -117,6 +118,17 @@ class HalSerial {
+   }
+ 
+   void flush() {
++    receive_buffer.clear();
++  }
++
++  uint8_t availableForWrite(void){
++    return transmit_buffer.free() > 255 ? 255 : (uint8_t)transmit_buffer.free();
++  }
++
++  void flushTX(void){
++    if(host_connected) {
++      while(transmit_buffer.available());
++    }
+   }
+ 
+   void printf(const char *format, ...) {
+diff --git a/Marlin/src/Marlin.cpp b/Marlin/src/Marlin.cpp
+index 06072426488..c95758754a7 100644
+--- a/Marlin/src/Marlin.cpp
++++ b/Marlin/src/Marlin.cpp
+@@ -681,7 +681,8 @@ void setup() {
+   #endif
+ 
+   MYSERIAL.begin(BAUDRATE);
+-  while(!MYSERIAL);
++  uint32_t serial_connect_timeout = millis() + 1000;
++  while(!MYSERIAL && PENDING(millis(), serial_connect_timeout));
+   SERIAL_PROTOCOLLNPGM("start");
+   SERIAL_ECHO_START();
+ 
+diff --git a/Marlin/src/lcd/dogm/ultralcd_st7920_u8glib_rrd.h b/Marlin/src/lcd/dogm/ultralcd_st7920_u8glib_rrd.h
+index 84bb2d975f9..3ea51e86953 100644
+--- a/Marlin/src/lcd/dogm/ultralcd_st7920_u8glib_rrd.h
++++ b/Marlin/src/lcd/dogm/ultralcd_st7920_u8glib_rrd.h
+@@ -23,7 +23,7 @@
+ #ifndef ULCDST7920_H
+ #define ULCDST7920_H
+ 
+-#include <src/Marlin.h>
++#include "../../Marlin.h"
+ 
+ #if ENABLED(U8GLIB_ST7920)
+ 
+diff --git a/Marlin/src/module/stepper.cpp b/Marlin/src/module/stepper.cpp
+index b95d223561d..1419b961093 100644
+--- a/Marlin/src/module/stepper.cpp
++++ b/Marlin/src/module/stepper.cpp
+@@ -323,13 +323,8 @@ void Stepper::isr() {
+ 
+   HAL_TIMER_TYPE ocr_val;
+ 
+-  #ifdef CPU_32_BIT
+-    #define ENDSTOP_NOMINAL_OCR_VAL 1500 * HAL_TICKS_PER_US    // check endstops every 1.5ms to guarantee two stepper ISRs within 5ms for BLTouch
+-    #define OCR_VAL_TOLERANCE 500 * HAL_TICKS_PER_US           // First max delay is 2.0ms, last min delay is 0.5ms, all others 1.5ms
+-  #else
+-    #define ENDSTOP_NOMINAL_OCR_VAL 3000    // check endstops every 1.5ms to guarantee two stepper ISRs within 5ms for BLTouch
+-    #define OCR_VAL_TOLERANCE 1000          // First max delay is 2.0ms, last min delay is 0.5ms, all others 1.5ms
+-  #endif
++  #define ENDSTOP_NOMINAL_OCR_VAL 1500 * HAL_TICKS_PER_US    // check endstops every 1.5ms to guarantee two stepper ISRs within 5ms for BLTouch
++  #define OCR_VAL_TOLERANCE 500 * HAL_TICKS_PER_US           // First max delay is 2.0ms, last min delay is 0.5ms, all others 1.5ms
+ 
+   #if DISABLED(ADVANCE) && DISABLED(LIN_ADVANCE)
+     // Disable Timer0 ISRs and enable global ISR again to capture UART events (incoming chars)
+diff --git a/frameworks/CMSIS/LPC1768/lib/LiquidCrystal.cpp b/frameworks/CMSIS/LPC1768/lib/LiquidCrystal.cpp
+index e017d11d4c2..44217721418 100644
+--- a/frameworks/CMSIS/LPC1768/lib/LiquidCrystal.cpp
++++ b/frameworks/CMSIS/LPC1768/lib/LiquidCrystal.cpp
+@@ -3,7 +3,7 @@
+ #include <stdio.h>
+ #include <string.h>
+ #include <inttypes.h>
+-#include "arduino.h"
++#include <arduino.h>
+ 
+ // When the display powers up, it is configured as follows:
+ //
+diff --git a/frameworks/CMSIS/LPC1768/lib/usb/mscuser.cpp b/frameworks/CMSIS/LPC1768/lib/usb/mscuser.cpp
+index 6ff062604ef..be52ebebc7b 100644
+--- a/frameworks/CMSIS/LPC1768/lib/usb/mscuser.cpp
++++ b/frameworks/CMSIS/LPC1768/lib/usb/mscuser.cpp
+@@ -26,6 +26,7 @@ extern "C" {
+ #include "usbhw.h"
+ #include "usbcore.h"
+ #include "mscuser.h"
++#include "lpc17xx_wdt.h"
+ 
+ #include "../chanfs/diskio.h"
+ #include <debug_frmwrk.h>
+@@ -44,13 +45,71 @@ uint8_t  BulkStage;               /* Bulk Stage */
+ uint8_t  BulkBuf[MSC_MAX_PACKET]; /* Bulk In/Out Buffer */
+ uint8_t  block_cache[MSC_BLOCK_SIZE];
+ uint8_t  BulkLen;                 /* Bulk In/Out Length */
++Sense sense_data;
+ 
+ MSC_CBW CBW;                   /* Command Block Wrapper */
+ MSC_CSW CSW;                   /* Command Status Wrapper */
+-uint8_t media_lock = 0;
++volatile uint8_t media_lock = 0;
++volatile bool device_wants_lock = false;
++
++#define NO_LOCK 0
++#define HOST_LOCK 1
++#define DEVICE_LOCK 2
++
++extern uint32_t millis();
++extern void _delay_ms(int delay);
++
++uint32_t MSC_Aquire_Lock() {
++  NVIC_DisableIRQ(USB_IRQn);
++  device_wants_lock = true;
++  uint32_t end_millis = millis() + 1000;
++  if(media_lock == HOST_LOCK) {
++    NVIC_EnableIRQ(USB_IRQn);
++    while(media_lock == HOST_LOCK) {
++      if(((long)(end_millis - (millis())) < 0)) {
++        _DBG("No signal from Host, Assume success\n");
++        break;
++      }
++      WDT_Feed();
++    }
++  }
++  NVIC_DisableIRQ(USB_IRQn);
++  media_lock = DEVICE_LOCK;
++  NVIC_EnableIRQ(USB_IRQn);
++  _DBG("Device MSC Lock\n");
++  device_wants_lock = false;
++  return 0;
++}
++
++uint32_t MSC_Release_Lock() {
++  if(media_lock != DEVICE_LOCK) {
++    return 0; // Didn't have lock
++  }
++  media_lock = NO_LOCK;
++  if(disk_status(0) != STA_NOINIT) disk_ioctl(0, GET_SECTOR_COUNT, (void *)(&MSC_BlockCount));
++  _DBG("Device MSC Unlock\n");
++  NVIC_DisableIRQ(USB_IRQn);
++  sense_data.set(Sense_KEY::UNIT_ATTENTION, Sense_ASC::MEDIA_CHANGED);
++  NVIC_EnableIRQ(USB_IRQn);
++  return 0;   // Released
++}
+ 
+ uint32_t MSC_SD_Lock() {
+-  media_lock = CBW.CB[4]; //0x1 - lock, 0x0 - unlock
++  if(media_lock == DEVICE_LOCK || (device_wants_lock && CBW.CB[4])) {
++    CSW.bStatus = CSW_CMD_FAILED;
++    sense_data.set(Sense_KEY::NOT_READY, Sense_ASC::LOGICAL_UNIT_NOT_READY, Sense_ASCQ::DEVICE_IS_BUSY);
++    MSC_SetCSW();
++    _DBG("Device has Lock (or is waiting for lock) cannot Lock..\n");
++    return 1;
++  }
++
++  if(CBW.CB[4]) {
++    media_lock = HOST_LOCK;
++    _DBG("OS MSC Lock\n");
++  } else {
++    media_lock = NO_LOCK;
++    _DBG("OS MSC Unlock\n");
++  }
+   // logical_unit = CBW.CB[1] & 0xE0;
+   CSW.bStatus = CSW_CMD_PASSED;
+   MSC_SetCSW();
+@@ -78,20 +137,28 @@ void MSC_StartStopUnit() {
+   switch (CBW.CB[4] & 0x03) {
+     case STARTSTOP_EJECT:
+       MSC_SD_Release(0);
++      media_lock = NO_LOCK;
++      _DBG("OS Media Ejected UNLOCK\n");
+       break;
+     case STARTSTOP_LOAD:
+       if(MSC_BlockCount == 0) {
+         if(MSC_SD_Init(0) != 0) {
+           CSW.bStatus = CSW_CMD_FAILED;
++          sense_data.set(Sense_KEY::NOT_READY, Sense_ASC::MEDIUM_NOT_PRESENT, Sense_ASCQ::MANUAL_INTERVENTION_REQUIRED);
+           MSC_SetCSW();
+           return;
+         }
+       }
++      media_lock = HOST_LOCK;
++      _DBG("OS Media Mount LOCKED\n");
+       break;
+     default:
+-      _DBG("MSC_StartStopUnit unknown startstopunit sub command\n");
++      _DBG("MSC_StartStopUnit unknown startstopunit sub command: ");
++      _DBH(CBW.CB[4] & 0x03);
++      _DBG("\n");
+   }
+   CSW.bStatus = CSW_CMD_PASSED;
++  sense_data.reset();
+   MSC_SetCSW();
+ }
+ 
+@@ -122,6 +189,18 @@ uint32_t MSC_GetMaxLUN (void) {
+ }
+ 
+ 
++bool host_get_lock(void) {
++  if(media_lock != DEVICE_LOCK && !device_wants_lock) {
++    media_lock = HOST_LOCK;
++    return true;
++  } else {
++    CSW.bStatus = CSW_CMD_FAILED;
++    sense_data.set(Sense_KEY::NOT_READY, Sense_ASC::LOGICAL_UNIT_NOT_READY, Sense_ASCQ::DEVICE_IS_BUSY);
++    MSC_SetCSW();
++    return false;
++  }
++}
++
+ /*
+  *  MSC Memory Read Callback
+  *   Called automatically on Memory Read Event
+@@ -130,6 +209,12 @@ uint32_t MSC_GetMaxLUN (void) {
+  */
+ 
+ void MSC_MemoryRead (void) {
++  if(!host_get_lock()) {
++     _DBG("Auto Lock Fail Permission Denied Device has Lock\n");
++     return;
++  }
++  WDT_Feed();
++
+   uint32_t n = (length > MSC_MAX_PACKET) ? MSC_MAX_PACKET : length;
+ 
+   if (lba > MSC_BlockCount) {
+@@ -158,6 +243,7 @@ void MSC_MemoryRead (void) {
+ 
+   if (BulkStage != MSC_BS_DATA_IN) {
+     CSW.bStatus = CSW_CMD_PASSED;
++    sense_data.reset();
+   }
+ }
+ 
+@@ -170,6 +256,11 @@ void MSC_MemoryRead (void) {
+  */
+ 
+ void MSC_MemoryWrite (void) {
++  if(!host_get_lock()) {
++     _DBG("Auto Lock Fail Permission Denied Device has Lock\n");
++     return;
++  }
++  WDT_Feed();
+ 
+   for (uint32_t n = 0; n < BulkLen; n++) {
+     block_cache[block_offset + n] = BulkBuf[n];
+@@ -192,6 +283,7 @@ void MSC_MemoryWrite (void) {
+ 
+   if ((length == 0) || (BulkStage == MSC_BS_CSW)) {
+     CSW.bStatus = CSW_CMD_PASSED;
++    sense_data.reset();
+     MSC_SetCSW();
+   }
+ }
+@@ -205,6 +297,11 @@ void MSC_MemoryWrite (void) {
+  */
+ 
+ void MSC_MemoryVerify (void) {
++  if(!host_get_lock()) {
++     _DBG("Auto Lock Fail Permission Denied Device has Lock\n");
++     return;
++  }
++  WDT_Feed();
+ 
+   if(!block_offset) {
+     disk_read(0, block_cache, lba, 1);
+@@ -222,7 +319,13 @@ void MSC_MemoryVerify (void) {
+   CSW.dDataResidue -= BulkLen;
+ 
+   if ((length == 0) || (BulkStage == MSC_BS_CSW)) {
+-    CSW.bStatus = (MemOK) ? CSW_CMD_PASSED : CSW_CMD_FAILED;
++    if(MemOK) {
++      CSW.bStatus = CSW_CMD_PASSED;
++      sense_data.reset();
++    } else {
++      CSW.bStatus = CSW_CMD_FAILED;
++      sense_data.set(Sense_KEY::MEDIUM_ERROR);
++    }
+     MSC_SetCSW();
+   }
+ }
+@@ -321,10 +424,15 @@ void MSC_TestUnitReady (void) {
+     }
+   }
+ 
+-  if(MSC_BlockCount > 0) {
++  if(device_wants_lock) {
++    sense_data.set(Sense_KEY::NOT_READY, Sense_ASC::MEDIUM_NOT_PRESENT, Sense_ASCQ::REASON_UNKNOWN);
++    CSW.bStatus = CSW_CMD_FAILED;
++  } else if(MSC_BlockCount > 0) {
++    sense_data.reset();
+     CSW.bStatus = CSW_CMD_PASSED;
+   } else {
+     CSW.bStatus = CSW_CMD_FAILED;
++    sense_data.set(Sense_KEY::NOT_READY, Sense_ASC::MEDIUM_NOT_PRESENT, Sense_ASCQ::LOADABLE);
+   }
+ 
+   MSC_SetCSW();
+@@ -341,9 +449,13 @@ void MSC_RequestSense (void) {
+ 
+   if (!DataInFormat()) return;
+ 
++  if(media_lock == DEVICE_LOCK || device_wants_lock) {
++    sense_data.set(Sense_KEY::NOT_READY, Sense_ASC::MEDIUM_NOT_PRESENT, Sense_ASCQ::REASON_UNKNOWN);
++  }
++
+   BulkBuf[ 0] = 0x70;          /* Response Code */
+   BulkBuf[ 1] = 0x00;
+-  BulkBuf[ 2] = static_cast<uint8_t>(Sense_KEY::ILLEGAL_REQUEST);
++  BulkBuf[ 2] = static_cast<uint8_t>(sense_data.key);
+   BulkBuf[ 3] = 0x00;
+   BulkBuf[ 4] = 0x00;
+   BulkBuf[ 5] = 0x00;
+@@ -354,17 +466,17 @@ void MSC_RequestSense (void) {
+   BulkBuf[ 9] = 0x00;
+   BulkBuf[10] = 0x00;
+   BulkBuf[11] = 0x00;
+-  BulkBuf[12] = static_cast<uint8_t>(Sense_ASC::CANNOT_READ_MEDIUM);
+-  BulkBuf[13] = static_cast<uint8_t>(Sense_ASCQ::UNKNOWN_FORMAT);
++  BulkBuf[12] = static_cast<uint8_t>(sense_data.asc);
++  BulkBuf[13] = static_cast<uint8_t>(sense_data.ascq);
+   BulkBuf[14] = 0x00;
+   BulkBuf[15] = 0x00;
+   BulkBuf[16] = 0x00;
+   BulkBuf[17] = 0x00;
+ 
+-  if (MSC_BlockCount == 0) {
+-    BulkBuf[ 2] = static_cast<uint8_t>(Sense_KEY::NOT_READY);
+-    BulkBuf[12] = static_cast<uint8_t>(Sense_ASC::MEDIUM_NOT_PRESENT);
+-    BulkBuf[13] = static_cast<uint8_t>(Sense_ASCQ::LOADABLE);
++  if(sense_data.has_sense()){
++    _DBG("Sent Response to SenseRequest: ");
++    _DBH(static_cast<uint8_t>(sense_data.key));
++    _DBG("\n");
+   }
+ 
+   BulkLen = 18;
+@@ -423,10 +535,6 @@ void MSC_Inquiry (void) {
+   BulkBuf[34] = '0';
+   BulkBuf[35] = ' ';
+ 
+-  if(MSC_BlockCount == 0) {
+-    BulkBuf[0] = 0x20; // Direct Access Device usually available but not currently
+-  }
+-
+   BulkLen = 36;
+   DataInTransfer();
+ }
+@@ -553,8 +661,9 @@ void MSC_GetCBW (void) {
+     CSW.dDataResidue = CBW.dDataLength;
+     if ((CBW.bLUN != 0) || (CBW.bCBLength < 1) || CBW.bCBLength > 16) {
+ fail: CSW.bStatus = CSW_CMD_FAILED;
++      sense_data.set(Sense_KEY::ILLEGAL_REQUEST);
+       MSC_SetCSW();
+-      _DBG("Failed SCSI OP code ");
++      _DBG("Unsupported SCSI OP code ");
+       _DBH(CBW.CB[0]);
+       _DBG("\n");
+     } else {
+@@ -627,6 +736,20 @@ fail: CSW.bStatus = CSW_CMD_FAILED;
+             }
+           }
+           break;
++        case 0x35: // SCSI_SYNCHRONIZECACHE10
++          _DBG("SCSI_SYNCHRONIZECACHE10 Unsupported\n");
++          CSW.bStatus = CSW_CMD_FAILED;
++          sense_data.set(Sense_KEY::ILLEGAL_REQUEST);
++          MSC_SetCSW();
++          break;
++        case 0x9E: // SCSI_SERVICEACTIONIN16
++          _DBG("ServiceAction(16) Action: ");
++          _DBH(CBW.CB[1]);
++          _DBG(" Unsupported\n");
++          CSW.bStatus = CSW_CMD_FAILED;
++          sense_data.set(Sense_KEY::ILLEGAL_REQUEST);
++          MSC_SetCSW();
++          break;
+         default:
+           goto fail;
+       }
+@@ -647,7 +770,6 @@ fail: CSW.bStatus = CSW_CMD_FAILED;
+  */
+ 
+ void MSC_SetCSW (void) {
+-
+   CSW.dSignature = MSC_CSW_Signature;
+   USB_WriteEP(MSC_EP_IN, (uint8_t *)&CSW, sizeof(CSW));
+   BulkStage = MSC_BS_CSW;
+@@ -661,7 +783,6 @@ void MSC_SetCSW (void) {
+  */
+ 
+ void MSC_BulkIn (void) {
+-
+   switch (BulkStage) {
+     case MSC_BS_DATA_IN:
+       switch (CBW.CB[0]) {
+@@ -691,7 +812,6 @@ void MSC_BulkIn (void) {
+  */
+ 
+ void MSC_BulkOut (void) {
+-
+   BulkLen = (uint8_t)USB_ReadEP(MSC_EP_OUT, BulkBuf);
+   switch (BulkStage) {
+     case MSC_BS_CBW:
+diff --git a/frameworks/CMSIS/LPC1768/lib/usb/mscuser.h b/frameworks/CMSIS/LPC1768/lib/usb/mscuser.h
+index 439c8c4068c..8d12e8d3f3e 100644
+--- a/frameworks/CMSIS/LPC1768/lib/usb/mscuser.h
++++ b/frameworks/CMSIS/LPC1768/lib/usb/mscuser.h
+@@ -38,7 +38,7 @@ extern void MSC_SetCSW (void);
+ extern void MSC_BulkIn (void);
+ extern void MSC_BulkOut(void);
+ 
+-enum class Sense_KEY : uint8_t {
++enum struct Sense_KEY : uint8_t {
+   NO_SENSE,
+   RECOVERED_ERROR,
+   NOT_READY,
+@@ -49,15 +49,25 @@ enum class Sense_KEY : uint8_t {
+   DATA_PROTECT
+ };
+ 
+-enum class Sense_ASC : uint8_t {
++enum struct Sense_ASC : uint8_t {
++  NONE = 0x0,
++  LOGICAL_UNIT_NOT_READY = 0x04,
+   CANNOT_READ_MEDIUM = 0x30,
+-  MEDIUM_NOT_PRESENT = 0x3A
++  MEDIUM_NOT_PRESENT = 0x3A,
++  MEDIA_CHANGED = 0x28
+ };
+ 
+-enum class Sense_ASCQ : uint8_t {
+-  // CANNOT_READ_MEDIUM
++enum struct Sense_ASCQ : uint8_t {
++  // ASC: LOGICAL_UNIT_NOT_READY
++  CAUSE_NOT_REPORTABLE = 0x00,
++  UNIT_IS_IN_PROCESS_OF_BECOMING_READY,
++  INITIALIZING_COMMAND_REQUIRED,
++  MANUAL_INTERVENTION_REQUIRED,
++  FORMAT_IN_PROGRESS,
++  DEVICE_IS_BUSY = 0xFF,
++  // ASC: CANNOT_READ_MEDIUM
+   UNKNOWN_FORMAT = 0x01,
+-  // MEDIUM_NOT_PRESENT
++  // ASC: MEDIUM_NOT_PRESENT
+   REASON_UNKNOWN = 0x00,
+   TRAY_CLOSED,
+   TRAY_OPEN,
+@@ -65,5 +75,30 @@ enum class Sense_ASCQ : uint8_t {
+   AUXILIARY_MEMORY_ACCESSIBLE
+ };
+ 
++struct Sense {
++  Sense() {
++    reset();
++  }
++
++  void set(Sense_KEY key_val, Sense_ASC asc_val = Sense_ASC::NONE, Sense_ASCQ ascq_val = Sense_ASCQ::REASON_UNKNOWN) {
++    key = key_val;
++    asc = asc_val;
++    ascq = ascq_val;
++  }
++
++  void reset() {
++    key = Sense_KEY::NO_SENSE;
++    asc = Sense_ASC::NONE;
++    ascq = Sense_ASCQ::REASON_UNKNOWN;
++  }
++
++  bool has_sense() {
++    return key != Sense_KEY::NO_SENSE;
++  }
++
++  Sense_KEY key;
++  Sense_ASC asc;
++  Sense_ASCQ ascq;
++};
+ 
+ #endif  /* __MSCUSER_H__ */
+diff --git a/platformio.ini b/platformio.ini
+index c544ea0789f..06e783433fc 100644
+--- a/platformio.ini
++++ b/platformio.ini
+@@ -158,17 +158,18 @@ src_filter      = ${common.default_src_filter}
+ #
+ [env:Re-ARM_debug_and_upload]
+ # Segger JLink
+-platform      = nxplpc
+-#framework    = mbed
+-board         = lpc1768
+-board_f_cpu   = 100000000L
+-build_flags   = !python Marlin/src/HAL/HAL_LPC1768/lpc1768_flag_script.py
+-lib_ldf_mode  = off
+-lib_deps      = U8glib-ARM
+-src_filter    = ${common.default_src_filter}
+-extra_scripts = debug_extra_script.py, Marlin/src/HAL/HAL_LPC1768/lpc1768_flag_script.py
+-debug_tool    = custom
+-debug_server  =
++platform       = nxplpc
++#framework     = mbed
++board          = lpc1768
++board_f_cpu    = 100000000L
++build_flags    = !python Marlin/src/HAL/HAL_LPC1768/lpc1768_flag_script.py
++lib_ldf_mode   = off
++lib_extra_dirs = frameworks
++lib_deps       = U8glib-ARM, CMSIS-LPC1768
++src_filter     = ${common.default_src_filter}
++extra_scripts  =  Marlin/src/HAL/HAL_LPC1768/debug_extra_script.py, Marlin/src/HAL/HAL_LPC1768/lpc1768_flag_script.py
++debug_tool     = custom
++debug_server   =
+   C:\Program Files (x86)\SEGGER\JLink_V618d\JLinkGDBServerCL.exe
+   -select
+   USB

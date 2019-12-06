@@ -1,0 +1,149 @@
+diff --git a/x-pack/plugin/ccr/src/main/java/org/elasticsearch/xpack/ccr/action/AutoFollowCoordinator.java b/x-pack/plugin/ccr/src/main/java/org/elasticsearch/xpack/ccr/action/AutoFollowCoordinator.java
+index 55e24abc86c2..e3b008efc565 100644
+--- a/x-pack/plugin/ccr/src/main/java/org/elasticsearch/xpack/ccr/action/AutoFollowCoordinator.java
++++ b/x-pack/plugin/ccr/src/main/java/org/elasticsearch/xpack/ccr/action/AutoFollowCoordinator.java
+@@ -258,6 +258,7 @@ public void clusterStateProcessed(String source, ClusterState oldState, ClusterS
+                 .anyMatch(pattern -> pattern.getRemoteCluster().equals(remoteCluster));
+             if (exist == false) {
+                 LOGGER.info("removing auto follower for remote cluster [{}]", remoteCluster);
++                autoFollower.removed = true;
+                 removedRemoteClusters.add(remoteCluster);
+             } else if (autoFollower.remoteClusterConnectionMissing) {
+                 LOGGER.info("retrying auto follower [{}] after remote cluster connection was missing", remoteCluster);
+@@ -265,11 +266,25 @@ public void clusterStateProcessed(String source, ClusterState oldState, ClusterS
+                 autoFollower.start();
+             }
+         }
++        assert assertNoOtherActiveAutoFollower(newAutoFollowers);
+         this.autoFollowers = autoFollowers
+             .copyAndPutAll(newAutoFollowers)
+             .copyAndRemoveAll(removedRemoteClusters);
+     }
+ 
++    private boolean assertNoOtherActiveAutoFollower(Map<String, AutoFollower> newAutoFollowers) {
++        for (AutoFollower newAutoFollower : newAutoFollowers.values()) {
++            AutoFollower previousInstance = autoFollowers.get(newAutoFollower.remoteCluster);
++            assert previousInstance == null || previousInstance.removed;
++        }
++        return true;
++    }
++
++
++    Map<String, AutoFollower> getAutoFollowers() {
++        return autoFollowers;
++    }
++
+     @Override
+     public void clusterChanged(ClusterChangedEvent event) {
+         if (event.localNodeMaster()) {
+@@ -295,6 +310,7 @@ public void clusterChanged(ClusterChangedEvent event) {
+         private volatile long lastAutoFollowTimeInMillis = -1;
+         private volatile long metadataVersion = 0;
+         private volatile boolean remoteClusterConnectionMissing = false;
++        volatile boolean removed = false;
+         private volatile CountDown autoFollowPatternsCountDown;
+         private volatile AtomicArray<AutoFollowResult> autoFollowResults;
+ 
+@@ -309,6 +325,17 @@ public void clusterChanged(ClusterChangedEvent event) {
+         }
+ 
+         void start() {
++            if (removed) {
++                // This check exists to avoid two AutoFollower instances a single remote cluster.
++                // (If an auto follow pattern is deleted and then added back quickly enough then
++                // the old AutoFollower instance still sees that there is an auto follow pattern
++                // for the remote cluster it is tracking and will continue to operate, while in
++                // the meantime in updateAutoFollowers() method another AutoFollower instance has been
++                // started for the same remote cluster.)
++                LOGGER.info("AutoFollower instance for cluster [{}] has been removed", remoteCluster);
++                return;
++            }
++
+             lastAutoFollowTimeInMillis = relativeTimeProvider.getAsLong();
+             final ClusterState clusterState = followerClusterStateSupplier.get();
+             final AutoFollowMetadata autoFollowMetadata = clusterState.metaData().custom(AutoFollowMetadata.TYPE);
+@@ -330,6 +357,12 @@ void start() {
+             this.autoFollowResults = new AtomicArray<>(patterns.size());
+ 
+             getRemoteClusterState(remoteCluster, metadataVersion + 1, (remoteClusterStateResponse, remoteError) -> {
++                // Also check removed flag here, as it may take a while for this remote cluster state api call to return:
++                if (removed) {
++                    LOGGER.info("AutoFollower instance for cluster [{}] has been removed", remoteCluster);
++                    return;
++                }
++
+                 if (remoteClusterStateResponse != null) {
+                     assert remoteError == null;
+                     if (remoteClusterStateResponse.isWaitForTimedOut()) {
+diff --git a/x-pack/plugin/ccr/src/test/java/org/elasticsearch/xpack/ccr/AutoFollowIT.java b/x-pack/plugin/ccr/src/test/java/org/elasticsearch/xpack/ccr/AutoFollowIT.java
+index 286e5badee13..70f624392367 100644
+--- a/x-pack/plugin/ccr/src/test/java/org/elasticsearch/xpack/ccr/AutoFollowIT.java
++++ b/x-pack/plugin/ccr/src/test/java/org/elasticsearch/xpack/ccr/AutoFollowIT.java
+@@ -157,15 +157,20 @@ public void testAutoFollowManyIndices() throws Exception {
+         int expectedVal2 = numIndices;
+ 
+         MetaData[] metaData = new MetaData[1];
++        AutoFollowStats[] autoFollowStats = new AutoFollowStats[1];
+         try {
+             assertBusy(() -> {
+                 metaData[0] = followerClient().admin().cluster().prepareState().get().getState().metaData();
++                autoFollowStats[0] = getAutoFollowStats();
+                 int count = (int) Arrays.stream(metaData[0].getConcreteAllIndices()).filter(s -> s.startsWith("copy-")).count();
+                 assertThat(count, equalTo(expectedVal2));
++                // Ensure that there are no auto follow errors:
++                // (added specifically to see that there are no leader indices auto followed multiple times)
++                assertThat(autoFollowStats[0].getRecentAutoFollowErrors().size(), equalTo(0));
+             });
+         } catch (AssertionError ae) {
+             logger.warn("metadata={}", Strings.toString(metaData[0]));
+-            logger.warn("auto follow stats={}", Strings.toString(getAutoFollowStats()));
++            logger.warn("auto follow stats={}", Strings.toString(autoFollowStats[0]));
+             throw ae;
+         }
+     }
+diff --git a/x-pack/plugin/ccr/src/test/java/org/elasticsearch/xpack/ccr/action/AutoFollowCoordinatorTests.java b/x-pack/plugin/ccr/src/test/java/org/elasticsearch/xpack/ccr/action/AutoFollowCoordinatorTests.java
+index 1c6864088b5f..2ac67a65fc1c 100644
+--- a/x-pack/plugin/ccr/src/test/java/org/elasticsearch/xpack/ccr/action/AutoFollowCoordinatorTests.java
++++ b/x-pack/plugin/ccr/src/test/java/org/elasticsearch/xpack/ccr/action/AutoFollowCoordinatorTests.java
+@@ -620,6 +620,10 @@ public void testUpdateAutoFollowers() {
+         assertThat(autoFollowCoordinator.getStats().getAutoFollowedClusters().size(), equalTo(2));
+         assertThat(autoFollowCoordinator.getStats().getAutoFollowedClusters().get("remote1"), notNullValue());
+         assertThat(autoFollowCoordinator.getStats().getAutoFollowedClusters().get("remote2"), notNullValue());
++        // Get a reference to auto follower that will get removed, so that we can assert that it has been marked as removed,
++        // when pattern 1 and 3 are moved. (To avoid a edge case where multiple auto follow coordinators for the same remote cluster)
++        AutoFollowCoordinator.AutoFollower removedAutoFollower1 = autoFollowCoordinator.getAutoFollowers().get("remote1");
++        assertThat(removedAutoFollower1.removed, is(false));
+         // Remove patterns 1 and 3:
+         patterns.remove("pattern1");
+         patterns.remove("pattern3");
+@@ -630,6 +634,7 @@ public void testUpdateAutoFollowers() {
+         autoFollowCoordinator.updateAutoFollowers(clusterState);
+         assertThat(autoFollowCoordinator.getStats().getAutoFollowedClusters().size(), equalTo(1));
+         assertThat(autoFollowCoordinator.getStats().getAutoFollowedClusters().get("remote2"), notNullValue());
++        assertThat(removedAutoFollower1.removed, is(true));
+         // Add pattern 4:
+         patterns.put("pattern4", new AutoFollowPattern("remote1", Collections.singletonList("metrics-*"), null, null, null,
+             null, null, null, null, null, null, null, null));
+@@ -641,7 +646,13 @@ public void testUpdateAutoFollowers() {
+         assertThat(autoFollowCoordinator.getStats().getAutoFollowedClusters().size(), equalTo(2));
+         assertThat(autoFollowCoordinator.getStats().getAutoFollowedClusters().get("remote1"), notNullValue());
+         assertThat(autoFollowCoordinator.getStats().getAutoFollowedClusters().get("remote2"), notNullValue());
++        // Get references to auto followers that will get removed, so that we can assert that those have been marked as removed,
++        // when pattern 2 and 4 are moved. (To avoid a edge case where multiple auto follow coordinators for the same remote cluster)
++        removedAutoFollower1 = autoFollowCoordinator.getAutoFollowers().get("remote1");
++        AutoFollower removedAutoFollower2 = autoFollowCoordinator.getAutoFollowers().get("remote2");
+         // Remove patterns 2 and 4:
++        assertThat(removedAutoFollower1.removed, is(false));
++        assertThat(removedAutoFollower2.removed, is(false));
+         patterns.remove("pattern2");
+         patterns.remove("pattern4");
+         clusterState = ClusterState.builder(new ClusterName("remote"))
+@@ -650,6 +661,8 @@ public void testUpdateAutoFollowers() {
+             .build();
+         autoFollowCoordinator.updateAutoFollowers(clusterState);
+         assertThat(autoFollowCoordinator.getStats().getAutoFollowedClusters().size(), equalTo(0));
++        assertThat(removedAutoFollower1.removed, is(true));
++        assertThat(removedAutoFollower2.removed, is(true));
+     }
+ 
+     public void testUpdateAutoFollowersNoPatterns() {

@@ -1,0 +1,225 @@
+diff --git a/src/main/java/org/elasticsearch/index/engine/InternalEngine.java b/src/main/java/org/elasticsearch/index/engine/InternalEngine.java
+index 0c48cedff386..c3efe981ba0f 100644
+--- a/src/main/java/org/elasticsearch/index/engine/InternalEngine.java
++++ b/src/main/java/org/elasticsearch/index/engine/InternalEngine.java
+@@ -31,14 +31,12 @@
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.IOUtils;
+ import org.elasticsearch.ElasticsearchException;
+-import org.elasticsearch.ExceptionsHelper;
+ import org.elasticsearch.cluster.routing.operation.hash.djb.DjbHashFunction;
+ import org.elasticsearch.common.Nullable;
+ import org.elasticsearch.common.lease.Releasable;
+ import org.elasticsearch.common.lease.Releasables;
+ import org.elasticsearch.common.lucene.LoggerInfoStream;
+ import org.elasticsearch.common.lucene.Lucene;
+-import org.elasticsearch.common.lucene.SegmentReaderUtils;
+ import org.elasticsearch.common.lucene.search.XFilteredQuery;
+ import org.elasticsearch.common.lucene.uid.Versions;
+ import org.elasticsearch.common.math.MathUtils;
+@@ -804,7 +802,8 @@ public void recover(RecoveryHandler recoveryHandler) throws EngineException {
+             recoveryHandler.phase1(phase1Snapshot);
+         } catch (Throwable e) {
+             maybeFailEngine("recovery phase 1", e);
+-            Releasables.closeWhileHandlingException(onGoingRecoveries, phase1Snapshot);
++            // close the snapshot first to release the reference to the translog file, so a flush post recovery can delete it
++            Releasables.closeWhileHandlingException(phase1Snapshot, onGoingRecoveries);
+             throw new RecoveryEngineException(shardId, 1, "Execution failed", wrapIfClosed(e));
+         }
+ 
+@@ -813,14 +812,15 @@ public void recover(RecoveryHandler recoveryHandler) throws EngineException {
+             phase2Snapshot = translog.snapshot();
+         } catch (Throwable e) {
+             maybeFailEngine("snapshot recovery", e);
+-            Releasables.closeWhileHandlingException(onGoingRecoveries, phase1Snapshot);
++            Releasables.closeWhileHandlingException(phase1Snapshot, onGoingRecoveries);
+             throw new RecoveryEngineException(shardId, 2, "Snapshot failed", wrapIfClosed(e));
+         }
+         try {
+             recoveryHandler.phase2(phase2Snapshot);
+         } catch (Throwable e) {
+             maybeFailEngine("recovery phase 2", e);
+-            Releasables.closeWhileHandlingException(onGoingRecoveries, phase1Snapshot, phase2Snapshot);
++            // close the snapshots first to release the reference to the translog file, so a flush post recovery can delete it
++            Releasables.closeWhileHandlingException(phase1Snapshot, phase2Snapshot, onGoingRecoveries);
+             throw new RecoveryEngineException(shardId, 2, "Execution failed", wrapIfClosed(e));
+         }
+ 
+@@ -836,8 +836,9 @@ public void recover(RecoveryHandler recoveryHandler) throws EngineException {
+             maybeFailEngine("recovery phase 3", e);
+             throw new RecoveryEngineException(shardId, 3, "Execution failed", wrapIfClosed(e));
+         } finally {
+-            Releasables.close(success, onGoingRecoveries, writeLock, phase1Snapshot,
+-                    phase2Snapshot, phase3Snapshot); // hmm why can't we use try-with here?
++            // close the snapshots first to release the reference to the translog file, so a flush post recovery can delete it
++            Releasables.close(success, phase1Snapshot, phase2Snapshot, phase3Snapshot,
++                    onGoingRecoveries, writeLock); // hmm why can't we use try-with here?
+         }
+     }
+ 
+diff --git a/src/main/java/org/elasticsearch/index/translog/Translog.java b/src/main/java/org/elasticsearch/index/translog/Translog.java
+index 18143d6b42af..eb7db1ca26eb 100644
+--- a/src/main/java/org/elasticsearch/index/translog/Translog.java
++++ b/src/main/java/org/elasticsearch/index/translog/Translog.java
+@@ -118,9 +118,11 @@
+     Snapshot snapshot(Snapshot snapshot);
+ 
+     /**
+-     * Clears unreferenced transaclogs.
++     * Clears unreferenced transaction logs.
++     *
++     * @return the number of clean up files
+      */
+-    void clearUnreferenced();
++    int clearUnreferenced();
+ 
+     /**
+      * Sync's the translog.
+diff --git a/src/main/java/org/elasticsearch/index/translog/fs/FsTranslog.java b/src/main/java/org/elasticsearch/index/translog/fs/FsTranslog.java
+index c573cb72b76d..e80ece2b4d75 100644
+--- a/src/main/java/org/elasticsearch/index/translog/fs/FsTranslog.java
++++ b/src/main/java/org/elasticsearch/index/translog/fs/FsTranslog.java
+@@ -200,8 +200,9 @@ public long translogSizeInBytes() {
+     }
+ 
+     @Override
+-    public void clearUnreferenced() {
++    public int clearUnreferenced() {
+         rwl.writeLock().lock();
++        int deleted = 0;
+         try {
+             for (File location : locations) {
+                 File[] files = location.listFiles();
+@@ -216,6 +217,7 @@ public void clearUnreferenced() {
+                         try {
+                             logger.trace("clearing unreferenced translog {}", file);
+                             file.delete();
++                            deleted++;
+                         } catch (Exception e) {
+                             // ignore
+                         }
+@@ -225,6 +227,7 @@ public void clearUnreferenced() {
+         } finally {
+             rwl.writeLock().unlock();
+         }
++        return deleted;
+     }
+ 
+     @Override
+diff --git a/src/test/java/org/elasticsearch/index/engine/InternalEngineTests.java b/src/test/java/org/elasticsearch/index/engine/InternalEngineTests.java
+index 350d844570df..fc620b1758f1 100644
+--- a/src/test/java/org/elasticsearch/index/engine/InternalEngineTests.java
++++ b/src/test/java/org/elasticsearch/index/engine/InternalEngineTests.java
+@@ -19,7 +19,6 @@
+ 
+ package org.elasticsearch.index.engine;
+ 
+-import com.google.common.base.Predicate;
+ import org.apache.log4j.AppenderSkeleton;
+ import org.apache.log4j.Level;
+ import org.apache.log4j.LogManager;
+@@ -37,7 +36,7 @@
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.IOContext;
+ import org.apache.lucene.store.MockDirectoryWrapper;
+-import org.elasticsearch.ExceptionsHelper;
++import org.apache.lucene.util.XIOUtils;
+ import org.elasticsearch.Version;
+ import org.elasticsearch.cluster.metadata.IndexMetaData;
+ import org.elasticsearch.common.Nullable;
+@@ -59,7 +58,6 @@
+ import org.elasticsearch.index.mapper.ParsedDocument;
+ import org.elasticsearch.index.mapper.internal.SourceFieldMapper;
+ import org.elasticsearch.index.mapper.internal.UidFieldMapper;
+-import org.elasticsearch.index.merge.OnGoingMerge;
+ import org.elasticsearch.index.merge.policy.LogByteSizeMergePolicyProvider;
+ import org.elasticsearch.index.merge.policy.MergePolicyProvider;
+ import org.elasticsearch.index.merge.scheduler.ConcurrentMergeSchedulerProvider;
+@@ -84,16 +82,14 @@
+ 
+ import java.io.File;
+ import java.io.IOException;
++import java.nio.file.Paths;
+ import java.util.Arrays;
+ import java.util.List;
+-import java.util.concurrent.CountDownLatch;
+-import java.util.concurrent.atomic.AtomicReference;
+ 
+ import static com.carrotsearch.randomizedtesting.RandomizedTest.*;
+ import static org.elasticsearch.common.settings.ImmutableSettings.Builder.EMPTY_SETTINGS;
+ import static org.elasticsearch.index.engine.Engine.Operation.Origin.PRIMARY;
+ import static org.elasticsearch.index.engine.Engine.Operation.Origin.REPLICA;
+-import static org.elasticsearch.test.ElasticsearchTestCase.awaitBusy;
+ import static org.elasticsearch.test.ElasticsearchTestCase.terminate;
+ import static org.hamcrest.Matchers.*;
+ 
+@@ -102,6 +98,8 @@
+  */
+ public class InternalEngineTests extends ElasticsearchLuceneTestCase {
+ 
++    public static final String TRANSLOG_PRIMARY_LOCATION = "work/fs-translog/primary";
++    public static final String TRANSLOG_REPLICA_LOCATION = "work/fs-translog/replica";
+     protected final ShardId shardId = new ShardId(new Index("index"), 1);
+ 
+     protected ThreadPool threadPool;
+@@ -122,6 +120,9 @@
+     @Before
+     public void setUp() throws Exception {
+         super.setUp();
++        // clean up shared directory
++        XIOUtils.rm(Paths.get(TRANSLOG_PRIMARY_LOCATION));
++        XIOUtils.rm(Paths.get(TRANSLOG_REPLICA_LOCATION));
+         CodecService codecService = new CodecService(shardId.index());
+         indexConcurrency = randomIntBetween(1, 20);
+         String name = Codec.getDefault().getName();
+@@ -149,10 +150,10 @@ public void setUp() throws Exception {
+         engine = createEngine(store, translog);
+         LiveIndexWriterConfig currentIndexWriterConfig = ((InternalEngine)engine).getCurrentIndexWriterConfig();
+ 
+-        assertEquals(((InternalEngine)engine).config().getCodec().getName(), codecService.codec(codecName).getName());
++        assertEquals(engine.config().getCodec().getName(), codecService.codec(codecName).getName());
+         assertEquals(currentIndexWriterConfig.getCodec().getName(), codecService.codec(codecName).getName());
+         if (randomBoolean()) {
+-            ((InternalEngine)engine).config().setEnableGcDeletes(false);
++            engine.config().setEnableGcDeletes(false);
+         }
+         replicaTranslog = createTranslogReplica();
+         replicaEngine = createEngine(storeReplica, replicaTranslog);
+@@ -222,11 +223,11 @@ public long throttleTimeInNanos() {
+     }
+ 
+     protected Translog createTranslog() {
+-        return new FsTranslog(shardId, EMPTY_SETTINGS, new File("work/fs-translog/primary"));
++        return new FsTranslog(shardId, EMPTY_SETTINGS, new File(TRANSLOG_PRIMARY_LOCATION));
+     }
+ 
+     protected Translog createTranslogReplica() {
+-        return new FsTranslog(shardId, EMPTY_SETTINGS, new File("work/fs-translog/replica"));
++        return new FsTranslog(shardId, EMPTY_SETTINGS, new File(TRANSLOG_REPLICA_LOCATION));
+     }
+ 
+     protected IndexDeletionPolicy createIndexDeletionPolicy() {
+@@ -733,8 +734,13 @@ public void phase3(Translog.Snapshot snapshot) throws EngineException {
+         });
+         // post recovery should flush the translog
+         MatcherAssert.assertThat(translog.snapshot(), TranslogSizeMatcher.translogSize(0));
++        // and we should not leak files
++        assertThat("there are unreferenced translog files left", translog.clearUnreferenced(), equalTo(0));
+ 
+         engine.flush();
++
++        assertThat("there are unreferenced translog files left, post flush", translog.clearUnreferenced(), equalTo(0));
++
+         engine.close();
+     }
+ 
+@@ -1319,9 +1325,6 @@ public void testIndexWriterIFDInfoStream() {
+     @Test
+     public void testEnableGcDeletes() throws Exception {
+ 
+-        Store store = createStore();
+-        IndexSettingsService indexSettingsService = new IndexSettingsService(shardId.index(), ImmutableSettings.builder().put(defaultSettings).put(IndexMetaData.SETTING_VERSION_CREATED, Version.CURRENT).build());
+-        Engine engine = new InternalEngine(config(indexSettingsService, store, createTranslog(), createMergeScheduler()));
+         engine.config().setEnableGcDeletes(false);
+ 
+         // Add document

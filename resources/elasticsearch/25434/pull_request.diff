@@ -1,0 +1,404 @@
+diff --git a/core/src/main/java/org/elasticsearch/index/seqno/GlobalCheckpointTracker.java b/core/src/main/java/org/elasticsearch/index/seqno/GlobalCheckpointTracker.java
+index a669065d32bc..ddfe906b6266 100644
+--- a/core/src/main/java/org/elasticsearch/index/seqno/GlobalCheckpointTracker.java
++++ b/core/src/main/java/org/elasticsearch/index/seqno/GlobalCheckpointTracker.java
+@@ -99,6 +99,10 @@
+         this.pendingInSync = new HashSet<>();
+     }
+ 
++    public synchronized long getLocalCheckpointForInSyncShard(final String allocationId) {
++        return inSyncLocalCheckpoints.getOrDefault(allocationId, SequenceNumbersService.UNASSIGNED_SEQ_NO);
++    }
++
+     /**
+      * Notifies the service to update the local checkpoint for the shard with the provided allocation ID. If the checkpoint is lower than
+      * the currently known one, this is a no-op. If the allocation ID is not tracked, it is ignored. This is to prevent late arrivals from
+@@ -298,9 +302,10 @@ synchronized void releasePrimaryContext() {
+     /**
+      * Updates the known allocation IDs and the local checkpoints for the corresponding allocations from a primary relocation source.
+      *
++     * @param allocationId   the allocation ID of the relocation target
+      * @param primaryContext the primary context
+      */
+-    synchronized void updateAllocationIdsFromPrimaryContext(final PrimaryContext primaryContext) {
++    synchronized void updateAllocationIdsFromPrimaryContext(final String allocationId, final PrimaryContext primaryContext) {
+         if (sealed) {
+             throw new IllegalStateException("global checkpoint tracker is sealed");
+         }
+@@ -360,6 +365,7 @@ synchronized void updateAllocationIdsFromPrimaryContext(final PrimaryContext pri
+                 .allMatch(e -> e.value == SequenceNumbersService.UNASSIGNED_SEQ_NO) : inSyncLocalCheckpoints;
+         assert StreamSupport
+                 .stream(trackingLocalCheckpoints.spliterator(), false)
++                .filter(e -> !e.key.equals(allocationId)) // during primary relocation a shard can already know its local checkpoint
+                 .allMatch(e -> e.value == SequenceNumbersService.UNASSIGNED_SEQ_NO) : trackingLocalCheckpoints;
+         assert pendingInSync.isEmpty() : pendingInSync;
+ 
+diff --git a/core/src/main/java/org/elasticsearch/index/seqno/SequenceNumbersService.java b/core/src/main/java/org/elasticsearch/index/seqno/SequenceNumbersService.java
+index 6d8b87599a12..8c3b1ddbd995 100644
+--- a/core/src/main/java/org/elasticsearch/index/seqno/SequenceNumbersService.java
++++ b/core/src/main/java/org/elasticsearch/index/seqno/SequenceNumbersService.java
+@@ -115,6 +115,10 @@ public SeqNoStats stats() {
+         return localCheckpointTracker.getStats(getGlobalCheckpoint());
+     }
+ 
++    public long getLocalCheckpointForInSyncShard(final String allocationId) {
++        return globalCheckpointTracker.getLocalCheckpointForInSyncShard(allocationId);
++    }
++
+     /**
+      * Notifies the service to update the local checkpoint for the shard with the provided allocation ID. See
+      * {@link GlobalCheckpointTracker#updateLocalCheckpoint(String, long)} for details.
+@@ -180,10 +184,11 @@ public void updateAllocationIdsFromMaster(
+     /**
+      * Updates the known allocation IDs and the local checkpoints for the corresponding allocations from a primary relocation source.
+      *
++     * @param allocationId   the allocation ID of the relocation target
+      * @param primaryContext the sequence number context
+      */
+-    public void updateAllocationIdsFromPrimaryContext(final PrimaryContext primaryContext) {
+-        globalCheckpointTracker.updateAllocationIdsFromPrimaryContext(primaryContext);
++    public void updateAllocationIdsFromPrimaryContext(final String allocationId, final PrimaryContext primaryContext) {
++        globalCheckpointTracker.updateAllocationIdsFromPrimaryContext(allocationId, primaryContext);
+     }
+ 
+     /**
+diff --git a/core/src/main/java/org/elasticsearch/index/shard/IndexShard.java b/core/src/main/java/org/elasticsearch/index/shard/IndexShard.java
+index db0f27a28ca7..cc0a38315f2e 100644
+--- a/core/src/main/java/org/elasticsearch/index/shard/IndexShard.java
++++ b/core/src/main/java/org/elasticsearch/index/shard/IndexShard.java
+@@ -366,6 +366,7 @@ public void updateShardState(final ShardRouting newRouting,
+         final ShardRouting currentRouting;
+         synchronized (mutex) {
+             currentRouting = this.shardRouting;
++            final IndexShardState currentState = state;
+             updateRoutingEntry(newRouting);
+ 
+             if (shardRouting.primary()) {
+@@ -374,8 +375,12 @@ public void updateShardState(final ShardRouting newRouting,
+                 final Engine engine = getEngineOrNull();
+                 // if the engine is not yet started, we are not ready yet and can just ignore this
+                 if (engine != null) {
+-                    engine.seqNoService().updateAllocationIdsFromMaster(
+-                            applyingClusterStateVersion, activeAllocationIds, initializingAllocationIds);
++                    final SequenceNumbersService seqNoService = engine.seqNoService();
++                    seqNoService.updateAllocationIdsFromMaster(applyingClusterStateVersion, activeAllocationIds, initializingAllocationIds);
++                    if ((currentState == IndexShardState.POST_RECOVERY && state == IndexShardState.STARTED) ||
++                            recoveryState.getRecoverySource().getType().equals(RecoverySource.Type.PEER)) {
++                        updateLocalCheckpointForShard(shardRouting.allocationId().getId(), seqNoService.getLocalCheckpoint());
++                    }
+                 }
+             }
+         }
+@@ -1704,7 +1709,7 @@ public void updateAllocationIdsFromPrimaryContext(final PrimaryContext primaryCo
+         assert shardRouting.isRelocationTarget() : "only relocation target can update allocation IDs from primary context: " + shardRouting;
+         final Engine engine = getEngineOrNull();
+         if (engine != null) {
+-            engine.seqNoService().updateAllocationIdsFromPrimaryContext(primaryContext);
++            engine.seqNoService().updateAllocationIdsFromPrimaryContext(shardRouting.allocationId().getId(), primaryContext);
+         }
+     }
+ 
+diff --git a/core/src/test/java/org/elasticsearch/cluster/MinimumMasterNodesIT.java b/core/src/test/java/org/elasticsearch/cluster/MinimumMasterNodesIT.java
+index a923b3310423..31ffb026e3a7 100644
+--- a/core/src/test/java/org/elasticsearch/cluster/MinimumMasterNodesIT.java
++++ b/core/src/test/java/org/elasticsearch/cluster/MinimumMasterNodesIT.java
+@@ -188,7 +188,6 @@ public void testSimpleMinimumMasterNodes() throws Exception {
+         }
+     }
+ 
+-    @AwaitsFix(bugUrl = "https://github.com/elastic/elasticsearch/issues/25415")
+     public void testMultipleNodesShutdownNonMasterNodes() throws Exception {
+         Settings settings = Settings.builder()
+                 .put("discovery.zen.minimum_master_nodes", 3)
+diff --git a/core/src/test/java/org/elasticsearch/index/seqno/GlobalCheckpointTrackerTests.java b/core/src/test/java/org/elasticsearch/index/seqno/GlobalCheckpointTrackerTests.java
+index 0eee4eb8a445..a05fc3d89eb5 100644
+--- a/core/src/test/java/org/elasticsearch/index/seqno/GlobalCheckpointTrackerTests.java
++++ b/core/src/test/java/org/elasticsearch/index/seqno/GlobalCheckpointTrackerTests.java
+@@ -49,6 +49,7 @@
+ import java.util.stream.StreamSupport;
+ 
+ import static org.elasticsearch.index.seqno.SequenceNumbersService.UNASSIGNED_SEQ_NO;
++import static org.hamcrest.Matchers.allOf;
+ import static org.hamcrest.Matchers.containsString;
+ import static org.hamcrest.Matchers.equalTo;
+ import static org.hamcrest.Matchers.greaterThan;
+@@ -526,7 +527,7 @@ public void testRaceUpdatingGlobalCheckpoint() throws InterruptedException, Brok
+     public void testPrimaryContextOlderThanAppliedClusterState() {
+         final long initialClusterStateVersion = randomIntBetween(0, Integer.MAX_VALUE - 1) + 1;
+         final int numberOfActiveAllocationsIds = randomIntBetween(0, 8);
+-        final int numberOfInitializingIds = randomIntBetween(0, 8);
++        final int numberOfInitializingIds = randomIntBetween(1, 8);
+         final Tuple<Set<String>, Set<String>> activeAndInitializingAllocationIds =
+                 randomActiveAndInitializingAllocationIds(numberOfActiveAllocationsIds, numberOfInitializingIds);
+         final Set<String> activeAllocationIds = activeAndInitializingAllocationIds.v1();
+@@ -541,12 +542,14 @@ public void testPrimaryContextOlderThanAppliedClusterState() {
+          * set of initializing allocation IDs is otherwise arbitrary.
+          */
+         final int numberOfAdditionalInitializingAllocationIds = randomIntBetween(0, 8);
+-        final Set<String> initializedAllocationIds = new HashSet<>(randomSubsetOf(initializingAllocationIds));
++        final Set<String> initializedAllocationIds =
++                new HashSet<>(randomSubsetOf(randomIntBetween(0, initializingAllocationIds.size() - 1), initializingAllocationIds));
+         final Set<String> newInitializingAllocationIds =
+                 randomAllocationIdsExcludingExistingIds(
+                         Sets.union(activeAllocationIds, initializingAllocationIds), numberOfAdditionalInitializingAllocationIds);
++        final Set<String> difference = Sets.difference(initializingAllocationIds, initializedAllocationIds);
+         final Set<String> contextInitializingIds = Sets.union(
+-                new HashSet<>(randomSubsetOf(Sets.difference(initializingAllocationIds, initializedAllocationIds))),
++                new HashSet<>(randomSubsetOf(randomIntBetween(1, difference.size()), difference)),
+                 newInitializingAllocationIds);
+ 
+         final int numberOfAdditionalActiveAllocationIds = randomIntBetween(0, 8);
+@@ -570,7 +573,9 @@ public void testPrimaryContextOlderThanAppliedClusterState() {
+                 activeAllocationIdsLocalCheckpoints,
+                 initializingAllocationIdsLocalCheckpoints);
+ 
+-        tracker.updateAllocationIdsFromPrimaryContext(primaryContext);
++        final String initializingAllocationId = randomFrom(Sets.difference(contextInitializingIds, newInitializingAllocationIds));
++        tracker.updateLocalCheckpoint(initializingAllocationId, initializingAllocationIdsLocalCheckpoints.get(initializingAllocationId));
++        tracker.updateAllocationIdsFromPrimaryContext(initializingAllocationId, primaryContext);
+ 
+         // the primary context carries an older cluster state version
+         assertThat(tracker.appliedClusterStateVersion, equalTo(initialClusterStateVersion));
+@@ -606,7 +611,9 @@ public void testPrimaryContextOlderThanAppliedClusterState() {
+                         tracker.trackingLocalCheckpoints.get(allocationId),
+                         equalTo(primaryContext.trackingLocalCheckpoints().get(allocationId)));
+             } else {
+-                assertThat(tracker.trackingLocalCheckpoints.get(allocationId), equalTo(SequenceNumbersService.UNASSIGNED_SEQ_NO));
++                assertThat(
++                        allocationId,
++                        tracker.trackingLocalCheckpoints.get(allocationId), equalTo(SequenceNumbersService.UNASSIGNED_SEQ_NO));
+             }
+         }
+ 
+@@ -624,7 +631,7 @@ public void testPrimaryContextOlderThanAppliedClusterState() {
+     public void testPrimaryContextNewerThanAppliedClusterState() {
+         final long initialClusterStateVersion = randomIntBetween(0, Integer.MAX_VALUE);
+         final int numberOfActiveAllocationsIds = randomIntBetween(0, 8);
+-        final int numberOfInitializingIds = randomIntBetween(0, 8);
++        final int numberOfInitializingIds = randomIntBetween(1, 8);
+         final Tuple<Set<String>, Set<String>> activeAndInitializingAllocationIds =
+                 randomActiveAndInitializingAllocationIds(numberOfActiveAllocationsIds, numberOfInitializingIds);
+         final Set<String> activeAllocationIds = activeAndInitializingAllocationIds.v1();
+@@ -638,19 +645,23 @@ public void testPrimaryContextNewerThanAppliedClusterState() {
+          * allocation ID could have moved to an in-sync allocation ID within the tracker due to recovery finalization, and the set of
+          * initializing allocation IDs is otherwise arbitrary.
+          */
+-        final int numberOfNewInitializingAllocationIds = randomIntBetween(0, 8);
+-        final Set<String> initializedAllocationIds = new HashSet<>(randomSubsetOf(initializingAllocationIds));
++        final int numberOfNewInitializingAllocationIds = randomIntBetween(1, 8);
++        final Set<String> initializedAllocationIds =
++                new HashSet<>(randomSubsetOf(randomIntBetween(0, initializingAllocationIds.size() - 1), initializingAllocationIds));
+         final Set<String> newInitializingAllocationIds =
+                 randomAllocationIdsExcludingExistingIds(
+                         Sets.union(activeAllocationIds, initializingAllocationIds), numberOfNewInitializingAllocationIds);
+ 
+         final ObjectLongMap<String> activeAllocationIdsLocalCheckpoints = new ObjectLongHashMap<>();
+-        for (final String allocationId : Sets.union(new HashSet<>(randomSubsetOf(activeAllocationIds)), initializedAllocationIds)) {
++        final Set<String> contextActiveAllocationIds =
++                Sets.union(new HashSet<>(randomSubsetOf(activeAllocationIds)), initializedAllocationIds);
++        for (final String allocationId : contextActiveAllocationIds) {
+             activeAllocationIdsLocalCheckpoints.put(allocationId, randomNonNegativeLong());
+         }
+         final ObjectLongMap<String> initializingIdsLocalCheckpoints = new ObjectLongHashMap<>();
++        final Set<String> difference = Sets.difference(initializingAllocationIds, initializedAllocationIds);
+         final Set<String> contextInitializingAllocationIds = Sets.union(
+-                new HashSet<>(randomSubsetOf(Sets.difference(initializingAllocationIds, initializedAllocationIds))),
++                new HashSet<>(randomSubsetOf(randomIntBetween(1, difference.size()), difference)),
+                 newInitializingAllocationIds);
+         for (final String allocationId : contextInitializingAllocationIds) {
+             initializingIdsLocalCheckpoints.put(allocationId, randomNonNegativeLong());
+@@ -662,7 +673,9 @@ public void testPrimaryContextNewerThanAppliedClusterState() {
+                         activeAllocationIdsLocalCheckpoints,
+                         initializingIdsLocalCheckpoints);
+ 
+-        tracker.updateAllocationIdsFromPrimaryContext(primaryContext);
++        final String initializingAllocationId = randomFrom(Sets.difference(contextInitializingAllocationIds, newInitializingAllocationIds));
++        tracker.updateLocalCheckpoint(initializingAllocationId, initializingIdsLocalCheckpoints.get(initializingAllocationId));
++        tracker.updateAllocationIdsFromPrimaryContext(initializingAllocationId, primaryContext);
+ 
+         final PrimaryContext trackerPrimaryContext = tracker.primaryContext();
+         try {
+@@ -698,7 +711,8 @@ public void testPrimaryContextSealing() {
+          * global checkpoint on replica which can happen on the relocation source).
+          */
+         assertIllegalStateExceptionWhenSealed(() -> tracker.updateLocalCheckpoint(randomAlphaOfLength(16), randomNonNegativeLong()));
+-        assertIllegalStateExceptionWhenSealed(() -> tracker.updateAllocationIdsFromPrimaryContext(mock(PrimaryContext.class)));
++        assertIllegalStateExceptionWhenSealed(
++                () -> tracker.updateAllocationIdsFromPrimaryContext(randomAlphaOfLength(16), mock(PrimaryContext.class)));
+         assertIllegalStateExceptionWhenSealed(() -> tracker.primaryContext());
+         assertIllegalStateExceptionWhenSealed(() -> tracker.markAllocationIdAsInSync(randomAlphaOfLength(16), randomNonNegativeLong()));
+ 
+diff --git a/core/src/test/java/org/elasticsearch/index/shard/IndexShardTests.java b/core/src/test/java/org/elasticsearch/index/shard/IndexShardTests.java
+index 9093274a491c..48afb83fab09 100644
+--- a/core/src/test/java/org/elasticsearch/index/shard/IndexShardTests.java
++++ b/core/src/test/java/org/elasticsearch/index/shard/IndexShardTests.java
+@@ -1223,7 +1223,6 @@ public void testShardCanNotBeMarkedAsRelocatedIfRelocationCancelled() throws IOE
+         closeShards(shard);
+     }
+ 
+-    @AwaitsFix(bugUrl = "https://github.com/elastic/elasticsearch/issues/25419")
+     public void testRelocatedShardCanNotBeRevivedConcurrently() throws IOException, InterruptedException, BrokenBarrierException {
+         final IndexShard shard = newStartedShard(true);
+         final ShardRouting originalRouting = shard.routingEntry();
+diff --git a/core/src/test/java/org/elasticsearch/index/shard/LocalCheckpointIT.java b/core/src/test/java/org/elasticsearch/index/shard/LocalCheckpointIT.java
+new file mode 100644
+index 000000000000..4cca2b16b4da
+--- /dev/null
++++ b/core/src/test/java/org/elasticsearch/index/shard/LocalCheckpointIT.java
+@@ -0,0 +1,144 @@
++/*
++ * Licensed to Elasticsearch under one or more contributor
++ * license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright
++ * ownership. Elasticsearch licenses this file to you under
++ * the Apache License, Version 2.0 (the "License"); you may
++ * not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++package org.elasticsearch.index.shard;
++
++import org.elasticsearch.action.admin.cluster.health.ClusterHealthResponse;
++import org.elasticsearch.action.index.IndexRequestBuilder;
++import org.elasticsearch.cluster.ClusterState;
++import org.elasticsearch.cluster.routing.allocation.command.MoveAllocationCommand;
++import org.elasticsearch.common.Priority;
++import org.elasticsearch.common.settings.Settings;
++import org.elasticsearch.common.unit.TimeValue;
++import org.elasticsearch.indices.IndicesService;
++import org.elasticsearch.test.ESIntegTestCase;
++import org.elasticsearch.test.ESIntegTestCase.Scope;
++
++import java.util.concurrent.ExecutionException;
++
++import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;
++import static org.hamcrest.Matchers.equalTo;
++
++/**
++ * Tests that a primary shard tracks its own local checkpoint after starting.
++ */
++@ESIntegTestCase.ClusterScope(scope = Scope.TEST, numDataNodes = 0)
++public class LocalCheckpointIT extends ESIntegTestCase {
++
++    public void testGatewayRecovery() throws Exception {
++        internalCluster().startNode();
++
++        assertAcked(
++                prepareCreate(
++                        "index",
++                        Settings.builder().put("number_of_shards", 1).put("number_of_replicas", 0)));
++        ensureGreen();
++
++        final int numDocs = scaledRandomIntBetween(0, 128);
++        final IndexRequestBuilder[] docs = new IndexRequestBuilder[numDocs];
++
++        for (int i = 0; i < numDocs; i++) {
++            docs[i] = client().prepareIndex("index", "type").setSource("f", randomInt());
++        }
++
++        indexRandom(false, docs);
++
++        internalCluster().fullRestart();
++        ensureGreen();
++
++        final IndexShard indexShard = getIndexShard();
++        assertLocalCheckpoint(numDocs, indexShard);
++    }
++
++    public void testPrimaryPromotion() throws Exception {
++        internalCluster().startNode();
++        internalCluster().startNode();
++
++        assertAcked(prepareCreate("index", Settings.builder().put("number_of_shards", 1).put("number_of_replicas", 1)));
++        ensureGreen();
++
++        final int numDocs = scaledRandomIntBetween(0, 128);
++        final IndexRequestBuilder[] docs = new IndexRequestBuilder[numDocs];
++
++        for (int i = 0; i < numDocs; i++) {
++            docs[i] = client().prepareIndex("index", "type").setSource("f", randomInt());
++        }
++
++        indexRandom(false, docs);
++
++        final IndexShard primaryShardBeforeFailure = getIndexShard();
++
++        primaryShardBeforeFailure.failShard("test", new Exception("test"));
++        // this can not succeed until the primary shard has failed and the replica shard is promoted
++        client().admin().indices().prepareRefresh("index").get();
++        ensureGreen();
++
++        final IndexShard primaryShardAfterFailure = getIndexShard();
++
++        assertLocalCheckpoint(numDocs, primaryShardAfterFailure);
++    }
++
++    public void testPrimaryRelocation() throws ExecutionException, InterruptedException {
++        final String sourceNode = internalCluster().startNode();
++
++        assertAcked(prepareCreate("index", Settings.builder().put("number_of_shards", 1).put("number_of_replicas", 0)));
++        ensureGreen();
++
++        final int numDocs = scaledRandomIntBetween(0, 128);
++        final IndexRequestBuilder[] docs = new IndexRequestBuilder[numDocs];
++
++        for (int i = 0; i < numDocs; i++) {
++            docs[i] = client().prepareIndex("index", "type").setSource("f", randomInt());
++        }
++
++        indexRandom(false, docs);
++
++        final String targetNode = internalCluster().startNode();
++
++        client().admin().cluster().prepareReroute().add(new MoveAllocationCommand("index", 0, sourceNode, targetNode)).get();
++        final ClusterHealthResponse response =
++                client()
++                        .admin()
++                        .cluster()
++                        .prepareHealth()
++                        .setWaitForEvents(Priority.LANGUID)
++                        .setWaitForNoRelocatingShards(true)
++                        .setTimeout(TimeValue.timeValueMinutes(1)).get();
++        assertFalse(response.isTimedOut());
++
++        final IndexShard indexShard = getIndexShard();
++        assertLocalCheckpoint(numDocs, indexShard);
++    }
++
++    private IndexShard getIndexShard() {
++        final ClusterState state = client().admin().cluster().prepareState().get().getState();
++        final String nodeId = state.routingTable().index("index").shard(0).primaryShard().currentNodeId();
++        final String node = state.nodes().get(nodeId).getName();
++        final IndicesService indicesService = internalCluster().getInstance(IndicesService.class, node);
++        return indicesService.indexService(resolveIndex("index")).getShard(0);
++    }
++
++    private void assertLocalCheckpoint(final int numDocs, final IndexShard indexShard) {
++        assertThat(indexShard.getLocalCheckpoint(), equalTo((long)(numDocs - 1)));
++        assertThat(
++                indexShard.getEngine().seqNoService().getLocalCheckpointForInSyncShard(indexShard.routingEntry().allocationId().getId()),
++                equalTo(indexShard.getLocalCheckpoint()));
++    }
++
++}
+diff --git a/core/src/test/java/org/elasticsearch/recovery/FullRollingRestartIT.java b/core/src/test/java/org/elasticsearch/recovery/FullRollingRestartIT.java
+index d6daf3509f57..50035e1027b6 100644
+--- a/core/src/test/java/org/elasticsearch/recovery/FullRollingRestartIT.java
++++ b/core/src/test/java/org/elasticsearch/recovery/FullRollingRestartIT.java
+@@ -54,7 +54,6 @@ protected int numberOfReplicas() {
+         return 1;
+     }
+ 
+-    @AwaitsFix(bugUrl = "https://github.com/elastic/elasticsearch/issues/25420")
+     public void testFullRollingRestart() throws Exception {
+         Settings settings = Settings.builder().put(ZenDiscovery.JOIN_TIMEOUT_SETTING.getKey(), "30s").build();
+         internalCluster().startNode(settings);

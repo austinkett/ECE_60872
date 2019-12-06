@@ -1,0 +1,251 @@
+diff --git a/core/src/main/java/org/elasticsearch/bootstrap/Bootstrap.java b/core/src/main/java/org/elasticsearch/bootstrap/Bootstrap.java
+index 6a72bb4c397f..dce2e8b8cde5 100644
+--- a/core/src/main/java/org/elasticsearch/bootstrap/Bootstrap.java
++++ b/core/src/main/java/org/elasticsearch/bootstrap/Bootstrap.java
+@@ -182,11 +182,18 @@ public void run() {
+      * option for elasticsearch.yml etc to turn off our security manager completely,
+      * for example if you want to have your own configuration or just disable.
+      */
++    // TODO: remove this: http://www.openbsd.org/papers/hackfest2015-pledge/mgp00005.jpg
+     static final String SECURITY_SETTING = "security.manager.enabled";
++    /**
++     * option for elasticsearch.yml to fully respect the system policy, including bad defaults
++     * from java.
++     */
++    // TODO: remove this hack when insecure defaults are removed from java
++    static final String SECURITY_FILTER_BAD_DEFAULTS_SETTING = "security.manager.filter_bad_defaults";
+ 
+     private void setupSecurity(Settings settings, Environment environment) throws Exception {
+         if (settings.getAsBoolean(SECURITY_SETTING, true)) {
+-            Security.configure(environment);
++            Security.configure(environment, settings.getAsBoolean(SECURITY_FILTER_BAD_DEFAULTS_SETTING, true));
+         }
+     }
+ 
+diff --git a/core/src/main/java/org/elasticsearch/bootstrap/ESPolicy.java b/core/src/main/java/org/elasticsearch/bootstrap/ESPolicy.java
+index 474ec755d464..ee804b1480e9 100644
+--- a/core/src/main/java/org/elasticsearch/bootstrap/ESPolicy.java
++++ b/core/src/main/java/org/elasticsearch/bootstrap/ESPolicy.java
+@@ -21,6 +21,7 @@
+ 
+ import org.elasticsearch.common.SuppressForbidden;
+ 
++import java.net.SocketPermission;
+ import java.net.URL;
+ import java.security.CodeSource;
+ import java.security.Permission;
+@@ -40,12 +41,18 @@
+     
+     final Policy template;
+     final Policy untrusted;
++    final Policy system;
+     final PermissionCollection dynamic;
+     final Map<String,Policy> plugins;
+ 
+-    public ESPolicy(PermissionCollection dynamic, Map<String,Policy> plugins) {
++    public ESPolicy(PermissionCollection dynamic, Map<String,Policy> plugins, boolean filterBadDefaults) {
+         this.template = Security.readPolicy(getClass().getResource(POLICY_RESOURCE), JarHell.parseClassPath());
+         this.untrusted = Security.readPolicy(getClass().getResource(UNTRUSTED_RESOURCE), new URL[0]);
++        if (filterBadDefaults) {
++            this.system = new SystemPolicy(Policy.getPolicy());
++        } else {
++            this.system = Policy.getPolicy();
++        }
+         this.dynamic = dynamic;
+         this.plugins = plugins;
+     }
+@@ -75,7 +82,7 @@ public boolean implies(ProtectionDomain domain, Permission permission) {
+         }
+ 
+         // otherwise defer to template + dynamic file permissions
+-        return template.implies(domain, permission) || dynamic.implies(permission);
++        return template.implies(domain, permission) || dynamic.implies(permission) || system.implies(domain, permission);
+     }
+ 
+     @Override
+@@ -92,4 +99,39 @@ public PermissionCollection getPermissions(CodeSource codesource) {
+         // return UNSUPPORTED_EMPTY_COLLECTION since it is safe.
+         return super.getPermissions(codesource);
+     }
++
++    // TODO: remove this hack when insecure defaults are removed from java
++
++    // default policy file states:
++    // "It is strongly recommended that you either remove this permission
++    //  from this policy file or further restrict it to code sources
++    //  that you specify, because Thread.stop() is potentially unsafe."
++    // not even sure this method still works...
++    static final Permission BAD_DEFAULT_NUMBER_ONE = new RuntimePermission("stopThread");
++
++    // default policy file states:
++    // "allows anyone to listen on dynamic ports"
++    // specified exactly because that is what we want, and fastest since it won't imply any
++    // expensive checks for the implicit "resolve"
++    static final Permission BAD_DEFAULT_NUMBER_TWO = new SocketPermission("localhost:0", "listen");
++
++    /**
++     * Wraps the Java system policy, filtering out bad default permissions that
++     * are granted to all domains. Note, before java 8 these were even worse.
++     */
++    static class SystemPolicy extends Policy {
++        final Policy delegate;
++
++        SystemPolicy(Policy delegate) {
++            this.delegate = delegate;
++        }
++
++        @Override
++        public boolean implies(ProtectionDomain domain, Permission permission) {
++            if (BAD_DEFAULT_NUMBER_ONE.equals(permission) || BAD_DEFAULT_NUMBER_TWO.equals(permission)) {
++                return false;
++            }
++            return delegate.implies(domain, permission);
++        }
++    }
+ }
+diff --git a/core/src/main/java/org/elasticsearch/bootstrap/Security.java b/core/src/main/java/org/elasticsearch/bootstrap/Security.java
+index e0f490f560d8..3d7ce9a1fcae 100644
+--- a/core/src/main/java/org/elasticsearch/bootstrap/Security.java
++++ b/core/src/main/java/org/elasticsearch/bootstrap/Security.java
+@@ -109,11 +109,13 @@ private Security() {}
+     /** 
+      * Initializes SecurityManager for the environment
+      * Can only happen once!
++     * @param environment configuration for generating dynamic permissions
++     * @param filterBadDefaults true if we should filter out bad java defaults in the system policy.
+      */
+-    static void configure(Environment environment) throws Exception {
++    static void configure(Environment environment, boolean filterBadDefaults) throws Exception {
+ 
+         // enable security policy: union of template and environment-based paths, and possibly plugin permissions
+-        Policy.setPolicy(new ESPolicy(createPermissions(environment), getPluginPermissions(environment)));
++        Policy.setPolicy(new ESPolicy(createPermissions(environment), getPluginPermissions(environment), filterBadDefaults));
+ 
+         // enable security manager
+         System.setSecurityManager(new SecureSM());
+@@ -192,11 +194,33 @@ static Policy readPolicy(URL policyFile, URL codebases[]) {
+     /** returns dynamic Permissions to configured paths and bind ports */
+     static Permissions createPermissions(Environment environment) throws IOException {
+         Permissions policy = new Permissions();
++        addClasspathPermissions(policy);
+         addFilePermissions(policy, environment);
+         addBindPermissions(policy, environment.settings());
+         return policy;
+     }
+-    
++
++    /** Adds access to classpath jars/classes for jar hell scan, etc */
++    @SuppressForbidden(reason = "accesses fully qualified URLs to configure security")
++    static void addClasspathPermissions(Permissions policy) throws IOException {
++        // add permissions to everything in classpath
++        // really it should be covered by lib/, but there could be e.g. agents or similar configured)
++        for (URL url : JarHell.parseClassPath()) {
++            Path path;
++            try {
++                path = PathUtils.get(url.toURI());
++            } catch (URISyntaxException e) {
++                throw new RuntimeException(e);
++            }
++            // resource itself
++            policy.add(new FilePermission(path.toString(), "read,readlink"));
++            // classes underneath
++            if (Files.isDirectory(path)) {
++                policy.add(new FilePermission(path.toString() + path.getFileSystem().getSeparator() + "-", "read,readlink"));
++            }
++        }
++    }
++
+     /**
+      * Adds access to all configurable paths.
+      */
+@@ -233,7 +257,9 @@ static void addBindPermissions(Permissions policy, Settings settings) throws IOE
+         String httpRange = settings.get("http.netty.port", 
+                                settings.get("http.port", 
+                                        NettyHttpServerTransport.DEFAULT_PORT_RANGE));
+-        policy.add(new SocketPermission("localhost:" + httpRange, "listen,resolve"));
++        // listen is always called with 'localhost' but use wildcard to be sure, no name service is consulted.
++        // see SocketPermission implies() code
++        policy.add(new SocketPermission("*:" + httpRange, "listen,resolve"));
+         // transport is waaaay overengineered
+         Map<String, Settings> profiles = settings.getGroups("transport.profiles", true);
+         if (!profiles.containsKey(NettyTransport.DEFAULT_PROFILE)) {
+@@ -253,7 +279,9 @@ static void addBindPermissions(Permissions policy, Settings settings) throws IOE
+             // a profile is only valid if its the default profile, or if it has an actual name and specifies a port
+             boolean valid = NettyTransport.DEFAULT_PROFILE.equals(name) || (Strings.hasLength(name) && profileSettings.get("port") != null);
+             if (valid) {
+-                policy.add(new SocketPermission("localhost:" + transportRange, "listen,resolve"));
++                // listen is always called with 'localhost' but use wildcard to be sure, no name service is consulted.
++                // see SocketPermission implies() code
++                policy.add(new SocketPermission("*:" + transportRange, "listen,resolve"));
+             }
+         }
+     }
+diff --git a/core/src/main/resources/org/elasticsearch/bootstrap/security.policy b/core/src/main/resources/org/elasticsearch/bootstrap/security.policy
+index ef194768e232..a1d6e29d5c41 100644
+--- a/core/src/main/resources/org/elasticsearch/bootstrap/security.policy
++++ b/core/src/main/resources/org/elasticsearch/bootstrap/security.policy
+@@ -21,13 +21,6 @@
+ // On startup, BootStrap reads environment and adds additional permissions
+ // for configured paths and network binding to these.
+ 
+-//// System code permissions:
+-//// These permissions apply to the JDK itself:
+-
+-grant codeBase "file:${{java.ext.dirs}}/*" {
+-  permission java.security.AllPermission;
+-};
+-
+ //// SecurityManager impl:
+ //// Must have all permissions to properly perform access checks
+ 
+diff --git a/qa/evil-tests/src/test/java/org/elasticsearch/bootstrap/ESPolicyUnitTests.java b/qa/evil-tests/src/test/java/org/elasticsearch/bootstrap/ESPolicyUnitTests.java
+index 3f8da03cb852..220d093301c4 100644
+--- a/qa/evil-tests/src/test/java/org/elasticsearch/bootstrap/ESPolicyUnitTests.java
++++ b/qa/evil-tests/src/test/java/org/elasticsearch/bootstrap/ESPolicyUnitTests.java
+@@ -49,7 +49,7 @@ public void testNullCodeSource() throws Exception {
+         Permission all = new AllPermission();
+         PermissionCollection allCollection = all.newPermissionCollection();
+         allCollection.add(all);
+-        ESPolicy policy = new ESPolicy(allCollection, Collections.emptyMap());
++        ESPolicy policy = new ESPolicy(allCollection, Collections.emptyMap(), true);
+         // restrict ourselves to NoPermission
+         PermissionCollection noPermissions = new Permissions();
+         assertFalse(policy.implies(new ProtectionDomain(null, noPermissions), new FilePermission("foo", "read")));
+@@ -63,7 +63,7 @@ public void testNullCodeSource() throws Exception {
+     public void testNullLocation() throws Exception {
+         assumeTrue("test cannot run with security manager", System.getSecurityManager() == null);
+         PermissionCollection noPermissions = new Permissions();
+-        ESPolicy policy = new ESPolicy(noPermissions, Collections.emptyMap());
++        ESPolicy policy = new ESPolicy(noPermissions, Collections.emptyMap(), true);
+         assertFalse(policy.implies(new ProtectionDomain(new CodeSource(null, (Certificate[])null), noPermissions), new FilePermission("foo", "read")));
+     }
+ }
+diff --git a/test-framework/src/main/java/org/elasticsearch/bootstrap/BootstrapForTesting.java b/test-framework/src/main/java/org/elasticsearch/bootstrap/BootstrapForTesting.java
+index b1a30730715e..b1b5cb3f102f 100644
+--- a/test-framework/src/main/java/org/elasticsearch/bootstrap/BootstrapForTesting.java
++++ b/test-framework/src/main/java/org/elasticsearch/bootstrap/BootstrapForTesting.java
+@@ -96,13 +96,10 @@
+             try {
+                 // initialize paths the same exact way as bootstrap
+                 Permissions perms = new Permissions();
+-                // add permissions to everything in classpath
++                Security.addClasspathPermissions(perms);
++                // crazy jython
+                 for (URL url : JarHell.parseClassPath()) {
+                     Path path = PathUtils.get(url.toURI());
+-                    // resource itself
+-                    perms.add(new FilePermission(path.toString(), "read,readlink"));
+-                    // classes underneath
+-                    perms.add(new FilePermission(path.toString() + path.getFileSystem().getSeparator() + "-", "read,readlink"));
+ 
+                     // crazy jython...
+                     String filename = path.getFileName().toString();
+@@ -141,7 +138,7 @@
+                 
+                 // read test-framework permissions
+                 final Policy testFramework = Security.readPolicy(Bootstrap.class.getResource("test-framework.policy"), JarHell.parseClassPath());
+-                final Policy esPolicy = new ESPolicy(perms, getPluginPermissions());
++                final Policy esPolicy = new ESPolicy(perms, getPluginPermissions(), true);
+                 Policy.setPolicy(new Policy() {
+                     @Override
+                     public boolean implies(ProtectionDomain domain, Permission permission) {

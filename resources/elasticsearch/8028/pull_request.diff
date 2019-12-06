@@ -1,0 +1,785 @@
+diff --git a/docs/reference/migration/migrate_2_0.asciidoc b/docs/reference/migration/migrate_2_0.asciidoc
+index e67f6674d329..12a948ce3d97 100644
+--- a/docs/reference/migration/migrate_2_0.asciidoc
++++ b/docs/reference/migration/migrate_2_0.asciidoc
+@@ -15,7 +15,11 @@ to change this behavior
+ 
+ Partial fields were deprecated since 1.0.0beta1 in favor of <<search-request-source-filtering,source filtering>>.
+ 
+-=== More Like This Field
++=== More Like This (MLT)
+ 
+-The More Like This Field query has been removed in favor of the <<query-dsl-mlt-query, More Like This Query>>
+-restrained set to a specific `field`.
+\ No newline at end of file
++* The MLT Field Query has been removed in favor of the <<query-dsl-mlt-query,
++  More Like This Query>> restrained set to a specific `field`.
++
++* The MLT API has been improved to better take into account `max_query_terms`
++  and `minimum_should_match`. As a consequence the query should return
++  different but more relevant results.
+\ No newline at end of file
+diff --git a/src/main/java/org/elasticsearch/action/mlt/TransportMoreLikeThisAction.java b/src/main/java/org/elasticsearch/action/mlt/TransportMoreLikeThisAction.java
+index 39ac56141593..d2fbbb513a89 100644
+--- a/src/main/java/org/elasticsearch/action/mlt/TransportMoreLikeThisAction.java
++++ b/src/main/java/org/elasticsearch/action/mlt/TransportMoreLikeThisAction.java
+@@ -19,20 +19,16 @@
+ 
+ package org.elasticsearch.action.mlt;
+ 
+-import org.apache.lucene.document.Field;
+-import org.apache.lucene.index.Term;
+-import org.apache.lucene.util.BytesRef;
+ import org.elasticsearch.ElasticsearchException;
+-import org.elasticsearch.ElasticsearchIllegalStateException;
+ import org.elasticsearch.action.ActionListener;
+-import org.elasticsearch.action.get.GetRequest;
+-import org.elasticsearch.action.get.GetResponse;
+-import org.elasticsearch.action.get.TransportGetAction;
+ import org.elasticsearch.action.search.SearchRequest;
+ import org.elasticsearch.action.search.SearchResponse;
+ import org.elasticsearch.action.search.TransportSearchAction;
+ import org.elasticsearch.action.support.ActionFilters;
+ import org.elasticsearch.action.support.HandledTransportAction;
++import org.elasticsearch.action.termvector.TermVectorRequest;
++import org.elasticsearch.action.termvector.TermVectorResponse;
++import org.elasticsearch.action.termvector.TransportSingleShardTermVectorAction;
+ import org.elasticsearch.cluster.ClusterService;
+ import org.elasticsearch.cluster.ClusterState;
+ import org.elasticsearch.cluster.node.DiscoveryNode;
+@@ -42,10 +38,6 @@
+ import org.elasticsearch.common.inject.Inject;
+ import org.elasticsearch.common.settings.Settings;
+ import org.elasticsearch.index.engine.DocumentMissingException;
+-import org.elasticsearch.index.get.GetField;
+-import org.elasticsearch.index.mapper.*;
+-import org.elasticsearch.index.mapper.internal.SourceFieldMapper;
+-import org.elasticsearch.index.query.BoolQueryBuilder;
+ import org.elasticsearch.index.query.MoreLikeThisQueryBuilder;
+ import org.elasticsearch.indices.IndicesService;
+ import org.elasticsearch.search.builder.SearchSourceBuilder;
+@@ -54,12 +46,7 @@
+ import org.elasticsearch.transport.TransportResponseHandler;
+ import org.elasticsearch.transport.TransportService;
+ 
+-import java.util.Collections;
+-import java.util.Iterator;
+-import java.util.Set;
+-
+-import static com.google.common.collect.Sets.newHashSet;
+-import static org.elasticsearch.index.query.QueryBuilders.*;
++import static org.elasticsearch.index.query.QueryBuilders.moreLikeThisQuery;
+ import static org.elasticsearch.search.builder.SearchSourceBuilder.searchSource;
+ 
+ /**
+@@ -69,7 +56,7 @@
+ 
+     private final TransportSearchAction searchAction;
+ 
+-    private final TransportGetAction getAction;
++    private final TransportSingleShardTermVectorAction termVectorAction;
+ 
+     private final IndicesService indicesService;
+ 
+@@ -78,11 +65,11 @@
+     private final TransportService transportService;
+ 
+     @Inject
+-    public TransportMoreLikeThisAction(Settings settings, ThreadPool threadPool, TransportSearchAction searchAction, TransportGetAction getAction,
++    public TransportMoreLikeThisAction(Settings settings, ThreadPool threadPool, TransportSearchAction searchAction, TransportSingleShardTermVectorAction getAction,
+                                        ClusterService clusterService, IndicesService indicesService, TransportService transportService, ActionFilters actionFilters) {
+         super(settings, MoreLikeThisAction.NAME, threadPool, transportService, actionFilters);
+         this.searchAction = searchAction;
+-        this.getAction = getAction;
++        this.termVectorAction = getAction;
+         this.indicesService = indicesService;
+         this.clusterService = clusterService;
+         this.transportService = transportService;
+@@ -116,80 +103,28 @@ protected void doExecute(final MoreLikeThisRequest request, final ActionListener
+             redirect(request, concreteIndex, listener, clusterState);
+             return;
+         }
+-        Set<String> getFields = newHashSet();
+-        if (request.fields() != null) {
+-            Collections.addAll(getFields, request.fields());
+-        }
+-        // add the source, in case we need to parse it to get fields
+-        getFields.add(SourceFieldMapper.NAME);
+ 
+-        GetRequest getRequest = new GetRequest(request, request.index())
+-                .fields(getFields.toArray(new String[getFields.size()]))
++        String[] selectedFields = (request.fields() == null || request.fields().length == 0) ? new String[]{"*"} : request.fields();
++        TermVectorRequest termVectorRequest = new TermVectorRequest()
++                .index(request.index())
+                 .type(request.type())
+                 .id(request.id())
++                .selectedFields(selectedFields)
+                 .routing(request.routing())
+                 .listenerThreaded(true)
+                 .operationThreaded(true);
+ 
+         request.beforeLocalFork();
+-        getAction.execute(getRequest, new ActionListener<GetResponse>() {
++        termVectorAction.execute(termVectorRequest, new ActionListener<TermVectorResponse>() {
+             @Override
+-            public void onResponse(GetResponse getResponse) {
+-                if (!getResponse.isExists()) {
++            public void onResponse(TermVectorResponse termVectorResponse) {
++                if (!termVectorResponse.isExists()) {
+                     listener.onFailure(new DocumentMissingException(null, request.type(), request.id()));
+                     return;
+                 }
+-                final BoolQueryBuilder boolBuilder = boolQuery();
++                final MoreLikeThisQueryBuilder mltQuery = getMoreLikeThis(request, true);
+                 try {
+-                    final DocumentMapper docMapper = indicesService.indexServiceSafe(concreteIndex).mapperService().documentMapper(request.type());
+-                    if (docMapper == null) {
+-                        throw new ElasticsearchException("No DocumentMapper found for type [" + request.type() + "]");
+-                    }
+-                    final Set<String> fields = newHashSet();
+-                    if (request.fields() != null) {
+-                        for (String field : request.fields()) {
+-                            FieldMappers fieldMappers = docMapper.mappers().smartName(field);
+-                            if (fieldMappers != null) {
+-                                fields.add(fieldMappers.mapper().names().indexName());
+-                            } else {
+-                                fields.add(field);
+-                            }
+-                        }
+-                    }
+-
+-                    if (!fields.isEmpty()) {
+-                        // if fields are not empty, see if we got them in the response
+-                        for (Iterator<String> it = fields.iterator(); it.hasNext(); ) {
+-                            String field = it.next();
+-                            GetField getField = getResponse.getField(field);
+-                            if (getField != null) {
+-                                for (Object value : getField.getValues()) {
+-                                    addMoreLikeThis(request, boolBuilder, getField.getName(), value.toString(), true);
+-                                }
+-                                it.remove();
+-                            }
+-                        }
+-                        if (!fields.isEmpty()) {
+-                            // if we don't get all the fields in the get response, see if we can parse the source
+-                            parseSource(getResponse, boolBuilder, docMapper, fields, request);
+-                        }
+-                    } else {
+-                        // we did not ask for any fields, try and get it from the source
+-                        parseSource(getResponse, boolBuilder, docMapper, fields, request);
+-                    }
+-
+-                    if (!boolBuilder.hasClauses()) {
+-                        // no field added, fail
+-                        listener.onFailure(new ElasticsearchException("No fields found to fetch the 'likeText' from"));
+-                        return;
+-                    }
+-
+-                    // exclude myself
+-                    if (!request.include()) {
+-                        Term uidTerm = docMapper.uidMapper().term(request.type(), request.id());
+-                        boolBuilder.mustNot(termQuery(uidTerm.field(), uidTerm.text()));
+-                        boolBuilder.adjustPureNegative(false);
+-                    }
++                    mltQuery.setTermVectorResponse(termVectorResponse);
+                 } catch (Throwable e) {
+                     listener.onFailure(e);
+                     return;
+@@ -210,7 +145,7 @@ public void onResponse(GetResponse getResponse) {
+                         .scroll(request.searchScroll())
+                         .listenerThreaded(request.listenerThreaded());
+ 
+-                SearchSourceBuilder extraSource = searchSource().query(boolBuilder);
++                SearchSourceBuilder extraSource = searchSource().query(mltQuery);
+                 if (request.searchFrom() != 0) {
+                     extraSource.from(request.searchFrom());
+                 }
+@@ -277,52 +212,8 @@ public String executor() {
+         });
+     }
+ 
+-    private void parseSource(GetResponse getResponse, final BoolQueryBuilder boolBuilder, DocumentMapper docMapper, final Set<String> fields, final MoreLikeThisRequest request) {
+-        if (getResponse.isSourceEmpty()) {
+-            return;
+-        }
+-        docMapper.parse(SourceToParse.source(getResponse.getSourceAsBytesRef()).type(request.type()).id(request.id()), new DocumentMapper.ParseListenerAdapter() {
+-            @Override
+-            public boolean beforeFieldAdded(FieldMapper fieldMapper, Field field, Object parseContext) {
+-                if (!field.fieldType().indexed()) {
+-                    return false;
+-                }
+-                if (fieldMapper instanceof InternalMapper) {
+-                    return true;
+-                }
+-                String value = fieldMapper.value(convertField(field)).toString();
+-                if (value == null) {
+-                    return false;
+-                }
+-
+-                if (fields.isEmpty() || fields.contains(field.name())) {
+-                    addMoreLikeThis(request, boolBuilder, fieldMapper, field, !fields.isEmpty());
+-                }
+-
+-                return false;
+-            }
+-        });
+-    }
+-
+-    private Object convertField(Field field) {
+-        if (field.stringValue() != null) {
+-            return field.stringValue();
+-        } else if (field.binaryValue() != null) {
+-            return BytesRef.deepCopyOf(field.binaryValue()).bytes;
+-        } else if (field.numericValue() != null) {
+-            return field.numericValue();
+-        } else {
+-            throw new ElasticsearchIllegalStateException("Field should have either a string, numeric or binary value");
+-        }
+-    }
+-
+-    private void addMoreLikeThis(MoreLikeThisRequest request, BoolQueryBuilder boolBuilder, FieldMapper fieldMapper, Field field, boolean failOnUnsupportedField) {
+-        addMoreLikeThis(request, boolBuilder, field.name(), fieldMapper.value(convertField(field)).toString(), failOnUnsupportedField);
+-    }
+-
+-    private void addMoreLikeThis(MoreLikeThisRequest request, BoolQueryBuilder boolBuilder, String fieldName, String likeText, boolean failOnUnsupportedField) {
+-        MoreLikeThisQueryBuilder mlt = moreLikeThisQuery(fieldName)
+-                .likeText(likeText)
++    private MoreLikeThisQueryBuilder getMoreLikeThis(MoreLikeThisRequest request, boolean failOnUnsupportedField) {
++        return moreLikeThisQuery(request.fields())
+                 .minimumShouldMatch(request.minimumShouldMatch())
+                 .boostTerms(request.boostTerms())
+                 .minDocFreq(request.minDocFreq())
+@@ -332,7 +223,7 @@ private void addMoreLikeThis(MoreLikeThisRequest request, BoolQueryBuilder boolB
+                 .minTermFreq(request.minTermFreq())
+                 .maxQueryTerms(request.maxQueryTerms())
+                 .stopWords(request.stopWords())
++                .include(request.include())
+                 .failOnUnsupportedField(failOnUnsupportedField);
+-        boolBuilder.should(mlt);
+     }
+ }
+diff --git a/src/main/java/org/elasticsearch/action/termvector/TermVectorFields.java b/src/main/java/org/elasticsearch/action/termvector/TermVectorFields.java
+index 92186bbe155a..b14d21db4628 100644
+--- a/src/main/java/org/elasticsearch/action/termvector/TermVectorFields.java
++++ b/src/main/java/org/elasticsearch/action/termvector/TermVectorFields.java
+@@ -391,7 +391,7 @@ public boolean hasPayloads() {
+         }
+     }
+ 
+-    private final class TermVectorDocsAndPosEnum extends DocsAndPositionsEnum {
++    public static final class TermVectorDocsAndPosEnum extends DocsAndPositionsEnum {
+         private boolean hasPositions;
+         private boolean hasOffsets;
+         private boolean hasPayloads;
+@@ -403,7 +403,7 @@ public boolean hasPayloads() {
+         private BytesRefBuilder[] payloads;
+         private int[] endOffsets;
+ 
+-        private DocsAndPositionsEnum reset(int[] positions, int[] startOffsets, int[] endOffsets, BytesRefBuilder[] payloads, int freq) {
++        DocsAndPositionsEnum reset(int[] positions, int[] startOffsets, int[] endOffsets, BytesRefBuilder[] payloads, int freq) {
+             curPos = -1;
+             doc = -1;
+             this.hasPositions = positions != null;
+diff --git a/src/main/java/org/elasticsearch/action/termvector/TermVectorResponseParser.java b/src/main/java/org/elasticsearch/action/termvector/TermVectorResponseParser.java
+new file mode 100644
+index 000000000000..6bec3101bf0b
+--- /dev/null
++++ b/src/main/java/org/elasticsearch/action/termvector/TermVectorResponseParser.java
+@@ -0,0 +1,296 @@
++/*
++ * Licensed to Elasticsearch under one or more contributor
++ * license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright
++ * ownership. Elasticsearch licenses this file to you under
++ * the Apache License, Version 2.0 (the "License"); you may
++ * not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++package org.elasticsearch.action.termvector;
++
++import org.apache.lucene.index.*;
++import org.apache.lucene.util.Bits;
++import org.apache.lucene.util.BytesRef;
++import org.elasticsearch.ElasticsearchParseException;
++import org.elasticsearch.action.termvector.TermVectorFields.TermVectorDocsAndPosEnum;
++import org.elasticsearch.common.xcontent.XContentParser;
++
++import java.io.IOException;
++import java.util.Comparator;
++import java.util.HashMap;
++import java.util.Iterator;
++import java.util.Map;
++
++/**
++ * This class is meant to parse the JSON response of a {@link TermVectorResponse} so that term vectors
++ * could be passed from {@link org.elasticsearch.action.mlt.TransportMoreLikeThisAction}
++ * to {@link org.elasticsearch.index.query.MoreLikeThisQueryParser}.
++ *
++ * <p>
++ * At the moment only <em>_index</em>, <em>_type</em>, <em>_id</em> and <em>term_vectors</em> are
++ * parsed from the response. Term vectors are returned as a {@link Fields} object.
++ * </p>
++*/
++public class TermVectorResponseParser {
++
++    public static class ParsedTermVectorResponse {
++
++        private final String index;
++
++        private final String type;
++
++        private final String id;
++
++        private final Fields termVectorFields;
++
++        public ParsedTermVectorResponse(String index, String type, String id, Fields termVectorResponseFields) {
++            this.index = index;
++            this.type = type;
++            this.id = id;
++            this.termVectorFields = termVectorResponseFields;
++        }
++
++        public String index() {
++            return index;
++        }
++
++        public String type() {
++            return type;
++        }
++
++        public String id() {
++            return id;
++        }
++
++        public Fields termVectorFields() {
++            return termVectorFields;
++        }
++    }
++
++    private XContentParser parser;
++
++    public TermVectorResponseParser(XContentParser parser) throws IOException {
++        this.parser = parser;
++    }
++
++    public ParsedTermVectorResponse parse() throws IOException {
++        String index = null;
++        String type = null;
++        String id = null;
++        Fields termVectorFields = null;
++        XContentParser.Token token;
++        String currentFieldName = null;
++        while ((token = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
++            if (token == XContentParser.Token.FIELD_NAME) {
++                currentFieldName = parser.currentName();
++            } else if (currentFieldName != null) {
++                if (currentFieldName.equals("_index")) {
++                    index = parser.text();
++                } else if (currentFieldName.equals("_type")) {
++                    type = parser.text();
++                } else if (currentFieldName.equals("_id")) {
++                    id = parser.text();
++                } else if (currentFieldName.equals("term_vectors")) {
++                    termVectorFields = parseTermVectors();
++                }
++            }
++        }
++        if (index == null || type == null || id == null || termVectorFields == null) {
++            throw new ElasticsearchParseException("\"_index\", \"_type\", \"_id\" or \"term_vectors\" missing from the response!");
++        }
++        return new ParsedTermVectorResponse(index, type, id, termVectorFields);
++    }
++
++    private Fields parseTermVectors() throws IOException {
++        Map<String, Terms> termVectors = new HashMap<>();
++        XContentParser.Token token;
++        String currentFieldName;
++        while ((token = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
++            if (token == XContentParser.Token.FIELD_NAME) {
++                currentFieldName = parser.currentName();
++                Map<String, Object> terms = null;
++                Map<String, Object> fieldStatistics = null;
++                while ((token = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
++                    if (parser.currentName().equals("terms")) {
++                        parser.nextToken();
++                        terms = parser.map();
++                    }
++                    if (parser.currentName().equals("field_statistics")) {
++                        parser.nextToken();
++                        fieldStatistics = parser.map();
++                    }
++                }
++                if (terms != null) {
++                    termVectors.put(currentFieldName, makeTermVector(terms, fieldStatistics));
++                }
++            }
++        }
++        return makeTermVectors(termVectors);
++    }
++
++    private Terms makeTermVector(final Map<String, Object> terms, final Map<String, Object> fieldStatistics) {
++        return new Terms() {
++            @Override
++            public TermsEnum iterator(TermsEnum reuse) throws IOException {
++                return makeTermsEnum(terms);
++            }
++
++            @Override
++            public Comparator<BytesRef> getComparator() {
++                return BytesRef.getUTF8SortedAsUnicodeComparator();
++            }
++
++            @Override
++            public long size() throws IOException {
++                return terms.size();
++            }
++
++            @Override
++            public long getSumTotalTermFreq() throws IOException {
++                return fieldStatistics != null ? (long) fieldStatistics.get("sum_ttf") : -1;
++            }
++
++            @Override
++            public long getSumDocFreq() throws IOException {
++                return fieldStatistics != null ? (long) fieldStatistics.get("sum_doc_freq") : -1;
++            }
++
++            @Override
++            public int getDocCount() throws IOException {
++                return fieldStatistics != null ? (int) fieldStatistics.get("doc_count") : -1;
++            }
++
++            @Override
++            public boolean hasFreqs() {
++                return true;
++            }
++
++            @Override
++            public boolean hasOffsets() {
++                return false;
++            }
++
++            @Override
++            public boolean hasPositions() {
++                return false;
++            }
++
++            @Override
++            public boolean hasPayloads() {
++                return false;
++            }
++        };
++    }
++
++    private TermsEnum makeTermsEnum(final Map<String, Object> terms) {
++        final Iterator<String> iterator = terms.keySet().iterator();
++        return new TermsEnum() {
++            BytesRef currentTerm;
++            int termFreq = -1;
++            int docFreq = -1;
++            long totalTermFreq = -1;
++
++            @Override
++            public BytesRef next() throws IOException {
++                if (iterator.hasNext()) {
++                    String term = iterator.next();
++                    setTermStats(term);
++                    currentTerm = new BytesRef(term);
++                    return currentTerm;
++                } else {
++                    return null;
++                }
++            }
++
++            private void setTermStats(String term) {
++                // we omit positions, offsets and payloads
++                Map<String, Object> termStats = (Map<String, Object>) terms.get(term);
++                termFreq = (int) termStats.get("term_freq");
++                if (termStats.containsKey("doc_freq")) {
++                    docFreq = (int) termStats.get("doc_freq");
++                }
++                if (termStats.containsKey("total_term_freq")) {
++                    totalTermFreq = (int) termStats.get("total_term_freq");
++                }
++            }
++
++            @Override
++            public BytesRef term() throws IOException {
++                return currentTerm;
++            }
++
++            @Override
++            public SeekStatus seekCeil(BytesRef text) throws IOException {
++                throw new UnsupportedOperationException();
++            }
++
++            @Override
++            public void seekExact(long ord) throws IOException {
++                throw new UnsupportedOperationException();
++            }
++
++            @Override
++            public long ord() throws IOException {
++                throw new UnsupportedOperationException();
++            }
++
++            @Override
++            public int docFreq() throws IOException {
++                return docFreq;
++            }
++
++            @Override
++            public long totalTermFreq() throws IOException {
++                return totalTermFreq;
++            }
++
++            @Override
++            public DocsEnum docs(Bits liveDocs, DocsEnum reuse, int flags) throws IOException {
++                return docsAndPositions(liveDocs, reuse instanceof DocsAndPositionsEnum ? (DocsAndPositionsEnum) reuse : null, 0);
++            }
++
++            @Override
++            public DocsAndPositionsEnum docsAndPositions(Bits liveDocs, DocsAndPositionsEnum reuse, int flags) throws IOException {
++                final TermVectorDocsAndPosEnum retVal = reuse instanceof TermVectorDocsAndPosEnum ? (TermVectorDocsAndPosEnum) reuse
++                        : new TermVectorDocsAndPosEnum();
++                return retVal.reset(null, null, null, null, termFreq);  // only care about term freq
++            }
++
++            @Override
++            public Comparator<BytesRef> getComparator() {
++                return BytesRef.getUTF8SortedAsUnicodeComparator();
++            }
++        };
++    }
++
++    private Fields makeTermVectors(final Map<String, Terms> termVectors) {
++        return new Fields() {
++            @Override
++            public Iterator<String> iterator() {
++                return termVectors.keySet().iterator();
++            }
++
++            @Override
++            public Terms terms(String field) throws IOException {
++                return termVectors.get(field);
++            }
++
++            @Override
++            public int size() {
++                return termVectors.size();
++            }
++        };
++    }
++}
++
+diff --git a/src/main/java/org/elasticsearch/index/query/MoreLikeThisQueryBuilder.java b/src/main/java/org/elasticsearch/index/query/MoreLikeThisQueryBuilder.java
+index af3918734994..f6a8a1e4b235 100644
+--- a/src/main/java/org/elasticsearch/index/query/MoreLikeThisQueryBuilder.java
++++ b/src/main/java/org/elasticsearch/index/query/MoreLikeThisQueryBuilder.java
+@@ -19,11 +19,9 @@
+ 
+ package org.elasticsearch.index.query;
+ 
+-import com.google.common.collect.Lists;
+-import org.elasticsearch.ElasticsearchException;
+ import org.elasticsearch.ElasticsearchIllegalArgumentException;
+-import org.elasticsearch.ElasticsearchParseException;
+ import org.elasticsearch.action.get.MultiGetRequest;
++import org.elasticsearch.action.termvector.TermVectorResponse;
+ import org.elasticsearch.common.Nullable;
+ import org.elasticsearch.common.bytes.BytesReference;
+ import org.elasticsearch.common.lucene.uid.Versions;
+@@ -132,6 +130,7 @@ public XContentBuilder toXContent(XContentBuilder builder, Params params) throws
+ 
+     private final String[] fields;
+     private List<Item> docs = new ArrayList<>();
++    private TermVectorResponse termVectorResponse = null;
+     private Boolean include = null;
+     private String minimumShouldMatch = null;
+     private int minTermFreq = -1;
+@@ -208,6 +207,15 @@ public MoreLikeThisQueryBuilder docs(Item... docs) {
+         return like(docs);
+     }
+ 
++     /* Allow to directly pass the terms as is. Only used internally by MLT API.
++     *
++     * @param termVectorResponse
++     */
++    public MoreLikeThisQueryBuilder setTermVectorResponse(TermVectorResponse termVectorResponse) {
++        this.termVectorResponse = termVectorResponse;
++        return this;
++    }
++
+     public MoreLikeThisQueryBuilder include(boolean include) {
+         this.include = include;
+         return this;
+@@ -346,15 +354,22 @@ protected void doXContent(XContentBuilder builder, Params params) throws IOExcep
+             }
+             builder.endArray();
+         }
+-        if (this.docs.isEmpty()) {
++        // at least like_text or one item is required
++        if (docs.isEmpty() && termVectorResponse == null) {
+             throw new ElasticsearchIllegalArgumentException("more_like_this requires '" + likeFieldName + "' to be provided");
+-        } else {
++        }
++        if (!docs.isEmpty()) {
+             if (docs.size() == 1) {
+                 builder.field(likeFieldName, docs);
+             } else {
+                 builder.array(likeFieldName, docs);
+             }
+         }
++        if (termVectorResponse != null) {
++            builder.startObject("term_vector_response");
++            builder.value(termVectorResponse);
++            builder.endObject();
++        }
+         if (minimumShouldMatch != null) {
+             builder.field(MoreLikeThisQueryParser.Fields.MINIMUM_SHOULD_MATCH.getPreferredName(), minimumShouldMatch);
+         }
+diff --git a/src/main/java/org/elasticsearch/index/query/MoreLikeThisQueryParser.java b/src/main/java/org/elasticsearch/index/query/MoreLikeThisQueryParser.java
+index 63ac858a1c5f..f775705eb09f 100644
+--- a/src/main/java/org/elasticsearch/index/query/MoreLikeThisQueryParser.java
++++ b/src/main/java/org/elasticsearch/index/query/MoreLikeThisQueryParser.java
+@@ -28,8 +28,10 @@
+ import org.apache.lucene.search.ConstantScoreQuery;
+ import org.apache.lucene.search.Query;
+ import org.elasticsearch.ElasticsearchIllegalArgumentException;
++import org.elasticsearch.action.DocumentRequest;
+ import org.elasticsearch.action.termvector.MultiTermVectorsRequest;
+ import org.elasticsearch.action.termvector.TermVectorRequest;
++import org.elasticsearch.action.termvector.TermVectorResponseParser;
+ import org.elasticsearch.common.Nullable;
+ import org.elasticsearch.common.ParseField;
+ import org.elasticsearch.common.Strings;
+@@ -71,6 +73,7 @@
+         public static final ParseField DOCUMENT_IDS = new ParseField("ids").withAllDeprecated("like");
+         public static final ParseField DOCUMENTS = new ParseField("docs").withAllDeprecated("like");
+         public static final ParseField LIKE = new ParseField("like");
++        public static final ParseField TERM_VECTOR_RESPONSE = new ParseField("term_vector_response");
+         public static final ParseField INCLUDE = new ParseField("include");
+     }
+ 
+@@ -105,7 +108,7 @@ public Query parse(QueryParseContext parseContext) throws IOException, QueryPars
+ 
+         List<String> likeTexts = new ArrayList<>();
+         MultiTermVectorsRequest items = new MultiTermVectorsRequest();
+-
++        TermVectorResponseParser.ParsedTermVectorResponse parsedTermVectorResponse = null;  // only used by MLT API
+         while ((token = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
+             if (token == XContentParser.Token.FIELD_NAME) {
+                 currentFieldName = parser.currentName();
+@@ -185,18 +188,17 @@ public Query parse(QueryParseContext parseContext) throws IOException, QueryPars
+             } else if (token == XContentParser.Token.START_OBJECT) {
+                 if (Fields.LIKE.match(currentFieldName, parseContext.parseFlags())) {
+                     parseLikeField(parser, likeTexts, items);
++                } else if (Fields.TERM_VECTOR_RESPONSE.match(currentFieldName, parseContext.parseFlags())) {
++                    parsedTermVectorResponse = new TermVectorResponseParser(parser).parse();
+                 } else {
+                     throw new QueryParsingException(parseContext.index(), "[mlt] query does not support [" + currentFieldName + "]");
+                 }
+             }
+         }
+ 
+-        if (likeTexts.isEmpty() && items.isEmpty()) {
++        if (likeTexts.isEmpty() && items.isEmpty() && parsedTermVectorResponse == null) {
+             throw new QueryParsingException(parseContext.index(), "more_like_this requires at least 'like_text' or 'ids/docs' to be specified");
+         }
+-        if (moreLikeFields != null && moreLikeFields.isEmpty()) {
+-            throw new QueryParsingException(parseContext.index(), "more_like_this requires 'fields' to be non-empty");
+-        }
+ 
+         // set analyzer
+         if (analyzer == null) {
+@@ -205,7 +207,7 @@ public Query parse(QueryParseContext parseContext) throws IOException, QueryPars
+         mltQuery.setAnalyzer(analyzer);
+ 
+         // set like text fields
+-        boolean useDefaultField = (moreLikeFields == null);
++        boolean useDefaultField = (moreLikeFields == null) || moreLikeFields.isEmpty();
+         if (useDefaultField) {
+             moreLikeFields = Lists.newArrayList(parseContext.defaultField());
+         }
+@@ -221,6 +223,17 @@ public Query parse(QueryParseContext parseContext) throws IOException, QueryPars
+             parseContext.addNamedQuery(queryName, mltQuery);
+         }
+ 
++        // handle term vectors directly, only used internally by MLT API
++        if (parsedTermVectorResponse != null) {
++            mltQuery.setLikeText(parsedTermVectorResponse.termVectorFields());
++            BooleanQuery boolQuery = new BooleanQuery();
++            boolQuery.add(mltQuery, BooleanClause.Occur.SHOULD);
++            if (!include) {
++                addExcludeClause(boolQuery, parsedTermVectorResponse.type(), parsedTermVectorResponse.id());
++            }
++            return boolQuery;
++        }
++
+         // handle like texts
+         if (!likeTexts.isEmpty()) {
+             mltQuery.setLikeText(likeTexts);
+@@ -257,9 +270,7 @@ public Query parse(QueryParseContext parseContext) throws IOException, QueryPars
+             boolQuery.add(mltQuery, BooleanClause.Occur.SHOULD);
+             // exclude the items from the search
+             if (!include) {
+-                TermsFilter filter = new TermsFilter(UidFieldMapper.NAME, Uid.createUids(items.getRequests()));
+-                ConstantScoreQuery query = new ConstantScoreQuery(filter);
+-                boolQuery.add(query, BooleanClause.Occur.MUST_NOT);
++                addExcludeClause(boolQuery, items.getRequests());
+             }
+             return boolQuery;
+         }
+@@ -305,4 +316,14 @@ private TermVectorRequest newTermVectorRequest() {
+         }
+         return moreLikeFields;
+     }
++
++    private void addExcludeClause(BooleanQuery boolQuery, List<? extends DocumentRequest> requests) {
++        TermsFilter filter = new TermsFilter(UidFieldMapper.NAME, Uid.createUids(requests));
++        ConstantScoreQuery query = new ConstantScoreQuery(filter);
++        boolQuery.add(query, BooleanClause.Occur.MUST_NOT);
++    }
++
++    private void addExcludeClause(BooleanQuery boolQuery, String type, String id) {
++        addExcludeClause(boolQuery, Lists.newArrayList(new TermVectorRequest().id(id).type(type)));
++    }
+ }
+\ No newline at end of file
+diff --git a/src/main/java/org/elasticsearch/rest/action/mlt/RestMoreLikeThisAction.java b/src/main/java/org/elasticsearch/rest/action/mlt/RestMoreLikeThisAction.java
+index b716e3881e7d..c957bc556526 100644
+--- a/src/main/java/org/elasticsearch/rest/action/mlt/RestMoreLikeThisAction.java
++++ b/src/main/java/org/elasticsearch/rest/action/mlt/RestMoreLikeThisAction.java
+@@ -56,7 +56,8 @@ public void handleRequest(final RestRequest request, final RestChannel channel,
+         //needs some work if it is to be used in a REST context like this too
+         // See the MoreLikeThisQueryParser constants that hold the valid syntax
+         mltRequest.fields(request.paramAsStringArray("mlt_fields", null));
+-        mltRequest.minimumShouldMatch(request.param("minimum_should_match", "0"));
++        mltRequest.percentTermsToMatch(request.paramAsFloat("percent_terms_to_match", 0));
++        mltRequest.minimumShouldMatch(request.param("minimum_should_match", mltRequest.minimumShouldMatch()));
+         mltRequest.minTermFreq(request.paramAsInt("min_term_freq", -1));
+         mltRequest.maxQueryTerms(request.paramAsInt("max_query_terms", -1));
+         mltRequest.stopWords(request.paramAsStringArray("stop_words", null));
+diff --git a/src/test/java/org/elasticsearch/mlt/MoreLikeThisActionTests.java b/src/test/java/org/elasticsearch/mlt/MoreLikeThisActionTests.java
+index 0edafa4ffb22..0280a427504c 100644
+--- a/src/test/java/org/elasticsearch/mlt/MoreLikeThisActionTests.java
++++ b/src/test/java/org/elasticsearch/mlt/MoreLikeThisActionTests.java
+@@ -525,7 +525,7 @@ public void testMoreLikeThisMultiValueFields() throws Exception {
+                     .maxQueryTerms(max_query_terms).percentTermsToMatch(0))
+                     .actionGet();
+             assertSearchResponse(response);
+-            assertHitCount(response, values.length);
++            assertHitCount(response, max_query_terms);
+         }
+     }
+ 

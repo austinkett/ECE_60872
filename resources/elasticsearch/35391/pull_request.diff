@@ -1,0 +1,383 @@
+diff --git a/x-pack/plugin/core/src/main/java/org/elasticsearch/xpack/core/indexlifecycle/CheckRolloverStep.java b/x-pack/plugin/core/src/main/java/org/elasticsearch/xpack/core/indexlifecycle/CheckRolloverStep.java
+new file mode 100644
+index 000000000000..36b99b2c40bb
+--- /dev/null
++++ b/x-pack/plugin/core/src/main/java/org/elasticsearch/xpack/core/indexlifecycle/CheckRolloverStep.java
+@@ -0,0 +1,74 @@
++/*
++ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
++ * or more contributor license agreements. Licensed under the Elastic License;
++ * you may not use this file except in compliance with the Elastic License.
++ */
++
++package org.elasticsearch.xpack.core.indexlifecycle;
++
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
++import org.elasticsearch.action.admin.indices.rollover.RolloverInfo;
++import org.elasticsearch.client.Client;
++import org.elasticsearch.cluster.metadata.IndexMetaData;
++import org.elasticsearch.common.Strings;
++import org.elasticsearch.common.unit.TimeValue;
++
++import java.util.function.LongSupplier;
++
++/**
++ * Checks whether the {@link RolloverStep} immediately prior to this step has successfully rolled over, including
++ * attaching RolloverInfo necessary for subsequent steps. Without this step, sometimes the RolloverInfo is not attached
++ * before the next step runs, causing an error.
++ *
++ * This step includes a timeout, and will error if the rollover has not completed after the timeout has passed.
++ */
++public class CheckRolloverStep extends AsyncWaitStep {
++    public static final String NAME = "check_rollover";
++
++    private static final Logger logger = LogManager.getLogger(CheckRolloverStep.class);
++    static final long TIMEOUT_MILLIS = TimeValue.timeValueMinutes(10).millis();
++
++    private LongSupplier nowSupplier;
++
++    CheckRolloverStep(StepKey key, StepKey nextStepKey, Client client, LongSupplier nowSupplier) {
++        super(key, nextStepKey, client);
++        this.nowSupplier = nowSupplier;
++    }
++
++    @Override
++    public void evaluateCondition(IndexMetaData indexMetaData, Listener listener) {
++        String rolloverAlias = RolloverAction.LIFECYCLE_ROLLOVER_ALIAS_SETTING.get(indexMetaData.getSettings());
++        if (Strings.isNullOrEmpty(rolloverAlias)) {
++            listener.onFailure(new IllegalStateException("setting [" + RolloverAction.LIFECYCLE_ROLLOVER_ALIAS
++                + "] is not set on index [" + indexMetaData.getIndex().getName() + "]"));
++            return;
++        }
++        RolloverInfo rolloverInfo = indexMetaData.getRolloverInfos().get(rolloverAlias);
++        if (rolloverInfo == null) {
++            logger.trace("{} index does not have rollover info yet", indexMetaData.getIndex());
++            // Check if we've timed out.
++            LifecycleExecutionState executionState = LifecycleExecutionState.fromIndexMetadata(indexMetaData);
++            Long stepTime = executionState.getStepTime();
++
++            assert NAME.equals(executionState.getStep()) : "the execution state must be on this step";
++            if (stepTime == null) {
++                listener.onFailure(new IllegalStateException("index [" + indexMetaData.getIndex().getName()  + "] has a null step_time"));
++                return;
++            }
++            long millisSinceEnteringStep = nowSupplier.getAsLong() - stepTime;
++
++            if (millisSinceEnteringStep > TIMEOUT_MILLIS) {
++                listener.onFailure(new IllegalStateException("index [" + indexMetaData.getIndex().getName() + "] was not rolled over "+
++                    "using the configured rollover alias [" + rolloverAlias + "] or a subsequent index was created outside of Index " +
++                    "Lifecycle Management"));
++                return;
++            }
++
++            listener.onResponse(false, null);
++        } else {
++            listener.onResponse(true, null);
++        }
++
++    }
++}
+diff --git a/x-pack/plugin/core/src/main/java/org/elasticsearch/xpack/core/indexlifecycle/RolloverAction.java b/x-pack/plugin/core/src/main/java/org/elasticsearch/xpack/core/indexlifecycle/RolloverAction.java
+index 78dce2db1b8c..c4e09e0789f7 100644
+--- a/x-pack/plugin/core/src/main/java/org/elasticsearch/xpack/core/indexlifecycle/RolloverAction.java
++++ b/x-pack/plugin/core/src/main/java/org/elasticsearch/xpack/core/indexlifecycle/RolloverAction.java
+@@ -132,18 +132,23 @@ public boolean isSafeAction() {
+ 
+     @Override
+     public List<Step> toSteps(Client client, String phase, Step.StepKey nextStepKey) {
++        StepKey rolloverStepKey = new StepKey(phase, NAME, RolloverStep.NAME);
++        StepKey checkRolloverStepKey = new StepKey(phase, NAME, CheckRolloverStep.NAME);
+         StepKey updateDateStepKey = new StepKey(phase, NAME, UpdateRolloverLifecycleDateStep.NAME);
+-        RolloverStep rolloverStep = new RolloverStep(new StepKey(phase, NAME, RolloverStep.NAME), updateDateStepKey, client,
+-            maxSize, maxAge, maxDocs);
++
++        RolloverStep rolloverStep = new RolloverStep(rolloverStepKey, checkRolloverStepKey, client, maxSize, maxAge, maxDocs);
++        CheckRolloverStep checkRolloverStep = new CheckRolloverStep(checkRolloverStepKey, updateDateStepKey,  client,
++            System::currentTimeMillis);
+         UpdateRolloverLifecycleDateStep updateDateStep = new UpdateRolloverLifecycleDateStep(updateDateStepKey, nextStepKey);
+-        return Arrays.asList(rolloverStep, updateDateStep);
++        return Arrays.asList(rolloverStep, checkRolloverStep, updateDateStep);
+     }
+ 
+     @Override
+     public List<StepKey> toStepKeys(String phase) {
+         StepKey rolloverStepKey = new StepKey(phase, NAME, RolloverStep.NAME);
++        StepKey checkRolloverStepKey = new StepKey(phase, NAME, CheckRolloverStep.NAME);
+         StepKey updateDateStepKey = new StepKey(phase, NAME, UpdateRolloverLifecycleDateStep.NAME);
+-        return Arrays.asList(rolloverStepKey, updateDateStepKey);
++        return Arrays.asList(rolloverStepKey, checkRolloverStepKey, updateDateStepKey);
+     }
+ 
+     @Override
+diff --git a/x-pack/plugin/core/src/main/java/org/elasticsearch/xpack/core/indexlifecycle/UpdateRolloverLifecycleDateStep.java b/x-pack/plugin/core/src/main/java/org/elasticsearch/xpack/core/indexlifecycle/UpdateRolloverLifecycleDateStep.java
+index 704d122f571a..e897578c87e2 100644
+--- a/x-pack/plugin/core/src/main/java/org/elasticsearch/xpack/core/indexlifecycle/UpdateRolloverLifecycleDateStep.java
++++ b/x-pack/plugin/core/src/main/java/org/elasticsearch/xpack/core/indexlifecycle/UpdateRolloverLifecycleDateStep.java
+@@ -32,8 +32,8 @@ public ClusterState performAction(Index index, ClusterState currentState) {
+         }
+         RolloverInfo rolloverInfo = indexMetaData.getRolloverInfos().get(rolloverAlias);
+         if (rolloverInfo == null) {
+-            throw new IllegalStateException("no rollover info found for [" + indexMetaData.getIndex().getName() + "], either the index " +
+-                "has not yet rolled over or a subsequent index was created outside of Index Lifecycle Management");
++            throw new IllegalStateException("no rollover info found for [" + indexMetaData.getIndex().getName() + "] with alias [" +
++                rolloverAlias + "], the index has not yet rolled over with that alias");
+         }
+ 
+         LifecycleExecutionState.Builder newLifecycleState = LifecycleExecutionState
+diff --git a/x-pack/plugin/core/src/test/java/org/elasticsearch/xpack/core/indexlifecycle/CheckRolloverStepTests.java b/x-pack/plugin/core/src/test/java/org/elasticsearch/xpack/core/indexlifecycle/CheckRolloverStepTests.java
+new file mode 100644
+index 000000000000..84e9c75e7f14
+--- /dev/null
++++ b/x-pack/plugin/core/src/test/java/org/elasticsearch/xpack/core/indexlifecycle/CheckRolloverStepTests.java
+@@ -0,0 +1,153 @@
++/*
++ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
++ * or more contributor license agreements. Licensed under the Elastic License;
++ * you may not use this file except in compliance with the Elastic License.
++ */
++
++package org.elasticsearch.xpack.core.indexlifecycle;
++
++import org.elasticsearch.Version;
++import org.elasticsearch.action.admin.indices.rollover.RolloverInfo;
++import org.elasticsearch.cluster.metadata.IndexMetaData;
++import org.elasticsearch.common.settings.Settings;
++import org.elasticsearch.common.xcontent.ToXContentObject;
++
++import static org.elasticsearch.xpack.core.indexlifecycle.LifecycleExecutionState.ILM_CUSTOM_METADATA_KEY;
++import static org.hamcrest.Matchers.equalTo;
++
++public class CheckRolloverStepTests extends AbstractStepTestCase<CheckRolloverStep> {
++
++    private final long stepTime = randomLongBetween(0, Long.MAX_VALUE - (CheckRolloverStep.TIMEOUT_MILLIS + 1));
++    private final String indexName = randomAlphaOfLengthBetween(5,15);
++    private final String aliasName = randomAlphaOfLengthBetween(5,15);
++
++    public void testOverTimeout() {
++        logger.info(indexName);
++        final long millisOverTimeout = randomLongBetween(1, Long.MAX_VALUE - stepTime);
++        CheckRolloverStep step = new CheckRolloverStep(randomStepKey(), randomStepKey(), null,
++            () -> stepTime + CheckRolloverStep.TIMEOUT_MILLIS + millisOverTimeout);
++        IndexMetaData indexMetaData = createIndexMetaData(false);
++
++        ExpectFailureListener listener = new ExpectFailureListener("over-timeout");
++        step.evaluateCondition(indexMetaData, listener);
++        assertThat(listener.getException().getMessage(), equalTo("index [" + indexName + "] was not rolled over using the configured " +
++            "rollover alias [" + aliasName + "] or a subsequent index was created outside of Index Lifecycle Management"));
++    }
++
++    public void testUnderTimeout() {
++        final long millisUnderTimeout = randomLongBetween(1, CheckRolloverStep.TIMEOUT_MILLIS);
++        CheckRolloverStep step = new CheckRolloverStep(randomStepKey(), randomStepKey(), null,
++            () -> stepTime + CheckRolloverStep.TIMEOUT_MILLIS - millisUnderTimeout);
++        IndexMetaData indexMetaData = createIndexMetaData(false);
++
++        ExpectResponseListener listener = new ExpectResponseListener("under-timeout", false);
++        step.evaluateCondition(indexMetaData, listener);
++    }
++
++    public void testConditionMet() {
++        final long millisDifferenceFromTimeout = randomLongBetween(-stepTime, Long.MAX_VALUE - stepTime);
++        CheckRolloverStep step = new CheckRolloverStep(randomStepKey(), randomStepKey(), null,
++            () -> stepTime + CheckRolloverStep.TIMEOUT_MILLIS + millisDifferenceFromTimeout);
++        IndexMetaData indexMetaData = createIndexMetaData(true);
++
++        ExpectResponseListener listener = new ExpectResponseListener("under-timeout", true);
++        step.evaluateCondition(indexMetaData, listener);
++    }
++
++    @Override
++    protected CheckRolloverStep createRandomInstance() {
++        final Step.StepKey stepKey = randomStepKey();
++        final Step.StepKey nextStepKey = randomStepKey();
++        return new CheckRolloverStep(stepKey, nextStepKey, null, () -> stepTime);
++    }
++
++    @Override
++    protected CheckRolloverStep mutateInstance(CheckRolloverStep instance) {
++        Step.StepKey key = instance.getKey();
++        Step.StepKey nextKey = instance.getNextStepKey();
++
++        switch (between(0, 1)) {
++            case 0:
++                key = new Step.StepKey(key.getPhase(), key.getAction(), key.getName() + randomAlphaOfLength(5));
++                break;
++            case 1:
++                nextKey = new Step.StepKey(key.getPhase(), key.getAction(), key.getName() + randomAlphaOfLength(5));
++                break;
++            default:
++                throw new AssertionError("Illegal randomisation branch");
++        }
++        return new CheckRolloverStep(key, nextKey, null, () -> stepTime);
++    }
++
++    @Override
++    protected CheckRolloverStep copyInstance(CheckRolloverStep instance) {
++        return new CheckRolloverStep(instance.getKey(), instance.getNextStepKey(), null, () -> stepTime);
++    }
++
++    private IndexMetaData createIndexMetaData(boolean hasRolloverInfo) {
++        LifecycleExecutionState executionState = LifecycleExecutionState.builder()
++            .setStep(CheckRolloverStep.NAME)
++            .setStepTime(stepTime).build();
++
++        Settings.Builder indexSettingsBuilder = Settings.builder();
++        Settings indexSettings = indexSettingsBuilder.put(IndexMetaData.SETTING_NUMBER_OF_SHARDS, 1)
++            .put(IndexMetaData.SETTING_NUMBER_OF_REPLICAS, 0)
++            .put(IndexMetaData.SETTING_VERSION_CREATED, Version.CURRENT)
++            .put(RolloverAction.LIFECYCLE_ROLLOVER_ALIAS, aliasName).build();
++        IndexMetaData.Builder indexMetadata = IndexMetaData.builder(indexName)
++            .settings(indexSettings)
++            .putCustom(ILM_CUSTOM_METADATA_KEY, executionState.asMap());
++        if (hasRolloverInfo) {
++            RolloverInfo rolloverInfo = new RolloverInfo(aliasName, null, stepTime);
++            indexMetadata.putRolloverInfo(rolloverInfo);
++        }
++
++        return indexMetadata.build();
++    }
++
++    private static class ExpectFailureListener implements AsyncWaitStep.Listener {
++        private final String description;
++
++        private Exception exception;
++
++        private ExpectFailureListener(String description) {
++            this.description = description;
++        }
++
++        @Override
++        public void onResponse(boolean conditionMet, ToXContentObject infomationContext) {
++            fail(description + " should fail when called, but onResponse was called with conditionMet = " + conditionMet);
++        }
++
++        @Override
++        public void onFailure(Exception e) {
++            exception = e;
++        }
++
++        public Exception getException() {
++            return exception;
++        }
++    }
++
++    private static class ExpectResponseListener implements AsyncWaitStep.Listener {
++        private final String description;
++        private final boolean expectedConditionMet;
++
++        private ExpectResponseListener(String description, boolean expectedConditionMet) {
++            this.description = description;
++            this.expectedConditionMet = expectedConditionMet;
++        }
++
++        @Override
++        public void onResponse(boolean conditionMet, ToXContentObject infomationContext) {
++            if (conditionMet != expectedConditionMet) {
++                fail(description + " expected conditionMet = " + expectedConditionMet + " but got " + conditionMet);
++            }
++        }
++
++        @Override
++        public void onFailure(Exception e) {
++            fail(description + " should not fail, but got exception: " + e);
++        }
++    }
++}
+diff --git a/x-pack/plugin/core/src/test/java/org/elasticsearch/xpack/core/indexlifecycle/RolloverActionTests.java b/x-pack/plugin/core/src/test/java/org/elasticsearch/xpack/core/indexlifecycle/RolloverActionTests.java
+index f13a09ac7476..15a863e78936 100644
+--- a/x-pack/plugin/core/src/test/java/org/elasticsearch/xpack/core/indexlifecycle/RolloverActionTests.java
++++ b/x-pack/plugin/core/src/test/java/org/elasticsearch/xpack/core/indexlifecycle/RolloverActionTests.java
+@@ -80,17 +80,21 @@ public void testToSteps() {
+                 randomAlphaOfLengthBetween(1, 10));
+         List<Step> steps = action.toSteps(null, phase, nextStepKey);
+         assertNotNull(steps);
+-        assertEquals(2, steps.size());
++        assertEquals(3, steps.size());
+         StepKey expectedFirstStepKey = new StepKey(phase, RolloverAction.NAME, RolloverStep.NAME);
+-        StepKey expectedSecondStepKey = new StepKey(phase, RolloverAction.NAME, UpdateRolloverLifecycleDateStep.NAME);
++        StepKey expectedSecondStepKey = new StepKey(phase, RolloverAction.NAME, CheckRolloverStep.NAME);
++        StepKey expectedThirdStepKey = new StepKey(phase, RolloverAction.NAME, UpdateRolloverLifecycleDateStep.NAME);
+         RolloverStep firstStep = (RolloverStep) steps.get(0);
+-        UpdateRolloverLifecycleDateStep secondStep = (UpdateRolloverLifecycleDateStep) steps.get(1);
++        CheckRolloverStep secondStep = (CheckRolloverStep) steps.get(1);
++        UpdateRolloverLifecycleDateStep thirdStep = (UpdateRolloverLifecycleDateStep) steps.get(2);
+         assertEquals(expectedFirstStepKey, firstStep.getKey());
+         assertEquals(expectedSecondStepKey, secondStep.getKey());
++        assertEquals(expectedThirdStepKey, thirdStep.getKey());
+         assertEquals(secondStep.getKey(), firstStep.getNextStepKey());
++        assertEquals(thirdStep.getKey(), secondStep.getNextStepKey());
+         assertEquals(action.getMaxSize(), firstStep.getMaxSize());
+         assertEquals(action.getMaxAge(), firstStep.getMaxAge());
+         assertEquals(action.getMaxDocs(), firstStep.getMaxDocs());
+-        assertEquals(nextStepKey, secondStep.getNextStepKey());
++        assertEquals(nextStepKey, thirdStep.getNextStepKey());
+     }
+ }
+diff --git a/x-pack/plugin/core/src/test/java/org/elasticsearch/xpack/core/indexlifecycle/UpdateRolloverLifecycleDateStepTests.java b/x-pack/plugin/core/src/test/java/org/elasticsearch/xpack/core/indexlifecycle/UpdateRolloverLifecycleDateStepTests.java
+index 6e492e24f9b3..9db45c1b59b2 100644
+--- a/x-pack/plugin/core/src/test/java/org/elasticsearch/xpack/core/indexlifecycle/UpdateRolloverLifecycleDateStepTests.java
++++ b/x-pack/plugin/core/src/test/java/org/elasticsearch/xpack/core/indexlifecycle/UpdateRolloverLifecycleDateStepTests.java
+@@ -87,8 +87,8 @@ public void testPerformActionBeforeRolloverHappened() {
+         IllegalStateException exceptionThrown = expectThrows(IllegalStateException.class,
+             () -> step.performAction(indexMetaData.getIndex(), clusterState));
+         assertThat(exceptionThrown.getMessage(),
+-            equalTo("no rollover info found for [" + indexMetaData.getIndex().getName() + "], either the index " +
+-                "has not yet rolled over or a subsequent index was created outside of Index Lifecycle Management"));
++            equalTo("no rollover info found for [" + indexMetaData.getIndex().getName() + "] with alias [" + alias + "], the index " +
++                "has not yet rolled over with that alias"));
+     }
+ 
+     public void testPerformActionWithNoRolloverAliasSetting() {
+diff --git a/x-pack/plugin/ilm/qa/multi-node/src/test/java/org/elasticsearch/xpack/indexlifecycle/TimeSeriesLifecycleActionsIT.java b/x-pack/plugin/ilm/qa/multi-node/src/test/java/org/elasticsearch/xpack/indexlifecycle/TimeSeriesLifecycleActionsIT.java
+index 8dc8427bc764..d5935479153a 100644
+--- a/x-pack/plugin/ilm/qa/multi-node/src/test/java/org/elasticsearch/xpack/indexlifecycle/TimeSeriesLifecycleActionsIT.java
++++ b/x-pack/plugin/ilm/qa/multi-node/src/test/java/org/elasticsearch/xpack/indexlifecycle/TimeSeriesLifecycleActionsIT.java
+@@ -22,7 +22,6 @@
+ import org.elasticsearch.test.rest.ESRestTestCase;
+ import org.elasticsearch.xpack.core.indexlifecycle.AllocateAction;
+ import org.elasticsearch.xpack.core.indexlifecycle.DeleteAction;
+-import org.elasticsearch.xpack.core.indexlifecycle.ErrorStep;
+ import org.elasticsearch.xpack.core.indexlifecycle.ForceMergeAction;
+ import org.elasticsearch.xpack.core.indexlifecycle.LifecycleAction;
+ import org.elasticsearch.xpack.core.indexlifecycle.LifecyclePolicy;
+@@ -193,39 +192,6 @@ public void testRolloverAction() throws Exception {
+         assertBusy(() -> assertTrue(indexExists(originalIndex)));
+     }
+ 
+-    public void testRolloverAlreadyExists() throws Exception {
+-        String originalIndex = index + "-000001";
+-        String secondIndex = index + "-000002";
+-        createIndexWithSettings(originalIndex, Settings.builder().put(IndexMetaData.SETTING_NUMBER_OF_SHARDS, 1)
+-            .put(IndexMetaData.SETTING_NUMBER_OF_REPLICAS, 0)
+-            .put(RolloverAction.LIFECYCLE_ROLLOVER_ALIAS, "alias"));
+-
+-        // create policy
+-        createNewSingletonPolicy("hot", new RolloverAction(null, null, 1L));
+-        // update policy on index
+-        updatePolicy(originalIndex, policy);
+-
+-        // Manually create the new index
+-        Request request = new Request("PUT", "/" + secondIndex);
+-        request.setJsonEntity("{\n \"settings\": " + Strings.toString(Settings.builder().put(IndexMetaData.SETTING_NUMBER_OF_SHARDS, 1)
+-            .put(IndexMetaData.SETTING_NUMBER_OF_REPLICAS, 0).build()) + "}");
+-        client().performRequest(request);
+-        // wait for the shards to initialize
+-        ensureGreen(secondIndex);
+-
+-        // index another doc to trigger the policy
+-        index(client(), originalIndex, "_id", "foo", "bar");
+-
+-        assertBusy(() -> {
+-            logger.info(originalIndex + ": " + getStepKeyForIndex(originalIndex));
+-            logger.info(secondIndex + ": " + getStepKeyForIndex(secondIndex));
+-            assertThat(getStepKeyForIndex(originalIndex), equalTo(new StepKey("hot", RolloverAction.NAME, ErrorStep.NAME)));
+-            assertThat(getFailedStepForIndex(originalIndex), equalTo("update-rollover-lifecycle-date"));
+-            assertThat(getReasonForIndex(originalIndex), equalTo("no rollover info found for [" + originalIndex + "], either the index " +
+-                "has not yet rolled over or a subsequent index was created outside of Index Lifecycle Management"));
+-        });
+-    }
+-
+     public void testAllocateOnlyAllocation() throws Exception {
+         createIndexWithSettings(index, Settings.builder().put(IndexMetaData.SETTING_NUMBER_OF_SHARDS, 2)
+             .put(IndexMetaData.SETTING_NUMBER_OF_REPLICAS, 0));

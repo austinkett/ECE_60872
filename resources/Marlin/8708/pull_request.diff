@@ -1,0 +1,136 @@
+diff --git a/Marlin/src/module/planner.cpp b/Marlin/src/module/planner.cpp
+index 7ca6965025a..bc84657bf25 100644
+--- a/Marlin/src/module/planner.cpp
++++ b/Marlin/src/module/planner.cpp
+@@ -789,7 +789,7 @@ void Planner::_buffer_steps(const int32_t (&target)[XYZE], float fr_mm_s, const
+   block_t* block = &block_buffer[block_buffer_head];
+ 
+   // Clear all flags, including the "busy" bit
+-  block->flag = 0;
++  block->flag = 0x00;
+ 
+   // Set direction bits
+   block->direction_bits = dm;
+@@ -1435,7 +1435,9 @@ void Planner::_buffer_line(const float &a, const float &b, const float &c, const
+     const int32_t between[XYZE] = { _BETWEEN(X), _BETWEEN(Y), _BETWEEN(Z), _BETWEEN(E) };
+     DISABLE_STEPPER_DRIVER_INTERRUPT();
+     _buffer_steps(between, fr_mm_s, extruder);
++    const uint8_t next = block_buffer_head;
+     _buffer_steps(target, fr_mm_s, extruder);
++    SBI(block_buffer[next].flag, BLOCK_BIT_CONTINUED);
+     ENABLE_STEPPER_DRIVER_INTERRUPT();
+   }
+   else
+diff --git a/Marlin/src/module/planner.h b/Marlin/src/module/planner.h
+index 9e70e3f6905..2872ef53b89 100644
+--- a/Marlin/src/module/planner.h
++++ b/Marlin/src/module/planner.h
+@@ -57,14 +57,18 @@ enum BlockFlagBit {
+   BLOCK_BIT_START_FROM_FULL_HALT,
+ 
+   // The block is busy
+-  BLOCK_BIT_BUSY
++  BLOCK_BIT_BUSY,
++
++  // The block is segment 2+ of a longer move
++  BLOCK_BIT_CONTINUED
+ };
+ 
+ enum BlockFlag {
+   BLOCK_FLAG_RECALCULATE          = _BV(BLOCK_BIT_RECALCULATE),
+   BLOCK_FLAG_NOMINAL_LENGTH       = _BV(BLOCK_BIT_NOMINAL_LENGTH),
+   BLOCK_FLAG_START_FROM_FULL_HALT = _BV(BLOCK_BIT_START_FROM_FULL_HALT),
+-  BLOCK_FLAG_BUSY                 = _BV(BLOCK_BIT_BUSY)
++  BLOCK_FLAG_BUSY                 = _BV(BLOCK_BIT_BUSY),
++  BLOCK_FLAG_CONTINUED            = _BV(BLOCK_BIT_CONTINUED)
+ };
+ 
+ /**
+@@ -454,14 +458,24 @@ class Planner {
+     static bool blocks_queued() { return (block_buffer_head != block_buffer_tail); }
+ 
+     /**
+-     * "Discards" the block and "releases" the memory.
++     * "Discard" the block and "release" the memory.
+      * Called when the current block is no longer needed.
+      */
+-    static void discard_current_block() {
++    FORCE_INLINE static void discard_current_block() {
+       if (blocks_queued())
+         block_buffer_tail = BLOCK_MOD(block_buffer_tail + 1);
+     }
+ 
++    /**
++     * "Discard" the next block if it's continued.
++     * Called after an interrupted move to throw away the rest of the move.
++     */
++    FORCE_INLINE static bool discard_continued_block() {
++      const bool discard = blocks_queued() && TEST(block_buffer[block_buffer_tail].flag, BLOCK_BIT_CONTINUED);
++      if (discard) discard_current_block();
++      return discard;
++    }
++
+     /**
+      * The current block. NULL if the buffer is empty.
+      * This also marks the block as busy.
+@@ -469,7 +483,7 @@ class Planner {
+      */
+     static block_t* get_current_block() {
+       if (blocks_queued()) {
+-        block_t* block = &block_buffer[block_buffer_tail];
++        block_t * const block = &block_buffer[block_buffer_tail];
+         #if ENABLED(ULTRA_LCD)
+           block_buffer_runtime_us -= block->segment_time_us; // We can't be sure how long an active block will take, so don't count it.
+         #endif
+diff --git a/Marlin/src/module/stepper.cpp b/Marlin/src/module/stepper.cpp
+index 721c9c57c83..d311fe6a2aa 100644
+--- a/Marlin/src/module/stepper.cpp
++++ b/Marlin/src/module/stepper.cpp
+@@ -388,18 +388,21 @@ void Stepper::isr() {
+   // When cleaning, discard the current block and run fast
+   //
+   if (cleaning_buffer_counter) {
+-    if (cleaning_buffer_counter < 0)
+-      ++cleaning_buffer_counter;                // Count up for endstop hit
++    if (cleaning_buffer_counter < 0) {          // Count up for endstop hit
++      if (current_block) planner.discard_current_block(); // Discard the active block that led to the trigger
++      if (!planner.discard_continued_block())   // Discard next CONTINUED block
++        cleaning_buffer_counter = 0;            // Keep discarding until non-CONTINUED
++    }
+     else {
++      planner.discard_current_block();
+       --cleaning_buffer_counter;                // Count down for abort print
+       #ifdef SD_FINISHED_RELEASECOMMAND
+         if (!cleaning_buffer_counter && (SD_FINISHED_STEPPERRELEASE)) enqueue_and_echo_commands_P(PSTR(SD_FINISHED_RELEASECOMMAND));
+       #endif
+     }
+-    current_block = NULL;
+-    planner.discard_current_block();
++    current_block = NULL;                       // Prep to get a new block after cleaning
+     _NEXT_ISR(HAL_STEPPER_TIMER_RATE / 10000);  // Run at max speed - 10 KHz
+-    HAL_ENABLE_ISRs();                          // Re-enable ISRs
++    HAL_ENABLE_ISRs();
+     return;
+   }
+ 
+@@ -1119,9 +1122,9 @@ void Stepper::init() {
+ 
+ 
+ /**
+- * Block until all buffered steps are executed
++ * Block until all buffered steps are executed / cleaned
+  */
+-void Stepper::synchronize() { while (planner.blocks_queued()) idle(); }
++void Stepper::synchronize() { while (planner.blocks_queued() || cleaning_buffer_counter) idle(); }
+ 
+ /**
+  * Set the stepper positions directly in steps
+@@ -1245,7 +1248,7 @@ void Stepper::endstop_triggered(AxisEnum axis) {
+   #endif // !COREXY && !COREXZ && !COREYZ
+ 
+   kill_current_block();
+-  cleaning_buffer_counter = -(BLOCK_BUFFER_SIZE - 1); // Ignore remaining blocks
++  cleaning_buffer_counter = -1; // Discard the rest of the move
+ }
+ 
+ void Stepper::report_positions() {

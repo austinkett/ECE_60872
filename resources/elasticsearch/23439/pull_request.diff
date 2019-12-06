@@ -1,0 +1,656 @@
+diff --git a/docs/plugins/repository-hdfs.asciidoc b/docs/plugins/repository-hdfs.asciidoc
+index 64b87801acbd..20c62a5861a4 100644
+--- a/docs/plugins/repository-hdfs.asciidoc
++++ b/docs/plugins/repository-hdfs.asciidoc
+@@ -68,3 +68,113 @@ The following settings are supported:
+ 
+     Override the chunk size. (Disabled by default)
+ 
++`security.principal`::
++
++    Kerberos principal to use when connecting to a secured HDFS cluster.
++    If you are using a service principal for your elasticsearch node, you may
++    use the `_HOST` pattern in the principal name and the plugin will replace
++    the pattern with the hostname of the node at runtime (see
++    link:repository-hdfs-security-runtime[Creating the Secure Repository]).
++
++[[repository-hdfs-security]]
++==== Hadoop Security
++
++The HDFS Repository Plugin integrates seamlessly with Hadoop's authentication model. The following authentication
++methods are supported by the plugin:
++
++[horizontal]
++`simple`::
++
++    Also means "no security" and is enabled by default. Uses information from underlying operating system account
++    running elasticsearch to inform Hadoop of the name of the current user. Hadoop makes no attempts to verify this
++    information.
++
++`kerberos`::
++
++    Authenticates to Hadoop through the usage of a Kerberos principal and keytab. Interfacing with HDFS clusters
++    secured with Kerberos requires a few additional steps to enable (See <<repository-hdfs-security-keytabs>> and
++    <<repository-hdfs-security-runtime>> for more info)
++
++[[repository-hdfs-security-keytabs]]
++[float]
++===== Principals and Keytabs
++Before attempting to connect to a secured HDFS cluster, provision the Kerberos principals and keytabs that the
++Elasticsearch nodes will use for authenticating to Kerberos. For maximum security and to avoid tripping up the Kerberos
++replay protection, you should create a service principal per node, following the pattern of
++`elasticsearch/hostname@REALM`.
++
++WARNING: In some cases, if the same principal is authenticating from multiple clients at once, services may reject
++authentication for those principals under the assumption that they could be replay attacks. If you are running the
++plugin in production with multiple nodes you should be using a unique service principal for each node.
++
++On each Elasticsearch node, place the appropriate keytab file in the node's configuration location under the
++`repository-hdfs` directory using the name `krb5.keytab`:
++
++[source, bash]
++----
++$> cd elasticsearch/config
++$> ls
++elasticsearch.yml  jvm.options        log4j2.properties  repository-hdfs/   scripts/
++$> cd repository-hdfs
++$> ls
++krb5.keytab
++----
++// TEST[skip:this is for demonstration purposes only
++
++NOTE: Make sure you have the correct keytabs! If you are using a service principal per node (like
++`elasticsearch/hostname@REALM`) then each node will need its own unique keytab file for the principal assigned to that
++host!
++
++// Setup at runtime (principal name)
++[[repository-hdfs-security-runtime]]
++[float]
++===== Creating the Secure Repository
++Once your keytab files are in place and your cluster is started, creating a secured HDFS repository is simple. Just
++add the name of the principal that you will be authenticating as in the repository settings under the
++`security.principal` option:
++
++[source,js]
++----
++PUT _snapshot/my_hdfs_repository
++{
++  "type": "hdfs",
++  "settings": {
++    "uri": "hdfs://namenode:8020/",
++    "path": "/user/elasticsearch/respositories/my_hdfs_repository",
++    "security.principal": "elasticsearch@REALM"
++  }
++}
++----
++// CONSOLE
++// TEST[skip:we don't have hdfs set up while testing this]
++
++If you are using different service principals for each node, you can use the `_HOST` pattern in your principal
++name. Elasticsearch will automatically replace the pattern with the hostname of the node at runtime:
++
++[source,js]
++----
++PUT _snapshot/my_hdfs_repository
++{
++  "type": "hdfs",
++  "settings": {
++    "uri": "hdfs://namenode:8020/",
++    "path": "/user/elasticsearch/respositories/my_hdfs_repository",
++    "security.principal": "elasticsearch/_HOST@REALM"
++  }
++}
++----
++// CONSOLE
++// TEST[skip:we don't have hdfs set up while testing this]
++
++[[repository-hdfs-security-authorization]]
++[float]
++===== Authorization
++Once Elasticsearch is connected and authenticated to HDFS, HDFS will infer a username to use for
++authorizing file access for the client. By default, it picks this username from the primary part of
++the kerberos principal used to authenticate to the service. For example, in the case of a principal
++like `elasticsearch@REALM` or `elasticsearch/hostname@REALM` then the username that HDFS
++extracts for file access checks will be `elasticsearch`.
++
++NOTE: The repository plugin makes no assumptions of what Elasticsearch's principal name is. The main fragment of the
++Kerberos principal is not required to be `elasticsearch`. If you have a principal or service name that works better
++for you or your organization then feel free to use it instead!
+\ No newline at end of file
+diff --git a/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsBlobStore.java b/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsBlobStore.java
+index 7ce5e8d3cd83..8d88b7fd0742 100644
+--- a/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsBlobStore.java
++++ b/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsBlobStore.java
+@@ -29,23 +29,21 @@
+ import org.elasticsearch.common.blobstore.BlobStore;
+ 
+ import java.io.IOException;
+-import java.lang.reflect.ReflectPermission;
+-import java.net.SocketPermission;
+ import java.security.AccessController;
+ import java.security.PrivilegedActionException;
+ import java.security.PrivilegedExceptionAction;
+ 
+-import javax.security.auth.AuthPermission;
+-
+ final class HdfsBlobStore implements BlobStore {
+ 
+     private final Path root;
+     private final FileContext fileContext;
++    private final HdfsSecurityContext securityContext;
+     private final int bufferSize;
+     private volatile boolean closed;
+ 
+     HdfsBlobStore(FileContext fileContext, String path, int bufferSize) throws IOException {
+         this.fileContext = fileContext;
++        this.securityContext = new HdfsSecurityContext(fileContext.getUgi());
+         this.bufferSize = bufferSize;
+         this.root = execute(fileContext1 -> fileContext1.makeQualified(new Path(path)));
+         try {
+@@ -107,9 +105,6 @@ private Path translateToHdfsPath(BlobPath blobPath) {
+     /**
+      * Executes the provided operation against this store
+      */
+-    // we can do FS ops with only two elevated permissions:
+-    // 1) hadoop dynamic proxy is messy with access rules
+-    // 2) allow hadoop to add credentials to our Subject
+     <V> V execute(Operation<V> operation) throws IOException {
+         SpecialPermission.check();
+         if (closed) {
+@@ -117,8 +112,12 @@ private Path translateToHdfsPath(BlobPath blobPath) {
+         }
+         try {
+             return AccessController.doPrivileged((PrivilegedExceptionAction<V>)
+-                    () -> operation.run(fileContext), null, new ReflectPermission("suppressAccessChecks"),
+-                     new AuthPermission("modifyPrivateCredentials"), new SocketPermission("*", "connect"));
++                () -> {
++                    securityContext.ensureLogin();
++                    return operation.run(fileContext);
++                },
++                null,
++                securityContext.getRestrictedExecutionPermissions());
+         } catch (PrivilegedActionException pae) {
+             throw (IOException) pae.getException();
+         }
+diff --git a/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsPlugin.java b/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsPlugin.java
+index 9ea53a5acf22..4e51ab23b809 100644
+--- a/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsPlugin.java
++++ b/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsPlugin.java
+@@ -26,6 +26,9 @@
+ import java.util.Collections;
+ import java.util.Map;
+ 
++import org.apache.hadoop.hdfs.protocolPB.ClientNamenodeProtocolPB;
++import org.apache.hadoop.security.KerberosInfo;
++import org.apache.hadoop.security.SecurityUtil;
+ import org.elasticsearch.SpecialPermission;
+ import org.elasticsearch.common.SuppressForbidden;
+ import org.elasticsearch.common.xcontent.NamedXContentRegistry;
+@@ -40,6 +43,7 @@
+     static {
+         SpecialPermission.check();
+         AccessController.doPrivileged((PrivilegedAction<Void>) HdfsPlugin::evilHadoopInit);
++        AccessController.doPrivileged((PrivilegedAction<Void>) HdfsPlugin::eagerInit);
+     }
+ 
+     @SuppressForbidden(reason = "Needs a security hack for hadoop on windows, until HADOOP-XXXX is fixed")
+@@ -79,6 +83,34 @@ private static Void evilHadoopInit() {
+         return null;
+     }
+ 
++    private static Void eagerInit() {
++        /*
++         * Hadoop RPC wire serialization uses ProtocolBuffers. All proto classes for Hadoop
++         * come annotated with configurations that denote information about if they support
++         * certain security options like Kerberos, and how to send information with the
++         * message to support that authentication method. SecurityUtil creates a service loader
++         * in a static field during its clinit. This loader provides the implementations that
++         * pull the security information for each proto class. The service loader sources its
++         * services from the current thread's context class loader, which must contain the Hadoop
++         * jars. Since plugins don't execute with their class loaders installed as the thread's
++         * context class loader, we need to install the loader briefly, allow the util to be
++         * initialized, then restore the old loader since we don't actually own this thread.
++         */
++        ClassLoader oldCCL = Thread.currentThread().getContextClassLoader();
++        try {
++            Thread.currentThread().setContextClassLoader(HdfsRepository.class.getClassLoader());
++            KerberosInfo info = SecurityUtil.getKerberosInfo(ClientNamenodeProtocolPB.class, null);
++            // Make sure that the correct class loader was installed.
++            if (info == null) {
++                throw new RuntimeException("Could not initialize SecurityUtil: " +
++                    "Unable to find services for [org.apache.hadoop.security.SecurityInfo]");
++            }
++        } finally {
++            Thread.currentThread().setContextClassLoader(oldCCL);
++        }
++        return null;
++    }
++
+     @Override
+     public Map<String, Repository.Factory> getRepositories(Environment env, NamedXContentRegistry namedXContentRegistry) {
+         return Collections.singletonMap("hdfs", (metadata) -> new HdfsRepository(metadata, env, namedXContentRegistry));
+diff --git a/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsRepository.java b/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsRepository.java
+index d784e8bf0931..16ed9d06a5e8 100644
+--- a/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsRepository.java
++++ b/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsRepository.java
+@@ -19,29 +19,31 @@
+ package org.elasticsearch.repositories.hdfs;
+ 
+ import java.io.IOException;
+-import java.lang.reflect.Constructor;
++import java.io.UncheckedIOException;
++import java.net.InetAddress;
+ import java.net.URI;
++import java.net.UnknownHostException;
+ import java.security.AccessController;
+-import java.security.Principal;
+ import java.security.PrivilegedAction;
+-import java.util.Collections;
+ import java.util.Locale;
+ import java.util.Map;
+ import java.util.Map.Entry;
+ 
+-import javax.security.auth.Subject;
+-
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.AbstractFileSystem;
+ import org.apache.hadoop.fs.FileContext;
+ import org.apache.hadoop.fs.UnsupportedFileSystemException;
+-import org.elasticsearch.ElasticsearchGenerationException;
++import org.apache.hadoop.security.SecurityUtil;
++import org.apache.hadoop.security.UserGroupInformation;
++import org.apache.hadoop.security.UserGroupInformation.AuthenticationMethod;
++import org.apache.logging.log4j.Logger;
+ import org.elasticsearch.SpecialPermission;
+ import org.elasticsearch.cluster.metadata.RepositoryMetaData;
+ import org.elasticsearch.common.Strings;
+ import org.elasticsearch.common.SuppressForbidden;
+ import org.elasticsearch.common.blobstore.BlobPath;
+ import org.elasticsearch.common.blobstore.BlobStore;
++import org.elasticsearch.common.logging.Loggers;
+ import org.elasticsearch.common.settings.Settings;
+ import org.elasticsearch.common.unit.ByteSizeUnit;
+ import org.elasticsearch.common.unit.ByteSizeValue;
+@@ -51,9 +53,14 @@
+ 
+ public final class HdfsRepository extends BlobStoreRepository {
+ 
+-    private final BlobPath basePath = BlobPath.cleanPath();
++    private static final Logger LOGGER = Loggers.getLogger(HdfsRepository.class);
++
++    private static final String CONF_SECURITY_PRINCIPAL = "security.principal";
++
++    private final Environment environment;
+     private final ByteSizeValue chunkSize;
+     private final boolean compress;
++    private final BlobPath basePath = BlobPath.cleanPath();
+ 
+     private HdfsBlobStore blobStore;
+ 
+@@ -65,6 +72,7 @@ public HdfsRepository(RepositoryMetaData metadata, Environment environment,
+                           NamedXContentRegistry namedXContentRegistry) throws IOException {
+         super(metadata, environment.settings(), namedXContentRegistry);
+ 
++        this.environment = environment;
+         this.chunkSize = metadata.settings().getAsBytesSize("chunk_size", null);
+         this.compress = metadata.settings().getAsBoolean("compress", false);
+     }
+@@ -101,49 +109,116 @@ protected void doStart() {
+             blobStore = new HdfsBlobStore(fileContext, pathSetting, bufferSize);
+             logger.debug("Using file-system [{}] for URI [{}], path [{}]", fileContext.getDefaultFileSystem(), fileContext.getDefaultFileSystem().getUri(), pathSetting);
+         } catch (IOException e) {
+-            throw new ElasticsearchGenerationException(String.format(Locale.ROOT, "Cannot create HDFS repository for uri [%s]", uri), e);
++            throw new UncheckedIOException(String.format(Locale.ROOT, "Cannot create HDFS repository for uri [%s]", uri), e);
+         }
+         super.doStart();
+     }
+ 
+     // create hadoop filecontext
+-    @SuppressForbidden(reason = "lesser of two evils (the other being a bunch of JNI/classloader nightmares)")
+-    private static FileContext createContext(URI uri, Settings repositorySettings)  {
+-        Configuration cfg = new Configuration(repositorySettings.getAsBoolean("load_defaults", true));
+-        cfg.setClassLoader(HdfsRepository.class.getClassLoader());
+-        cfg.reloadConfiguration();
++    private FileContext createContext(URI uri, Settings repositorySettings)  {
++        Configuration hadoopConfiguration = new Configuration(repositorySettings.getAsBoolean("load_defaults", true));
++        hadoopConfiguration.setClassLoader(HdfsRepository.class.getClassLoader());
++        hadoopConfiguration.reloadConfiguration();
+ 
+         Map<String, String> map = repositorySettings.getByPrefix("conf.").getAsMap();
+         for (Entry<String, String> entry : map.entrySet()) {
+-            cfg.set(entry.getKey(), entry.getValue());
++            hadoopConfiguration.set(entry.getKey(), entry.getValue());
+         }
+ 
+-        // create a hadoop user. if we want some auth, it must be done different anyway, and tested.
+-        Subject subject;
+-        try {
+-            Class<?> clazz = Class.forName("org.apache.hadoop.security.User");
+-            Constructor<?> ctor = clazz.getConstructor(String.class);
+-            ctor.setAccessible(true);
+-            Principal principal = (Principal) ctor.newInstance(System.getProperty("user.name"));
+-            subject = new Subject(false, Collections.singleton(principal), Collections.emptySet(), Collections.emptySet());
+-        } catch (ReflectiveOperationException e) {
+-            throw new RuntimeException(e);
+-        }
++        // Create a hadoop user
++        UserGroupInformation ugi = login(hadoopConfiguration, repositorySettings);
+ 
+-        // disable FS cache
+-        cfg.setBoolean("fs.hdfs.impl.disable.cache", true);
++        // Disable FS cache
++        hadoopConfiguration.setBoolean("fs.hdfs.impl.disable.cache", true);
+ 
+-        // create the filecontext with our user
+-        return Subject.doAs(subject, (PrivilegedAction<FileContext>) () -> {
++        // Create the filecontext with our user information
++        // This will correctly configure the filecontext to have our UGI as it's internal user.
++        return ugi.doAs((PrivilegedAction<FileContext>) () -> {
+             try {
+-                AbstractFileSystem fs = AbstractFileSystem.get(uri, cfg);
+-                return FileContext.getFileContext(fs, cfg);
++                AbstractFileSystem fs = AbstractFileSystem.get(uri, hadoopConfiguration);
++                return FileContext.getFileContext(fs, hadoopConfiguration);
+             } catch (UnsupportedFileSystemException e) {
+-                throw new RuntimeException(e);
++                throw new UncheckedIOException(e);
+             }
+         });
+     }
+ 
++    private UserGroupInformation login(Configuration hadoopConfiguration, Settings repositorySettings) {
++        // Validate the authentication method:
++        AuthenticationMethod authMethod = SecurityUtil.getAuthenticationMethod(hadoopConfiguration);
++        if (authMethod.equals(AuthenticationMethod.SIMPLE) == false
++            && authMethod.equals(AuthenticationMethod.KERBEROS) == false) {
++            throw new RuntimeException("Unsupported authorization mode ["+authMethod+"]");
++        }
++
++        // Check if the user added a principal to use, and that there is a keytab file provided
++        String kerberosPrincipal = repositorySettings.get(CONF_SECURITY_PRINCIPAL);
++
++        // Check to see if the authentication method is compatible
++        if (kerberosPrincipal != null && authMethod.equals(AuthenticationMethod.SIMPLE)) {
++            LOGGER.warn("Hadoop authentication method is set to [SIMPLE], but a Kerberos principal is " +
++                "specified. Continuing with [KERBEROS] authentication.");
++            SecurityUtil.setAuthenticationMethod(AuthenticationMethod.KERBEROS, hadoopConfiguration);
++        } else if (kerberosPrincipal == null && authMethod.equals(AuthenticationMethod.KERBEROS)) {
++            throw new RuntimeException("HDFS Repository does not support [KERBEROS] authentication without " +
++                "a valid Kerberos principal and keytab. Please specify a principal in the repository settings with [" +
++                CONF_SECURITY_PRINCIPAL + "].");
++        }
++
++        // Now we can initialize the UGI with the configuration.
++        UserGroupInformation.setConfiguration(hadoopConfiguration);
++
++        // Debugging
++        LOGGER.debug("Hadoop security enabled: [{}]", UserGroupInformation.isSecurityEnabled());
++        LOGGER.debug("Using Hadoop authentication method: [{}]", SecurityUtil.getAuthenticationMethod(hadoopConfiguration));
++
++        // UserGroupInformation (UGI) instance is just a Hadoop specific wrapper around a Java Subject
++        try {
++            if (UserGroupInformation.isSecurityEnabled()) {
++                String principal = preparePrincipal(kerberosPrincipal);
++                String keytab = HdfsSecurityContext.locateKeytabFile(environment).toString();
++                LOGGER.debug("Using kerberos principal [{}] and keytab located at [{}]", principal, keytab);
++                return UserGroupInformation.loginUserFromKeytabAndReturnUGI(principal, keytab);
++            }
++            return UserGroupInformation.getCurrentUser();
++        } catch (IOException e) {
++            throw new UncheckedIOException("Could not retrieve the current user information", e);
++        }
++    }
++
++    // Convert principals of the format 'service/_HOST@REALM' by subbing in the local address for '_HOST'.
++    private static String preparePrincipal(String originalPrincipal) {
++        String finalPrincipal = originalPrincipal;
++        // Don't worry about host name resolution if they don't have the _HOST pattern in the name.
++        if (originalPrincipal.contains("_HOST")) {
++            try {
++                finalPrincipal = SecurityUtil.getServerPrincipal(originalPrincipal, getHostName());
++            } catch (IOException e) {
++                throw new UncheckedIOException(e);
++            }
++
++            if (originalPrincipal.equals(finalPrincipal) == false) {
++                LOGGER.debug("Found service principal. Converted original principal name [{}] to server principal [{}]",
++                    originalPrincipal, finalPrincipal);
++            }
++        }
++        return finalPrincipal;
++    }
++
++    @SuppressForbidden(reason = "InetAddress.getLocalHost(); Needed for filling in hostname for a kerberos principal name pattern.")
++    private static String getHostName() {
++        try {
++            /*
++             * This should not block since it should already be resolved via Log4J and Netty. The
++             * host information is cached by the JVM and the TTL for the cache entry is infinite
++             * when the SecurityManager is activated.
++             */
++            return InetAddress.getLocalHost().getCanonicalHostName();
++        } catch (UnknownHostException e) {
++            throw new RuntimeException("Could not locate host information", e);
++        }
++    }
++
+     @Override
+     protected BlobStore blobStore() {
+         return blobStore;
+diff --git a/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsSecurityContext.java b/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsSecurityContext.java
+new file mode 100644
+index 000000000000..3cd1a5a40fdc
+--- /dev/null
++++ b/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsSecurityContext.java
+@@ -0,0 +1,145 @@
++/*
++ * Licensed to Elasticsearch under one or more contributor
++ * license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright
++ * ownership. Elasticsearch licenses this file to you under
++ * the Apache License, Version 2.0 (the "License"); you may
++ * not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.elasticsearch.repositories.hdfs;
++
++import java.io.IOException;
++import java.io.UncheckedIOException;
++import java.lang.reflect.ReflectPermission;
++import java.net.SocketPermission;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.security.Permission;
++import java.util.Arrays;
++import java.util.Locale;
++import java.util.function.Supplier;
++import javax.security.auth.AuthPermission;
++import javax.security.auth.PrivateCredentialPermission;
++import javax.security.auth.kerberos.ServicePermission;
++
++import org.apache.hadoop.security.UserGroupInformation;
++import org.apache.logging.log4j.Logger;
++import org.elasticsearch.common.logging.Loggers;
++import org.elasticsearch.env.Environment;
++
++/**
++ * Oversees all the security specific logic for the HDFS Repository plugin.
++ *
++ * Keeps track of the current user for a given repository, as well as which
++ * permissions to grant the blob store restricted execution methods.
++ */
++class HdfsSecurityContext {
++
++    private static final Logger LOGGER = Loggers.getLogger(HdfsSecurityContext.class);
++
++    private static final Permission[] SIMPLE_AUTH_PERMISSIONS;
++    private static final Permission[] KERBEROS_AUTH_PERMISSIONS;
++    static {
++        // We can do FS ops with only a few elevated permissions:
++        SIMPLE_AUTH_PERMISSIONS = new Permission[]{
++            new SocketPermission("*", "connect"),
++            // 1) hadoop dynamic proxy is messy with access rules
++            new ReflectPermission("suppressAccessChecks"),
++            // 2) allow hadoop to add credentials to our Subject
++            new AuthPermission("modifyPrivateCredentials")
++        };
++
++        // If Security is enabled, we need all the following elevated permissions:
++        KERBEROS_AUTH_PERMISSIONS = new Permission[] {
++            new SocketPermission("*", "connect"),
++            // 1) hadoop dynamic proxy is messy with access rules
++            new ReflectPermission("suppressAccessChecks"),
++            // 2) allow hadoop to add credentials to our Subject
++            new AuthPermission("modifyPrivateCredentials"),
++            // 3) allow hadoop to act as the logged in Subject
++            new AuthPermission("doAs"),
++            // 4) Listen and resolve permissions for kerberos server principals
++            new SocketPermission("localhost:0", "listen,resolve"),
++            // We add the following since hadoop requires the client to re-login when the kerberos ticket expires:
++            // 5) All the permissions needed for UGI to do its weird JAAS hack
++            new RuntimePermission("getClassLoader"),
++            new RuntimePermission("setContextClassLoader"),
++            // 6) Additional permissions for the login modules
++            new AuthPermission("modifyPrincipals"),
++            new PrivateCredentialPermission("org.apache.hadoop.security.Credentials * \"*\"", "read"),
++            new PrivateCredentialPermission("javax.security.auth.kerberos.KerberosTicket * \"*\"", "read"),
++            new PrivateCredentialPermission("javax.security.auth.kerberos.KeyTab * \"*\"", "read")
++            // Included later:
++            // 7) allow code to initiate kerberos connections as the logged in user
++            // Still far and away fewer permissions than the original full plugin policy
++        };
++    }
++
++    /**
++     * Locates the keytab file in the environment and verifies that it exists.
++     * Expects keytab file to exist at {@code $CONFIG_DIR$/repository-hdfs/krb5.keytab}
++     */
++    static Path locateKeytabFile(Environment environment) {
++        Path keytabPath = environment.configFile().resolve("repository-hdfs").resolve("krb5.keytab");
++        try {
++            if (Files.exists(keytabPath) == false) {
++                throw new RuntimeException("Could not locate keytab at [" + keytabPath + "].");
++            }
++        } catch (SecurityException se) {
++            throw new RuntimeException("Could not locate keytab at [" + keytabPath + "]", se);
++        }
++        return keytabPath;
++    }
++
++    private final UserGroupInformation ugi;
++    private final Permission[] restrictedExecutionPermissions;
++
++    HdfsSecurityContext(UserGroupInformation ugi) {
++        this.ugi = ugi;
++        this.restrictedExecutionPermissions = renderPermissions(ugi);
++    }
++
++    private Permission[] renderPermissions(UserGroupInformation ugi) {
++        Permission[] permissions;
++        if (ugi.isFromKeytab()) {
++            // KERBEROS
++            // Leave room to append one extra permission based on the logged in user's info.
++            int permlen = KERBEROS_AUTH_PERMISSIONS.length + 1;
++            permissions = new Permission[permlen];
++
++            System.arraycopy(KERBEROS_AUTH_PERMISSIONS, 0, permissions, 0, KERBEROS_AUTH_PERMISSIONS.length);
++
++            // Append a kerberos.ServicePermission to only allow initiating kerberos connections
++            // as the logged in user.
++            permissions[permissions.length - 1] = new ServicePermission(ugi.getUserName(), "initiate");
++        } else {
++            // SIMPLE
++            permissions = Arrays.copyOf(SIMPLE_AUTH_PERMISSIONS, SIMPLE_AUTH_PERMISSIONS.length);
++        }
++        return permissions;
++    }
++
++    Permission[] getRestrictedExecutionPermissions() {
++        return restrictedExecutionPermissions;
++    }
++
++    void ensureLogin() {
++        if (ugi.isFromKeytab()) {
++            try {
++                ugi.checkTGTAndReloginFromKeytab();
++            } catch (IOException ioe) {
++                throw new UncheckedIOException("Could not re-authenticate", ioe);
++            }
++        }
++    }
++}
+diff --git a/plugins/repository-hdfs/src/main/plugin-metadata/plugin-security.policy b/plugins/repository-hdfs/src/main/plugin-metadata/plugin-security.policy
+index b800f3eee46c..f6476f290bc3 100644
+--- a/plugins/repository-hdfs/src/main/plugin-metadata/plugin-security.policy
++++ b/plugins/repository-hdfs/src/main/plugin-metadata/plugin-security.policy
+@@ -25,17 +25,60 @@ grant {
+   permission java.lang.RuntimePermission "accessDeclaredMembers";
+   permission java.lang.reflect.ReflectPermission "suppressAccessChecks";
+ 
++  // Needed so that Hadoop can load the correct classes for SPI and JAAS
++  // org.apache.hadoop.security.SecurityUtil clinit
++  // org.apache.hadoop.security.UserGroupInformation.newLoginContext()
++  permission java.lang.RuntimePermission "setContextClassLoader";
++
+   // org.apache.hadoop.util.StringUtils clinit
+   permission java.util.PropertyPermission "*", "read,write";
+ 
+   // org.apache.hadoop.util.ShutdownHookManager clinit
+   permission java.lang.RuntimePermission "shutdownHooks";
+   
+-  // JAAS is used always, we use a fake subject, hurts nobody
++  // JAAS is used by Hadoop for authentication purposes
++  // The Hadoop Login JAAS module modifies a Subject's private credentials and principals
++  // The Hadoop RPC Layer must be able to read these credentials, and initiate Kerberos connections
++
++  // org.apache.hadoop.security.UserGroupInformation.getCurrentUser()
+   permission javax.security.auth.AuthPermission "getSubject";
++
++  // org.apache.hadoop.security.UserGroupInformation.doAs()
+   permission javax.security.auth.AuthPermission "doAs";
++
++  // org.apache.hadoop.security.UserGroupInformation.getCredentialsInternal()
++  permission javax.security.auth.PrivateCredentialPermission "org.apache.hadoop.security.Credentials * \"*\"", "read";
++
++  // Hadoop depends on the Kerberos login module for kerberos authentication
++  // com.sun.security.auth.module.Krb5LoginModule.login()
++  permission java.lang.RuntimePermission "accessClassInPackage.sun.security.krb5";
++
++  // com.sun.security.auth.module.Krb5LoginModule.commit()
+   permission javax.security.auth.AuthPermission "modifyPrivateCredentials";
++  permission javax.security.auth.AuthPermission "modifyPrincipals";
++  permission javax.security.auth.PrivateCredentialPermission "javax.security.auth.kerberos.KeyTab * \"*\"", "read";
++  permission javax.security.auth.PrivateCredentialPermission "javax.security.auth.kerberos.KerberosTicket * \"*\"", "read";
++
++  // Hadoop depends on OS level user information for simple authentication
++  // Unix: UnixLoginModule: com.sun.security.auth.module.UnixSystem.UnixSystem init
++  permission java.lang.RuntimePermission "loadLibrary.jaas_unix";
++  // Windows: NTLoginModule: com.sun.security.auth.module.NTSystem.loadNative
++  permission java.lang.RuntimePermission "loadLibrary.jaas_nt";
++  permission javax.security.auth.AuthPermission "modifyPublicCredentials";
++
++  // org.apache.hadoop.security.SaslRpcServer.init()
++  permission java.security.SecurityPermission "putProviderProperty.SaslPlainServer";
++
++  // org.apache.hadoop.security.SaslPlainServer.SecurityProvider.SecurityProvider init
++  permission java.security.SecurityPermission "insertProvider.SaslPlainServer";
++
++  // org.apache.hadoop.security.SaslRpcClient.getServerPrincipal -> KerberosPrincipal init
++  permission javax.security.auth.kerberos.ServicePermission "*", "initiate";
+ 
+   // hdfs client opens socket connections for to access repository
+   permission java.net.SocketPermission "*", "connect";
++
++  // client binds to the address returned from the host name of any principal set up as a service principal
++  // org.apache.hadoop.ipc.Client.Connection.setupConnection
++  permission java.net.SocketPermission "localhost:0", "listen,resolve";
+ };

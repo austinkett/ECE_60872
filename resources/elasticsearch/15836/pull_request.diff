@@ -1,0 +1,246 @@
+diff --git a/core/src/main/java/org/elasticsearch/index/cache/bitset/BitsetFilterCache.java b/core/src/main/java/org/elasticsearch/index/cache/bitset/BitsetFilterCache.java
+index 4e9ecf569d07..1de139aa695d 100644
+--- a/core/src/main/java/org/elasticsearch/index/cache/bitset/BitsetFilterCache.java
++++ b/core/src/main/java/org/elasticsearch/index/cache/bitset/BitsetFilterCache.java
+@@ -118,6 +118,12 @@ public void clear(String reason) {
+     private BitSet getAndLoadIfNotPresent(final Query query, final LeafReaderContext context) throws IOException, ExecutionException {
+         final Object coreCacheReader = context.reader().getCoreCacheKey();
+         final ShardId shardId = ShardUtils.extractShardId(context.reader());
++        if (shardId != null // can't require it because of the percolator
++                && indexSettings.getIndex().getName().equals(shardId.getIndex()) == false) {
++            // insanity
++            throw new IllegalStateException("Trying to load bit set for index [" + shardId.getIndex()
++                    + "] with cache of index [" + indexSettings.getIndex().getName() + "]");
++        }
+         Cache<Query, Value> filterToFbs = loadedFilters.computeIfAbsent(coreCacheReader, key -> {
+             context.reader().addCoreClosedListener(BitsetFilterCache.this);
+             return CacheBuilder.<Query, Value>builder().build();
+@@ -208,6 +214,11 @@ public int hashCode() {
+ 
+         @Override
+         public IndicesWarmer.TerminationHandle warmNewReaders(final IndexShard indexShard, final Engine.Searcher searcher) {
++            if (indexSettings.getIndex().equals(indexShard.getIndexSettings().getIndex()) == false) {
++                // this is from a different index
++                return TerminationHandle.NO_WAIT;
++            }
++
+             if (!loadRandomAccessFiltersEagerly) {
+                 return TerminationHandle.NO_WAIT;
+             }
+diff --git a/core/src/test/java/org/elasticsearch/index/cache/bitset/BitSetFilterCacheTests.java b/core/src/test/java/org/elasticsearch/index/cache/bitset/BitSetFilterCacheTests.java
+index d2bf6bebc5ce..69831d7471a2 100644
+--- a/core/src/test/java/org/elasticsearch/index/cache/bitset/BitSetFilterCacheTests.java
++++ b/core/src/test/java/org/elasticsearch/index/cache/bitset/BitSetFilterCacheTests.java
+@@ -31,8 +31,11 @@
+ import org.apache.lucene.index.LogByteSizeMergePolicy;
+ import org.apache.lucene.index.Term;
+ import org.apache.lucene.search.IndexSearcher;
++import org.apache.lucene.search.MatchAllDocsQuery;
+ import org.apache.lucene.search.TermQuery;
+ import org.apache.lucene.search.join.BitSetProducer;
++import org.apache.lucene.store.BaseDirectoryWrapper;
++import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.RAMDirectory;
+ import org.apache.lucene.util.Accountable;
+ import org.apache.lucene.util.BitSet;
+@@ -89,7 +92,8 @@ public void testInvalidateEntries() throws Exception {
+         writer.addDocument(document);
+         writer.commit();
+ 
+-        IndexReader reader = DirectoryReader.open(writer, false);
++        DirectoryReader reader = DirectoryReader.open(writer, false);
++        reader = ElasticsearchDirectoryReader.wrap(reader, new ShardId(new Index("test"), 0));
+         IndexSearcher searcher = new IndexSearcher(reader);
+ 
+         BitsetFilterCache cache = new BitsetFilterCache(INDEX_SETTINGS, warmer, new BitsetFilterCache.Listener() {
+@@ -114,6 +118,7 @@ public void onRemoval(ShardId shardId, Accountable accountable) {
+         writer.forceMerge(1);
+         reader.close();
+         reader = DirectoryReader.open(writer, false);
++        reader = ElasticsearchDirectoryReader.wrap(reader, new ShardId(new Index("test"), 0));
+         searcher = new IndexSearcher(reader);
+ 
+         assertThat(matchCount(filter, reader), equalTo(3));
+@@ -139,7 +144,7 @@ public void testListener() throws IOException {
+         writer.addDocument(document);
+         writer.commit();
+         final DirectoryReader writerReader = DirectoryReader.open(writer, false);
+-        final IndexReader reader = randomBoolean() ? writerReader : ElasticsearchDirectoryReader.wrap(writerReader, new ShardId("test", 0));
++        final IndexReader reader = ElasticsearchDirectoryReader.wrap(writerReader, new ShardId("test", 0));
+ 
+         final AtomicLong stats = new AtomicLong();
+         final AtomicInteger onCacheCalls = new AtomicInteger();
+@@ -192,4 +197,39 @@ public void testSetNullListener() {
+         }
+     }
+ 
++    public void testRejectOtherIndex() throws IOException {
++        BitsetFilterCache cache = new BitsetFilterCache(INDEX_SETTINGS, warmer, new BitsetFilterCache.Listener() {
++            @Override
++            public void onCache(ShardId shardId, Accountable accountable) {
++
++            }
++
++            @Override
++            public void onRemoval(ShardId shardId, Accountable accountable) {
++
++            }
++        });
++        
++        Directory dir = newDirectory();
++        IndexWriter writer = new IndexWriter(
++                dir,
++                newIndexWriterConfig()
++        );
++        writer.addDocument(new Document());
++        DirectoryReader reader = DirectoryReader.open(writer, true);
++        writer.close();
++        reader = ElasticsearchDirectoryReader.wrap(reader, new ShardId(new Index("test2"), 0));
++        
++        BitSetProducer producer = cache.getBitSetProducer(new MatchAllDocsQuery());
++        
++        try {
++            producer.getBitSet(reader.leaves().get(0));
++            fail();
++        } catch (IllegalStateException expected) {
++            assertEquals("Trying to load bit set for index [test2] with cache of index [test]", expected.getMessage());
++        } finally {
++            IOUtils.close(reader, dir);
++        }
++    }
++
+ }
+diff --git a/core/src/test/java/org/elasticsearch/index/fielddata/AbstractStringFieldDataTestCase.java b/core/src/test/java/org/elasticsearch/index/fielddata/AbstractStringFieldDataTestCase.java
+index 024a90ce7baf..82b2cca79aae 100644
+--- a/core/src/test/java/org/elasticsearch/index/fielddata/AbstractStringFieldDataTestCase.java
++++ b/core/src/test/java/org/elasticsearch/index/fielddata/AbstractStringFieldDataTestCase.java
+@@ -46,12 +46,15 @@
+ import org.apache.lucene.util.FixedBitSet;
+ import org.apache.lucene.util.TestUtil;
+ import org.apache.lucene.util.UnicodeUtil;
++import org.elasticsearch.common.lucene.index.ElasticsearchDirectoryReader;
+ import org.elasticsearch.common.lucene.search.Queries;
+ import org.elasticsearch.common.settings.Settings;
++import org.elasticsearch.index.Index;
+ import org.elasticsearch.index.fielddata.IndexFieldData.XFieldComparatorSource;
+ import org.elasticsearch.index.fielddata.IndexFieldData.XFieldComparatorSource.Nested;
+ import org.elasticsearch.index.fielddata.fieldcomparator.BytesRefFieldComparatorSource;
+ import org.elasticsearch.index.fielddata.ordinals.GlobalOrdinalsIndexFieldData;
++import org.elasticsearch.index.shard.ShardId;
+ import org.elasticsearch.search.MultiValueMode;
+ 
+ import java.io.IOException;
+@@ -385,7 +388,9 @@ public void testNestedSorting(MultiValueMode sortMode) throws IOException {
+                 writer.commit();
+             }
+         }
+-        IndexSearcher searcher = new IndexSearcher(DirectoryReader.open(writer, true));
++        DirectoryReader directoryReader = DirectoryReader.open(writer, true);
++        directoryReader = ElasticsearchDirectoryReader.wrap(directoryReader, new ShardId(new Index("test"), 0));
++        IndexSearcher searcher = new IndexSearcher(directoryReader);
+         IndexFieldData<?> fieldData = getForField("text");
+         final Object missingValue;
+         switch (randomInt(4)) {
+diff --git a/core/src/test/java/org/elasticsearch/index/search/nested/AbstractNumberNestedSortingTestCase.java b/core/src/test/java/org/elasticsearch/index/search/nested/AbstractNumberNestedSortingTestCase.java
+index fa27323c13a3..65dfd8a5af4f 100644
+--- a/core/src/test/java/org/elasticsearch/index/search/nested/AbstractNumberNestedSortingTestCase.java
++++ b/core/src/test/java/org/elasticsearch/index/search/nested/AbstractNumberNestedSortingTestCase.java
+@@ -36,11 +36,14 @@
+ import org.apache.lucene.search.join.QueryBitSetProducer;
+ import org.apache.lucene.search.join.ScoreMode;
+ import org.apache.lucene.search.join.ToParentBlockJoinQuery;
++import org.elasticsearch.common.lucene.index.ElasticsearchDirectoryReader;
+ import org.elasticsearch.common.lucene.search.Queries;
++import org.elasticsearch.index.Index;
+ import org.elasticsearch.index.fielddata.AbstractFieldDataTestCase;
+ import org.elasticsearch.index.fielddata.IndexFieldData;
+ import org.elasticsearch.index.fielddata.IndexFieldData.XFieldComparatorSource;
+ import org.elasticsearch.index.fielddata.IndexFieldData.XFieldComparatorSource.Nested;
++import org.elasticsearch.index.shard.ShardId;
+ import org.elasticsearch.search.MultiValueMode;
+ 
+ import java.io.IOException;
+@@ -216,7 +219,9 @@ public void testNestedSorting() throws Exception {
+         writer.addDocument(document);
+ 
+         MultiValueMode sortMode = MultiValueMode.SUM;
+-        IndexSearcher searcher = new IndexSearcher(DirectoryReader.open(writer, false));
++        DirectoryReader directoryReader = DirectoryReader.open(writer, false);
++        directoryReader = ElasticsearchDirectoryReader.wrap(directoryReader, new ShardId(new Index("test"), 0));
++        IndexSearcher searcher = new IndexSearcher(directoryReader);
+         Query parentFilter = new TermQuery(new Term("__type", "parent"));
+         Query childFilter = Queries.not(parentFilter);
+         XFieldComparatorSource nestedComparatorSource = createFieldComparator("field2", sortMode, null, createNested(searcher, parentFilter, childFilter));
+diff --git a/core/src/test/java/org/elasticsearch/index/search/nested/NestedSortingTests.java b/core/src/test/java/org/elasticsearch/index/search/nested/NestedSortingTests.java
+index 49af5f0b82e9..a58fea831d5a 100644
+--- a/core/src/test/java/org/elasticsearch/index/search/nested/NestedSortingTests.java
++++ b/core/src/test/java/org/elasticsearch/index/search/nested/NestedSortingTests.java
+@@ -40,8 +40,10 @@
+ import org.apache.lucene.search.join.ToParentBlockJoinQuery;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.TestUtil;
++import org.elasticsearch.common.lucene.index.ElasticsearchDirectoryReader;
+ import org.elasticsearch.common.lucene.search.Queries;
+ import org.elasticsearch.common.settings.Settings;
++import org.elasticsearch.index.Index;
+ import org.elasticsearch.index.fielddata.AbstractFieldDataTestCase;
+ import org.elasticsearch.index.fielddata.FieldDataType;
+ import org.elasticsearch.index.fielddata.IndexFieldData;
+@@ -49,6 +51,7 @@
+ import org.elasticsearch.index.fielddata.NoOrdinalsStringFieldDataTests;
+ import org.elasticsearch.index.fielddata.fieldcomparator.BytesRefFieldComparatorSource;
+ import org.elasticsearch.index.fielddata.plain.PagedBytesIndexFieldData;
++import org.elasticsearch.index.shard.ShardId;
+ import org.elasticsearch.search.MultiValueMode;
+ 
+ import java.io.IOException;
+@@ -91,7 +94,9 @@ public void testDuel() throws Exception {
+         writer.commit();
+ 
+         MultiValueMode sortMode = randomFrom(Arrays.asList(MultiValueMode.MIN, MultiValueMode.MAX));
+-        IndexSearcher searcher = new IndexSearcher(DirectoryReader.open(writer, false));
++        DirectoryReader reader = DirectoryReader.open(writer, false);
++        reader = ElasticsearchDirectoryReader.wrap(reader, new ShardId(new Index("test"), 0));
++        IndexSearcher searcher = new IndexSearcher(reader);
+         PagedBytesIndexFieldData indexFieldData1 = getForField("f");
+         IndexFieldData<?> indexFieldData2 = NoOrdinalsStringFieldDataTests.hideOrdinals(indexFieldData1);
+         final String missingValue = randomBoolean() ? null : TestUtil.randomSimpleString(getRandom(), 2);
+@@ -274,7 +279,9 @@ public void testNestedSorting() throws Exception {
+         writer.addDocument(document);
+ 
+         MultiValueMode sortMode = MultiValueMode.MIN;
+-        IndexSearcher searcher = new IndexSearcher(DirectoryReader.open(writer, false));
++        DirectoryReader reader = DirectoryReader.open(writer, false);
++        reader = ElasticsearchDirectoryReader.wrap(reader, new ShardId(new Index("test"), 0));
++        IndexSearcher searcher = new IndexSearcher(reader);
+         PagedBytesIndexFieldData indexFieldData = getForField("field2");
+         Query parentFilter = new TermQuery(new Term("__type", "parent"));
+         Query childFilter = Queries.not(parentFilter);
+diff --git a/core/src/test/java/org/elasticsearch/search/aggregations/bucket/nested/NestedAggregatorTests.java b/core/src/test/java/org/elasticsearch/search/aggregations/bucket/nested/NestedAggregatorTests.java
+index b5ef5d9eb4f8..17e8fd350732 100644
+--- a/core/src/test/java/org/elasticsearch/search/aggregations/bucket/nested/NestedAggregatorTests.java
++++ b/core/src/test/java/org/elasticsearch/search/aggregations/bucket/nested/NestedAggregatorTests.java
+@@ -34,10 +34,13 @@
+ import org.apache.lucene.store.Directory;
+ import org.elasticsearch.action.admin.indices.mapping.put.PutMappingRequest;
+ import org.elasticsearch.common.compress.CompressedXContent;
++import org.elasticsearch.common.lucene.index.ElasticsearchDirectoryReader;
+ import org.elasticsearch.common.lucene.search.Queries;
++import org.elasticsearch.index.Index;
+ import org.elasticsearch.index.IndexService;
+ import org.elasticsearch.index.mapper.internal.TypeFieldMapper;
+ import org.elasticsearch.index.mapper.internal.UidFieldMapper;
++import org.elasticsearch.index.shard.ShardId;
+ import org.elasticsearch.search.aggregations.Aggregator;
+ import org.elasticsearch.search.aggregations.AggregatorFactories;
+ import org.elasticsearch.search.aggregations.BucketCollector;
+@@ -110,7 +113,8 @@ public void testResetRootDocId() throws Exception {
+         indexWriter.commit();
+         indexWriter.close();
+ 
+-        DirectoryReader directoryReader =  DirectoryReader.open(directory);
++        DirectoryReader directoryReader = DirectoryReader.open(directory);
++        directoryReader = ElasticsearchDirectoryReader.wrap(directoryReader, new ShardId(new Index("test"), 0));
+         IndexSearcher searcher = new IndexSearcher(directoryReader);
+ 
+         IndexService indexService = createIndex("test");

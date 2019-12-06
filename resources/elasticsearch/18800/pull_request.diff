@@ -1,0 +1,143 @@
+diff --git a/core/src/main/java/org/elasticsearch/common/rounding/TimeZoneRounding.java b/core/src/main/java/org/elasticsearch/common/rounding/TimeZoneRounding.java
+index c78d6c730b68..593b04848000 100644
+--- a/core/src/main/java/org/elasticsearch/common/rounding/TimeZoneRounding.java
++++ b/core/src/main/java/org/elasticsearch/common/rounding/TimeZoneRounding.java
+@@ -25,6 +25,7 @@
+ import org.elasticsearch.common.unit.TimeValue;
+ import org.joda.time.DateTimeField;
+ import org.joda.time.DateTimeZone;
++import org.joda.time.IllegalInstantException;
+ 
+ import java.io.IOException;
+ import java.util.Objects;
+@@ -218,7 +219,56 @@ public byte id() {
+         public long roundKey(long utcMillis) {
+             long timeLocal = timeZone.convertUTCToLocal(utcMillis);
+             long rounded = Rounding.Interval.roundValue(Rounding.Interval.roundKey(timeLocal, interval), interval);
+-            return timeZone.convertLocalToUTC(rounded, false, utcMillis);
++            long roundedUTC;
++            if (isInDSTGap(rounded) == false) {
++                roundedUTC  = timeZone.convertLocalToUTC(rounded, true, utcMillis);
++            } else {
++                /*
++                 * Edge case where the rounded local time is illegal and landed
++                 * in a DST gap. In this case, we choose 1ms tick after the
++                 * transition date. We don't want the transition date itself
++                 * because those dates, when rounded themselves, fall into the
++                 * previous interval. This would violate the invariant that the
++                 * rounding operation should be idempotent.
++                 */
++                roundedUTC = timeZone.previousTransition(utcMillis) + 1;
++            }
++            return roundedUTC;
++        }
++
++        /**
++         * Determine whether the local instant is a valid instant in the given
++         * time zone. The logic for this is taken from
++         * {@link DateTimeZone#convertLocalToUTC(long, boolean)} for the
++         * `strict` mode case, but instead of throwing an
++         * {@link IllegalInstantException}, which is costly, we want to return a
++         * flag indicating that the value is illegal in that time zone.
++         */
++        private boolean isInDSTGap(long instantLocal) {
++            if (timeZone.isFixed()) {
++                return false;
++            }
++            // get the offset at instantLocal (first estimate)
++            int offsetLocal = timeZone.getOffset(instantLocal);
++            // adjust instantLocal using the estimate and recalc the offset
++            int offset = timeZone.getOffset(instantLocal - offsetLocal);
++            // if the offsets differ, we must be near a DST boundary
++            if (offsetLocal != offset) {
++                // determine if we are in the DST gap
++                long nextLocal = timeZone.nextTransition(instantLocal - offsetLocal);
++                if (nextLocal == (instantLocal - offsetLocal)) {
++                    nextLocal = Long.MAX_VALUE;
++                }
++                long nextAdjusted = timeZone.nextTransition(instantLocal - offset);
++                if (nextAdjusted == (instantLocal - offset)) {
++                    nextAdjusted = Long.MAX_VALUE;
++                }
++                if (nextLocal != nextAdjusted) {
++                    // we are in the DST gap
++                    return true;
++                }
++            }
++            return false;
+         }
+ 
+         @Override
+diff --git a/core/src/test/java/org/elasticsearch/common/rounding/TimeZoneRoundingTests.java b/core/src/test/java/org/elasticsearch/common/rounding/TimeZoneRoundingTests.java
+index 49ba26231da6..6302f9c67b15 100644
+--- a/core/src/test/java/org/elasticsearch/common/rounding/TimeZoneRoundingTests.java
++++ b/core/src/test/java/org/elasticsearch/common/rounding/TimeZoneRoundingTests.java
+@@ -309,24 +309,54 @@ public void testTimeInterval_Kathmandu_DST_Start() {
+         assertThat(time("1986-01-01T00:40:00+05:45") - time("1986-01-01T00:20:00+05:45"), equalTo(TimeUnit.MINUTES.toMillis(20)));
+     }
+ 
++    /**
++     * Special test for intervals that don't fit evenly into rounding interval.
++     * In this case, when interval crosses DST transition point, rounding in local
++     * time can land in a DST gap which results in wrong UTC rounding values.
++     */
++    public void testIntervalRounding_NotDivisibleInteval() {
++        DateTimeZone tz = DateTimeZone.forID("CET");
++        long interval = TimeUnit.MINUTES.toMillis(14);
++        TimeZoneRounding rounding = new TimeZoneRounding.TimeIntervalRounding(interval, tz);
++
++        assertThat(rounding.round(time("2016-03-27T01:41:00+01:00")), equalTo(time("2016-03-27T01:30:00+01:00")));
++        assertThat(rounding.round(time("2016-03-27T01:51:00+01:00")), equalTo(time("2016-03-27T01:44:00+01:00")));
++        assertThat(rounding.round(time("2016-03-27T01:59:00+01:00")), equalTo(time("2016-03-27T01:58:00+01:00")));
++        assertThat(rounding.round(time("2016-03-27T03:05:00+02:00")), equalTo(time("2016-03-27T03:00:00+02:00")));
++        assertThat(rounding.round(time("2016-03-27T03:12:00+02:00")), equalTo(time("2016-03-27T03:08:00+02:00")));
++        assertThat(rounding.round(time("2016-03-27T03:25:00+02:00")), equalTo(time("2016-03-27T03:22:00+02:00")));
++        assertThat(rounding.round(time("2016-03-27T03:39:00+02:00")), equalTo(time("2016-03-27T03:36:00+02:00")));
++    }
++
+     /**
+      * randomized test on {@link TimeIntervalRounding} with random interval and time zone offsets
+      */
+     public void testIntervalRoundingRandom() {
+-        for (int i = 0; i < 1000; ++i) {
+-            // max random interval is a year, can be negative
+-            long interval = Math.abs(randomLong() % (TimeUnit.DAYS.toMillis(365)));
+-            TimeZoneRounding rounding;
+-            int timezoneOffset = randomIntBetween(-23, 23);
+-            rounding = new TimeZoneRounding.TimeIntervalRounding(interval, DateTimeZone.forOffsetHours(timezoneOffset));
+-            long date = Math.abs(randomLong() % ((long) 10e11));
+-            final long roundedDate = rounding.round(date);
+-            final long nextRoundingValue = rounding.nextRoundingValue(roundedDate);
+-            assertThat("Rounding should be idempotent", roundedDate, equalTo(rounding.round(roundedDate)));
+-            assertThat("Rounded value smaller or equal than unrounded, regardless of timezone", roundedDate, lessThanOrEqualTo(date));
+-            assertThat("NextRounding value should be greater than date", nextRoundingValue, greaterThan(roundedDate));
+-            assertThat("NextRounding value should be interval from rounded value", nextRoundingValue - roundedDate, equalTo(interval));
+-            assertThat("NextRounding value should be a rounded date", nextRoundingValue, equalTo(rounding.round(nextRoundingValue)));
++        for (int i = 0; i < 1000; i++) {
++            TimeUnit unit = randomFrom(new TimeUnit[] {TimeUnit.MINUTES, TimeUnit.HOURS, TimeUnit.DAYS});
++            long interval = unit.toMillis(randomIntBetween(1, 365));
++            DateTimeZone tz = randomDateTimeZone();
++            TimeZoneRounding rounding = new TimeZoneRounding.TimeIntervalRounding(interval, tz);
++            long date = Math.abs(randomLong() % (2 * (long) 10e11)); // 1970-01-01T00:00:00Z - 2033-05-18T05:33:20.000+02:00
++            try {
++                final long roundedDate = rounding.round(date);
++                final long nextRoundingValue = rounding.nextRoundingValue(roundedDate);
++                assertThat("Rounding should be idempotent", roundedDate, equalTo(rounding.round(roundedDate)));
++                assertThat("Rounded value smaller or equal than unrounded", roundedDate, lessThanOrEqualTo(date));
++                assertThat("Values smaller than rounded value should round further down", rounding.round(roundedDate - 1),
++                        lessThan(roundedDate));
++
++                if (tz.isFixed()) {
++                    assertThat("NextRounding value should be greater than date", nextRoundingValue, greaterThan(roundedDate));
++                    assertThat("NextRounding value should be interval from rounded value", nextRoundingValue - roundedDate,
++                            equalTo(interval));
++                    assertThat("NextRounding value should be a rounded date", nextRoundingValue,
++                            equalTo(rounding.round(nextRoundingValue)));
++                }
++            } catch (AssertionError e) {
++                logger.error("Rounding error at {}, timezone {}, interval: {},", new DateTime(date, tz), tz, interval);
++                throw e;
++            }
+         }
+     }
+ 

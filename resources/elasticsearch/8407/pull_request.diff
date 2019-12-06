@@ -1,0 +1,150 @@
+diff --git a/src/main/java/org/elasticsearch/index/store/Store.java b/src/main/java/org/elasticsearch/index/store/Store.java
+index 5305095b6b56..aa1e4f4af59a 100644
+--- a/src/main/java/org/elasticsearch/index/store/Store.java
++++ b/src/main/java/org/elasticsearch/index/store/Store.java
+@@ -56,6 +56,7 @@
+ import java.util.*;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.locks.ReentrantReadWriteLock;
++import java.util.zip.Adler32;
+ import java.util.zip.CRC32;
+ import java.util.zip.Checksum;
+ 
+@@ -431,12 +432,33 @@ public static void verify(IndexInput input) throws IOException {
+     }
+ 
+     public boolean checkIntegrity(StoreFileMetaData md) {
+-        if (md.writtenBy() != null && md.writtenBy().onOrAfter(Version.LUCENE_4_8_0)) {
+-            try (IndexInput input = directory().openInput(md.name(), IOContext.READONCE)) {
+-                CodecUtil.checksumEntireFile(input);
+-            } catch (IOException  e) {
++        return checkIntegrity(md, directory());
++    }
++
++    public static boolean checkIntegrity(final StoreFileMetaData md, final Directory directory) {
++        try (IndexInput input = directory.openInput(md.name(), IOContext.READONCE)) {
++            if (input.length() != md.length()) { // first check the length no matter how old this file is
+                 return false;
+             }
++            if (md.writtenBy() != null && md.writtenBy().onOrAfter(Version.LUCENE_4_8_0)) {
++                return Store.digestToString(CodecUtil.checksumEntireFile(input)).equals(md.checksum());
++            } else if (md.hasLegacyChecksum()) {
++                // legacy checksum verification - no footer that we need to omit in the checksum!
++                final Checksum checksum = new Adler32();
++                final byte[] buffer = new byte[md.length() > 4096 ? 4096 : (int) md.length()];
++                final long len = input.length();
++                long read = 0;
++                while (len > read) {
++                    final long bytesLeft = len - read;
++                    final int bytesToRead = bytesLeft < buffer.length ? (int) bytesLeft : buffer.length;
++                    input.readBytes(buffer, 0, bytesToRead, false);
++                    checksum.update(buffer, 0, bytesToRead);
++                    read += bytesToRead;
++                }
++                return Store.digestToString(checksum.getValue()).equals(md.checksum());
++            }
++        } catch (IOException ex) {
++            return false;
+         }
+         return true;
+     }
+diff --git a/src/test/java/org/elasticsearch/index/store/StoreTest.java b/src/test/java/org/elasticsearch/index/store/StoreTest.java
+index fe4090fe72ba..20e14b3f9c48 100644
+--- a/src/test/java/org/elasticsearch/index/store/StoreTest.java
++++ b/src/test/java/org/elasticsearch/index/store/StoreTest.java
+@@ -18,6 +18,7 @@
+  */
+ package org.elasticsearch.index.store;
+ 
++import com.carrotsearch.randomizedtesting.annotations.Repeat;
+ import org.apache.lucene.analysis.MockAnalyzer;
+ import org.apache.lucene.codecs.CodecUtil;
+ import org.apache.lucene.document.*;
+@@ -40,6 +41,7 @@
+ import java.io.IOException;
+ import java.nio.file.NoSuchFileException;
+ import java.util.*;
++import java.util.zip.Adler32;
+ 
+ import static com.carrotsearch.randomizedtesting.RandomizedTest.*;
+ import static org.hamcrest.Matchers.*;
+@@ -428,6 +430,79 @@ public void testRenameFile() throws IOException {
+         IOUtils.close(store);
+     }
+ 
++    public void testCheckIntegrity() throws IOException {
++        Directory dir = newDirectory();
++        long luceneFileLength = 0;
++
++        try (IndexOutput output = dir.createOutput("lucene_checksum.bin", IOContext.DEFAULT)) {
++            int iters = scaledRandomIntBetween(10, 100);
++            for (int i = 0; i < iters; i++) {
++                BytesRef bytesRef = new BytesRef(TestUtil.randomRealisticUnicodeString(random(), 10, 1024));
++                output.writeBytes(bytesRef.bytes, bytesRef.offset, bytesRef.length);
++                luceneFileLength += bytesRef.length;
++            }
++            CodecUtil.writeFooter(output);
++            luceneFileLength += CodecUtil.footerLength();
++
++        }
++
++        final Adler32 adler32 = new Adler32();
++        long legacyFileLength = 0;
++        try (IndexOutput output = dir.createOutput("legacy.bin", IOContext.DEFAULT)) {
++            int iters = scaledRandomIntBetween(10, 100);
++            for (int i = 0; i < iters; i++) {
++                BytesRef bytesRef = new BytesRef(TestUtil.randomRealisticUnicodeString(random(), 10, 1024));
++                output.writeBytes(bytesRef.bytes, bytesRef.offset, bytesRef.length);
++                adler32.update(bytesRef.bytes, bytesRef.offset, bytesRef.length);
++                legacyFileLength += bytesRef.length;
++            }
++        }
++        final long luceneChecksum;
++        final long adler32LegacyChecksum = adler32.getValue();
++        try(IndexInput indexInput = dir.openInput("lucene_checksum.bin", IOContext.DEFAULT)) {
++            assertEquals(luceneFileLength, indexInput.length());
++            luceneChecksum = CodecUtil.retrieveChecksum(indexInput);
++        }
++
++        { // positive check
++            StoreFileMetaData lucene = new StoreFileMetaData("lucene_checksum.bin", luceneFileLength, Store.digestToString(luceneChecksum), Version.LUCENE_4_8_0);
++            StoreFileMetaData legacy = new StoreFileMetaData("legacy.bin", legacyFileLength, Store.digestToString(adler32LegacyChecksum));
++            assertTrue(legacy.hasLegacyChecksum());
++            assertFalse(lucene.hasLegacyChecksum());
++            assertTrue(Store.checkIntegrity(lucene, dir));
++            assertTrue(Store.checkIntegrity(legacy, dir));
++        }
++
++        { // negative check - wrong checksum
++            StoreFileMetaData lucene = new StoreFileMetaData("lucene_checksum.bin", luceneFileLength, Store.digestToString(luceneChecksum+1), Version.LUCENE_4_8_0);
++            StoreFileMetaData legacy = new StoreFileMetaData("legacy.bin", legacyFileLength, Store.digestToString(adler32LegacyChecksum+1));
++            assertTrue(legacy.hasLegacyChecksum());
++            assertFalse(lucene.hasLegacyChecksum());
++            assertFalse(Store.checkIntegrity(lucene, dir));
++            assertFalse(Store.checkIntegrity(legacy, dir));
++        }
++
++        { // negative check - wrong length
++            StoreFileMetaData lucene = new StoreFileMetaData("lucene_checksum.bin", luceneFileLength+1, Store.digestToString(luceneChecksum), Version.LUCENE_4_8_0);
++            StoreFileMetaData legacy = new StoreFileMetaData("legacy.bin", legacyFileLength+1, Store.digestToString(adler32LegacyChecksum));
++            assertTrue(legacy.hasLegacyChecksum());
++            assertFalse(lucene.hasLegacyChecksum());
++            assertFalse(Store.checkIntegrity(lucene, dir));
++            assertFalse(Store.checkIntegrity(legacy, dir));
++        }
++
++        { // negative check - wrong file
++            StoreFileMetaData lucene = new StoreFileMetaData("legacy.bin", luceneFileLength, Store.digestToString(luceneChecksum), Version.LUCENE_4_8_0);
++            StoreFileMetaData legacy = new StoreFileMetaData("lucene_checksum.bin", legacyFileLength, Store.digestToString(adler32LegacyChecksum));
++            assertTrue(legacy.hasLegacyChecksum());
++            assertFalse(lucene.hasLegacyChecksum());
++            assertFalse(Store.checkIntegrity(lucene, dir));
++            assertFalse(Store.checkIntegrity(legacy, dir));
++        }
++        dir.close();
++
++    }
++
+     @Test
+     public void testVerifyingIndexInput() throws IOException {
+         Directory dir = newDirectory();

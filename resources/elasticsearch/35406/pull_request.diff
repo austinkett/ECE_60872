@@ -1,0 +1,391 @@
+diff --git a/x-pack/plugin/ilm/qa/multi-node/src/test/java/org/elasticsearch/xpack/indexlifecycle/TimeSeriesLifecycleActionsIT.java b/x-pack/plugin/ilm/qa/multi-node/src/test/java/org/elasticsearch/xpack/indexlifecycle/TimeSeriesLifecycleActionsIT.java
+index 94609128c94c..82fe66c0e2d5 100644
+--- a/x-pack/plugin/ilm/qa/multi-node/src/test/java/org/elasticsearch/xpack/indexlifecycle/TimeSeriesLifecycleActionsIT.java
++++ b/x-pack/plugin/ilm/qa/multi-node/src/test/java/org/elasticsearch/xpack/indexlifecycle/TimeSeriesLifecycleActionsIT.java
+@@ -30,6 +30,7 @@
+ import org.elasticsearch.xpack.core.indexlifecycle.ReadOnlyAction;
+ import org.elasticsearch.xpack.core.indexlifecycle.RolloverAction;
+ import org.elasticsearch.xpack.core.indexlifecycle.ShrinkAction;
++import org.elasticsearch.xpack.core.indexlifecycle.ShrinkStep;
+ import org.elasticsearch.xpack.core.indexlifecycle.Step.StepKey;
+ import org.elasticsearch.xpack.core.indexlifecycle.TerminalPolicyStep;
+ import org.junit.Before;
+@@ -178,6 +179,41 @@ public void testMoveToRolloverStep() throws Exception {
+         assertBusy(() -> assertFalse(indexExists(shrunkenOriginalIndex)));
+     }
+ 
++    public void testRetryFailedShrinkAction() throws Exception {
++        int numShards = 6;
++        int divisor = randomFrom(2, 3, 6);
++        int expectedFinalShards = numShards / divisor;
++        String shrunkenIndex = ShrinkAction.SHRUNKEN_INDEX_PREFIX + index;
++        createIndexWithSettings(index, Settings.builder().put(IndexMetaData.SETTING_NUMBER_OF_SHARDS, numShards)
++            .put(IndexMetaData.SETTING_NUMBER_OF_REPLICAS, 0));
++        createNewSingletonPolicy("warm", new ShrinkAction(numShards + randomIntBetween(1, numShards)));
++        updatePolicy(index, policy);
++        assertBusy(() -> {
++            String failedStep = getFailedStepForIndex(index);
++            assertThat(failedStep, equalTo(ShrinkStep.NAME));
++        });
++
++        // update policy to be correct
++        createNewSingletonPolicy("warm", new ShrinkAction(expectedFinalShards));
++        updatePolicy(index, policy);
++
++        // retry step
++        Request retryRequest = new Request("POST", index + "/_ilm/retry");
++        assertOK(client().performRequest(retryRequest));
++
++        // assert corrected policy is picked up and index is shrunken
++        assertBusy(() -> {
++            logger.error(explainIndex(index));
++            assertTrue(indexExists(shrunkenIndex));
++            assertTrue(aliasExists(shrunkenIndex, index));
++            Map<String, Object> settings = getOnlyIndexSettings(shrunkenIndex);
++            assertThat(getStepKeyForIndex(shrunkenIndex), equalTo(TerminalPolicyStep.KEY));
++            assertThat(settings.get(IndexMetaData.SETTING_NUMBER_OF_SHARDS), equalTo(String.valueOf(expectedFinalShards)));
++            assertThat(settings.get(IndexMetaData.INDEX_BLOCKS_WRITE_SETTING.getKey()), equalTo("true"));
++        });
++        expectThrows(ResponseException.class, this::indexDocument);
++    }
++
+     public void testRolloverAction() throws Exception {
+         String originalIndex = index + "-000001";
+         String secondIndex = index + "-000002";
+diff --git a/x-pack/plugin/ilm/src/main/java/org/elasticsearch/xpack/indexlifecycle/ExecuteStepsUpdateTask.java b/x-pack/plugin/ilm/src/main/java/org/elasticsearch/xpack/indexlifecycle/ExecuteStepsUpdateTask.java
+index 9e5ef7b01c5f..70aa9af2c727 100644
+--- a/x-pack/plugin/ilm/src/main/java/org/elasticsearch/xpack/indexlifecycle/ExecuteStepsUpdateTask.java
++++ b/x-pack/plugin/ilm/src/main/java/org/elasticsearch/xpack/indexlifecycle/ExecuteStepsUpdateTask.java
+@@ -101,7 +101,7 @@ public ClusterState execute(final ClusterState currentState) throws IOException
+                         return state;
+                     } else {
+                         state = IndexLifecycleRunner.moveClusterStateToNextStep(index, state, currentStep.getKey(),
+-                            currentStep.getNextStepKey(), nowSupplier);
++                            currentStep.getNextStepKey(), nowSupplier, false);
+                     }
+                 } else {
+                     // cluster state wait step so evaluate the
+@@ -125,7 +125,7 @@ public ClusterState execute(final ClusterState currentState) throws IOException
+                             return state;
+                         } else {
+                             state = IndexLifecycleRunner.moveClusterStateToNextStep(index, state, currentStep.getKey(),
+-                                currentStep.getNextStepKey(), nowSupplier);
++                                currentStep.getNextStepKey(), nowSupplier, false);
+                         }
+                     } else {
+                         logger.trace("[{}] condition not met ({}) [{}], returning existing state",
+diff --git a/x-pack/plugin/ilm/src/main/java/org/elasticsearch/xpack/indexlifecycle/IndexLifecycleRunner.java b/x-pack/plugin/ilm/src/main/java/org/elasticsearch/xpack/indexlifecycle/IndexLifecycleRunner.java
+index f5e33fdb9807..2f7947bb5175 100644
+--- a/x-pack/plugin/ilm/src/main/java/org/elasticsearch/xpack/indexlifecycle/IndexLifecycleRunner.java
++++ b/x-pack/plugin/ilm/src/main/java/org/elasticsearch/xpack/indexlifecycle/IndexLifecycleRunner.java
+@@ -271,11 +271,13 @@ static Step getCurrentStep(PolicyStepsRegistry stepRegistry, String policy, Inde
+      * @param nextStepKey    The next step to move the index into
+      * @param nowSupplier    The current-time supplier for updating when steps changed
+      * @param stepRegistry   The steps registry to check a step-key's existence in the index's current policy
++     * @param forcePhaseDefinitionRefresh When true, step information will be recompiled from the latest version of the
++     *                                    policy. Otherwise, existing phase definition is used.
+      * @return The updated cluster state where the index moved to <code>nextStepKey</code>
+      */
+     static ClusterState moveClusterStateToStep(String indexName, ClusterState currentState, StepKey currentStepKey,
+                                                StepKey nextStepKey, LongSupplier nowSupplier,
+-                                               PolicyStepsRegistry stepRegistry) {
++                                               PolicyStepsRegistry stepRegistry, boolean forcePhaseDefinitionRefresh) {
+         IndexMetaData idxMeta = currentState.getMetaData().index(indexName);
+         Settings indexSettings = idxMeta.getSettings();
+         String indexPolicySetting = LifecycleSettings.LIFECYCLE_NAME_SETTING.get(indexSettings);
+@@ -295,18 +297,19 @@ static ClusterState moveClusterStateToStep(String indexName, ClusterState curren
+                 "] with policy [" + indexPolicySetting + "] does not exist");
+         }
+ 
+-        return IndexLifecycleRunner.moveClusterStateToNextStep(idxMeta.getIndex(), currentState, currentStepKey, nextStepKey, nowSupplier);
++        return IndexLifecycleRunner.moveClusterStateToNextStep(idxMeta.getIndex(), currentState, currentStepKey,
++            nextStepKey, nowSupplier, forcePhaseDefinitionRefresh);
+     }
+ 
+     static ClusterState moveClusterStateToNextStep(Index index, ClusterState clusterState, StepKey currentStep, StepKey nextStep,
+-                                                   LongSupplier nowSupplier) {
++                                                   LongSupplier nowSupplier, boolean forcePhaseDefinitionRefresh) {
+         IndexMetaData idxMeta = clusterState.getMetaData().index(index);
+         IndexLifecycleMetadata ilmMeta = clusterState.metaData().custom(IndexLifecycleMetadata.TYPE);
+         LifecyclePolicyMetadata policyMetadata = ilmMeta.getPolicyMetadatas()
+             .get(LifecycleSettings.LIFECYCLE_NAME_SETTING.get(idxMeta.getSettings()));
+         LifecycleExecutionState lifecycleState = LifecycleExecutionState.fromIndexMetadata(idxMeta);
+         LifecycleExecutionState newLifecycleState = moveExecutionStateToNextStep(policyMetadata,
+-            lifecycleState, currentStep, nextStep, nowSupplier);
++            lifecycleState, currentStep, nextStep, nowSupplier, forcePhaseDefinitionRefresh);
+         ClusterState.Builder newClusterStateBuilder = newClusterStateWithLifecycleState(index, clusterState, newLifecycleState);
+ 
+         return newClusterStateBuilder.build();
+@@ -324,7 +327,7 @@ static ClusterState moveClusterStateToErrorStep(Index index, ClusterState cluste
+         causeXContentBuilder.endObject();
+         LifecycleExecutionState nextStepState = moveExecutionStateToNextStep(policyMetadata,
+             LifecycleExecutionState.fromIndexMetadata(idxMeta), currentStep, new StepKey(currentStep.getPhase(),
+-                currentStep.getAction(), ErrorStep.NAME), nowSupplier);
++                currentStep.getAction(), ErrorStep.NAME), nowSupplier, false);
+         LifecycleExecutionState.Builder failedState = LifecycleExecutionState.builder(nextStepState);
+         failedState.setFailedStep(currentStep.getName());
+         failedState.setStepInfo(BytesReference.bytes(causeXContentBuilder).utf8ToString());
+@@ -343,9 +346,9 @@ ClusterState moveClusterStateToFailedStep(ClusterState currentState, String[] in
+             StepKey currentStepKey = IndexLifecycleRunner.getCurrentStepKey(lifecycleState);
+             String failedStep = lifecycleState.getFailedStep();
+             if (currentStepKey != null && ErrorStep.NAME.equals(currentStepKey.getName())
+-                && Strings.isNullOrEmpty(failedStep) == false) {
++                    && Strings.isNullOrEmpty(failedStep) == false) {
+                 StepKey nextStepKey = new StepKey(currentStepKey.getPhase(), currentStepKey.getAction(), failedStep);
+-                newState = moveClusterStateToStep(index, currentState, currentStepKey, nextStepKey, nowSupplier, stepRegistry);
++                newState = moveClusterStateToStep(index, currentState, currentStepKey, nextStepKey, nowSupplier, stepRegistry, true);
+             } else {
+                 throw new IllegalArgumentException("cannot retry an action for an index ["
+                     + index + "] that has not encountered an error when running a Lifecycle Policy");
+@@ -357,7 +360,8 @@ ClusterState moveClusterStateToFailedStep(ClusterState currentState, String[] in
+     private static LifecycleExecutionState moveExecutionStateToNextStep(LifecyclePolicyMetadata policyMetadata,
+                                                                         LifecycleExecutionState existingState,
+                                                                         StepKey currentStep, StepKey nextStep,
+-                                                                        LongSupplier nowSupplier) {
++                                                                        LongSupplier nowSupplier,
++                                                                        boolean forcePhaseDefinitionRefresh) {
+         long nowAsMillis = nowSupplier.getAsLong();
+         LifecycleExecutionState.Builder updatedState = LifecycleExecutionState.builder(existingState);
+         updatedState.setPhase(nextStep.getPhase());
+@@ -369,7 +373,7 @@ private static LifecycleExecutionState moveExecutionStateToNextStep(LifecyclePol
+         updatedState.setFailedStep(null);
+         updatedState.setStepInfo(null);
+ 
+-        if (currentStep.getPhase().equals(nextStep.getPhase()) == false) {
++        if (currentStep.getPhase().equals(nextStep.getPhase()) == false || forcePhaseDefinitionRefresh) {
+             final String newPhaseDefinition;
+             final Phase nextPhase;
+             if ("new".equals(nextStep.getPhase()) || TerminalPolicyStep.KEY.equals(nextStep)) {
+diff --git a/x-pack/plugin/ilm/src/main/java/org/elasticsearch/xpack/indexlifecycle/IndexLifecycleService.java b/x-pack/plugin/ilm/src/main/java/org/elasticsearch/xpack/indexlifecycle/IndexLifecycleService.java
+index 637c1855dd04..b77997a94a3d 100644
+--- a/x-pack/plugin/ilm/src/main/java/org/elasticsearch/xpack/indexlifecycle/IndexLifecycleService.java
++++ b/x-pack/plugin/ilm/src/main/java/org/elasticsearch/xpack/indexlifecycle/IndexLifecycleService.java
+@@ -84,7 +84,7 @@ public void maybeRunAsyncAction(ClusterState clusterState, IndexMetaData indexMe
+ 
+     public ClusterState moveClusterStateToStep(ClusterState currentState, String indexName, StepKey currentStepKey, StepKey nextStepKey) {
+         return IndexLifecycleRunner.moveClusterStateToStep(indexName, currentState, currentStepKey, nextStepKey,
+-            nowSupplier, policyRegistry);
++            nowSupplier, policyRegistry, false);
+     }
+ 
+     public ClusterState moveClusterStateToFailedStep(ClusterState currentState, String[] indices) {
+diff --git a/x-pack/plugin/ilm/src/main/java/org/elasticsearch/xpack/indexlifecycle/MoveToNextStepUpdateTask.java b/x-pack/plugin/ilm/src/main/java/org/elasticsearch/xpack/indexlifecycle/MoveToNextStepUpdateTask.java
+index 750fd1af5da4..246cda6192fa 100644
+--- a/x-pack/plugin/ilm/src/main/java/org/elasticsearch/xpack/indexlifecycle/MoveToNextStepUpdateTask.java
++++ b/x-pack/plugin/ilm/src/main/java/org/elasticsearch/xpack/indexlifecycle/MoveToNextStepUpdateTask.java
+@@ -68,7 +68,7 @@ public ClusterState execute(ClusterState currentState) {
+         if (policy.equals(LifecycleSettings.LIFECYCLE_NAME_SETTING.get(indexSettings))
+             && currentStepKey.equals(IndexLifecycleRunner.getCurrentStepKey(indexILMData))) {
+             logger.trace("moving [{}] to next step ({})", index.getName(), nextStepKey);
+-            return IndexLifecycleRunner.moveClusterStateToNextStep(index, currentState, currentStepKey, nextStepKey, nowSupplier);
++            return IndexLifecycleRunner.moveClusterStateToNextStep(index, currentState, currentStepKey, nextStepKey, nowSupplier, false);
+         } else {
+             // either the policy has changed or the step is now
+             // not the same as when we submitted the update task. In
+diff --git a/x-pack/plugin/ilm/src/main/java/org/elasticsearch/xpack/indexlifecycle/action/TransportRetryAction.java b/x-pack/plugin/ilm/src/main/java/org/elasticsearch/xpack/indexlifecycle/action/TransportRetryAction.java
+index b0f25ed79514..c9fabe822571 100644
+--- a/x-pack/plugin/ilm/src/main/java/org/elasticsearch/xpack/indexlifecycle/action/TransportRetryAction.java
++++ b/x-pack/plugin/ilm/src/main/java/org/elasticsearch/xpack/indexlifecycle/action/TransportRetryAction.java
+@@ -13,11 +13,14 @@
+ import org.elasticsearch.cluster.ClusterState;
+ import org.elasticsearch.cluster.block.ClusterBlockException;
+ import org.elasticsearch.cluster.block.ClusterBlockLevel;
++import org.elasticsearch.cluster.metadata.IndexMetaData;
+ import org.elasticsearch.cluster.metadata.IndexNameExpressionResolver;
+ import org.elasticsearch.cluster.service.ClusterService;
+ import org.elasticsearch.common.inject.Inject;
+ import org.elasticsearch.threadpool.ThreadPool;
+ import org.elasticsearch.transport.TransportService;
++import org.elasticsearch.xpack.core.indexlifecycle.LifecycleExecutionState;
++import org.elasticsearch.xpack.core.indexlifecycle.Step.StepKey;
+ import org.elasticsearch.xpack.core.indexlifecycle.action.RetryAction;
+ import org.elasticsearch.xpack.core.indexlifecycle.action.RetryAction.Request;
+ import org.elasticsearch.xpack.core.indexlifecycle.action.RetryAction.Response;
+@@ -55,6 +58,22 @@ public ClusterState execute(ClusterState currentState) {
+                     return indexLifecycleService.moveClusterStateToFailedStep(currentState, request.indices());
+                 }
+ 
++                @Override
++                public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {
++                    for (String index : request.indices()) {
++                        IndexMetaData idxMeta = newState.metaData().index(index);
++                        LifecycleExecutionState lifecycleState = LifecycleExecutionState.fromIndexMetadata(idxMeta);
++                        StepKey retryStep = new StepKey(lifecycleState.getPhase(), lifecycleState.getAction(), lifecycleState.getStep());
++                        if (idxMeta == null) {
++                            // The index has somehow been deleted - there shouldn't be any opportunity for this to happen, but just in case.
++                            logger.debug("index [" + index + "] has been deleted after moving to step [" +
++                                lifecycleState.getStep() + "], skipping async action check");
++                            return;
++                        }
++                        indexLifecycleService.maybeRunAsyncAction(newState, idxMeta, retryStep);
++                    }
++                }
++
+                 @Override
+                 protected Response newResponse(boolean acknowledged) {
+                     return new Response(acknowledged);
+diff --git a/x-pack/plugin/ilm/src/test/java/org/elasticsearch/xpack/indexlifecycle/IndexLifecycleRunnerTests.java b/x-pack/plugin/ilm/src/test/java/org/elasticsearch/xpack/indexlifecycle/IndexLifecycleRunnerTests.java
+index a8a896b5c4ea..8117207f2be8 100644
+--- a/x-pack/plugin/ilm/src/test/java/org/elasticsearch/xpack/indexlifecycle/IndexLifecycleRunnerTests.java
++++ b/x-pack/plugin/ilm/src/test/java/org/elasticsearch/xpack/indexlifecycle/IndexLifecycleRunnerTests.java
+@@ -668,7 +668,7 @@ public void testMoveClusterStateToNextStep() {
+                 .put(LifecycleSettings.LIFECYCLE_NAME, policy.getName()), LifecycleExecutionState.builder().build(), policyMetadatas);
+         Index index = clusterState.metaData().index(indexName).getIndex();
+         ClusterState newClusterState = IndexLifecycleRunner.moveClusterStateToNextStep(index, clusterState, currentStep, nextStep,
+-                () -> now);
++                () -> now, false);
+         assertClusterStateOnNextStep(clusterState, index, currentStep, nextStep, newClusterState, now);
+ 
+         LifecycleExecutionState.Builder lifecycleState = LifecycleExecutionState.builder();
+@@ -684,7 +684,7 @@ public void testMoveClusterStateToNextStep() {
+ 
+         clusterState = buildClusterState(indexName, indexSettingsBuilder, lifecycleState.build(), policyMetadatas);
+         index = clusterState.metaData().index(indexName).getIndex();
+-        newClusterState = IndexLifecycleRunner.moveClusterStateToNextStep(index, clusterState, currentStep, nextStep, () -> now);
++        newClusterState = IndexLifecycleRunner.moveClusterStateToNextStep(index, clusterState, currentStep, nextStep, () -> now, false);
+         assertClusterStateOnNextStep(clusterState, index, currentStep, nextStep, newClusterState, now);
+     }
+ 
+@@ -698,7 +698,7 @@ public void testMoveClusterStateToNextStepSamePhase() {
+             Collections.emptyList());
+         Index index = clusterState.metaData().index(indexName).getIndex();
+         ClusterState newClusterState = IndexLifecycleRunner.moveClusterStateToNextStep(index, clusterState, currentStep, nextStep,
+-                () -> now);
++                () -> now, false);
+         assertClusterStateOnNextStep(clusterState, index, currentStep, nextStep, newClusterState, now);
+ 
+         LifecycleExecutionState.Builder lifecycleState = LifecycleExecutionState.builder();
+@@ -711,7 +711,7 @@ public void testMoveClusterStateToNextStepSamePhase() {
+ 
+         clusterState = buildClusterState(indexName, Settings.builder(), lifecycleState.build(), Collections.emptyList());
+         index = clusterState.metaData().index(indexName).getIndex();
+-        newClusterState = IndexLifecycleRunner.moveClusterStateToNextStep(index, clusterState, currentStep, nextStep, () -> now);
++        newClusterState = IndexLifecycleRunner.moveClusterStateToNextStep(index, clusterState, currentStep, nextStep, () -> now, false);
+         assertClusterStateOnNextStep(clusterState, index, currentStep, nextStep, newClusterState, now);
+     }
+ 
+@@ -725,7 +725,7 @@ public void testMoveClusterStateToNextStepSameAction() {
+             Collections.emptyList());
+         Index index = clusterState.metaData().index(indexName).getIndex();
+         ClusterState newClusterState = IndexLifecycleRunner.moveClusterStateToNextStep(index, clusterState, currentStep, nextStep,
+-                () -> now);
++                () -> now, false);
+         assertClusterStateOnNextStep(clusterState, index, currentStep, nextStep, newClusterState, now);
+ 
+         LifecycleExecutionState.Builder lifecycleState = LifecycleExecutionState.builder();
+@@ -737,7 +737,7 @@ public void testMoveClusterStateToNextStepSameAction() {
+         }
+         clusterState = buildClusterState(indexName, Settings.builder(), lifecycleState.build(), Collections.emptyList());
+         index = clusterState.metaData().index(indexName).getIndex();
+-        newClusterState = IndexLifecycleRunner.moveClusterStateToNextStep(index, clusterState, currentStep, nextStep, () -> now);
++        newClusterState = IndexLifecycleRunner.moveClusterStateToNextStep(index, clusterState, currentStep, nextStep, () -> now, false);
+         assertClusterStateOnNextStep(clusterState, index, currentStep, nextStep, newClusterState, now);
+     }
+ 
+@@ -764,7 +764,7 @@ public void testSuccessfulValidatedMoveClusterStateToNextStep() {
+         ClusterState clusterState = buildClusterState(indexName, indexSettingsBuilder, lifecycleState.build(), policyMetadatas);
+         Index index = clusterState.metaData().index(indexName).getIndex();
+         ClusterState newClusterState = IndexLifecycleRunner.moveClusterStateToStep(indexName, clusterState, currentStepKey,
+-            nextStepKey, () -> now, stepRegistry);
++            nextStepKey, () -> now, stepRegistry, false);
+         assertClusterStateOnNextStep(clusterState, index, currentStepKey, nextStepKey, newClusterState, now);
+     }
+ 
+@@ -786,7 +786,7 @@ public void testValidatedMoveClusterStateToNextStepWithoutPolicy() {
+         ClusterState clusterState = buildClusterState(indexName, indexSettingsBuilder, lifecycleState.build(), Collections.emptyList());
+         IllegalArgumentException exception = expectThrows(IllegalArgumentException.class,
+             () -> IndexLifecycleRunner.moveClusterStateToStep(indexName, clusterState, currentStepKey,
+-                nextStepKey, () -> now, stepRegistry));
++                nextStepKey, () -> now, stepRegistry, false));
+         assertThat(exception.getMessage(), equalTo("index [my_index] is not associated with an Index Lifecycle Policy"));
+     }
+ 
+@@ -809,7 +809,7 @@ public void testValidatedMoveClusterStateToNextStepInvalidCurrentStep() {
+         ClusterState clusterState = buildClusterState(indexName, indexSettingsBuilder, lifecycleState.build(), Collections.emptyList());
+         IllegalArgumentException exception = expectThrows(IllegalArgumentException.class,
+             () -> IndexLifecycleRunner.moveClusterStateToStep(indexName, clusterState, notCurrentStepKey,
+-                nextStepKey, () -> now, stepRegistry));
++                nextStepKey, () -> now, stepRegistry, false));
+         assertThat(exception.getMessage(), equalTo("index [my_index] is not on current step " +
+             "[{\"phase\":\"not_current_phase\",\"action\":\"not_current_action\",\"name\":\"not_current_step\"}]"));
+     }
+@@ -832,7 +832,7 @@ public void testValidatedMoveClusterStateToNextStepInvalidNextStep() {
+         ClusterState clusterState = buildClusterState(indexName, indexSettingsBuilder, lifecycleState.build(), Collections.emptyList());
+         IllegalArgumentException exception = expectThrows(IllegalArgumentException.class,
+             () -> IndexLifecycleRunner.moveClusterStateToStep(indexName, clusterState, currentStepKey,
+-                nextStepKey, () -> now, stepRegistry));
++                nextStepKey, () -> now, stepRegistry, false));
+         assertThat(exception.getMessage(),
+             equalTo("step [{\"phase\":\"next_phase\",\"action\":\"next_action\",\"name\":\"next_step\"}] " +
+                 "for index [my_index] with policy [my_policy] does not exist"));
+@@ -866,18 +866,26 @@ public void testMoveClusterStateToFailedStep() {
+         String[] indices = new String[] { indexName };
+         String policyName = "my_policy";
+         long now = randomNonNegativeLong();
+-        StepKey failedStepKey = new StepKey("current_phase", "current_action", "current_step");
++        StepKey failedStepKey = new StepKey("current_phase", MockAction.NAME, "current_step");
+         StepKey errorStepKey = new StepKey(failedStepKey.getPhase(), failedStepKey.getAction(), ErrorStep.NAME);
+         Step step = new MockStep(failedStepKey, null);
++        LifecyclePolicy policy = createPolicy(policyName, failedStepKey, null);
++        LifecyclePolicyMetadata policyMetadata = new LifecyclePolicyMetadata(policy, Collections.emptyMap(),
++            randomNonNegativeLong(), randomNonNegativeLong());
++
+         PolicyStepsRegistry policyRegistry = createOneStepPolicyStepRegistry(policyName, step, indexName);
+         Settings.Builder indexSettingsBuilder = Settings.builder()
+                 .put(LifecycleSettings.LIFECYCLE_NAME, policyName);
+         LifecycleExecutionState.Builder lifecycleState = LifecycleExecutionState.builder();
+         lifecycleState.setPhase(errorStepKey.getPhase());
++        lifecycleState.setPhaseTime(now);
+         lifecycleState.setAction(errorStepKey.getAction());
++        lifecycleState.setActionTime(now);
+         lifecycleState.setStep(errorStepKey.getName());
++        lifecycleState.setStepTime(now);
+         lifecycleState.setFailedStep(failedStepKey.getName());
+-        ClusterState clusterState = buildClusterState(indexName, indexSettingsBuilder, lifecycleState.build(), Collections.emptyList());
++        ClusterState clusterState = buildClusterState(indexName, indexSettingsBuilder, lifecycleState.build(),
++            Collections.singletonList(policyMetadata));
+         Index index = clusterState.metaData().index(indexName).getIndex();
+         IndexLifecycleRunner runner = new IndexLifecycleRunner(policyRegistry, null, () -> now);
+         ClusterState nextClusterState = runner.moveClusterStateToFailedStep(clusterState, indices);
+@@ -885,6 +893,41 @@ public void testMoveClusterStateToFailedStep() {
+             nextClusterState, now);
+     }
+ 
++    public void testMoveClusterStateToFailedStepWithUnknownStep() {
++        String indexName = "my_index";
++        String[] indices = new String[] { indexName };
++        String policyName = "my_policy";
++        long now = randomNonNegativeLong();
++        StepKey failedStepKey = new StepKey("current_phase", MockAction.NAME, "current_step");
++        StepKey errorStepKey = new StepKey(failedStepKey.getPhase(), failedStepKey.getAction(), ErrorStep.NAME);
++
++        StepKey registeredStepKey = new StepKey(randomFrom(failedStepKey.getPhase(), "other"),
++            MockAction.NAME, "different_step");
++        Step step = new MockStep(registeredStepKey, null);
++        LifecyclePolicy policy = createPolicy(policyName, failedStepKey, null);
++        LifecyclePolicyMetadata policyMetadata = new LifecyclePolicyMetadata(policy, Collections.emptyMap(),
++            randomNonNegativeLong(), randomNonNegativeLong());
++
++        PolicyStepsRegistry policyRegistry = createOneStepPolicyStepRegistry(policyName, step, indexName);
++        Settings.Builder indexSettingsBuilder = Settings.builder()
++            .put(LifecycleSettings.LIFECYCLE_NAME, policyName);
++        LifecycleExecutionState.Builder lifecycleState = LifecycleExecutionState.builder();
++        lifecycleState.setPhase(errorStepKey.getPhase());
++        lifecycleState.setPhaseTime(now);
++        lifecycleState.setAction(errorStepKey.getAction());
++        lifecycleState.setActionTime(now);
++        lifecycleState.setStep(errorStepKey.getName());
++        lifecycleState.setStepTime(now);
++        lifecycleState.setFailedStep(failedStepKey.getName());
++        ClusterState clusterState = buildClusterState(indexName, indexSettingsBuilder, lifecycleState.build(),
++            Collections.singletonList(policyMetadata));
++        IndexLifecycleRunner runner = new IndexLifecycleRunner(policyRegistry, null, () -> now);
++        IllegalArgumentException exception = expectThrows(IllegalArgumentException.class,
++            () -> runner.moveClusterStateToFailedStep(clusterState, indices));
++        assertThat(exception.getMessage(), equalTo("step [" + failedStepKey
++            + "] for index [my_index] with policy [my_policy] does not exist"));
++    }
++
+     public void testMoveClusterStateToFailedStepIndexNotFound() {
+         String existingIndexName = "my_index";
+         String invalidIndexName = "does_not_exist";

@@ -1,0 +1,906 @@
+diff --git a/server/src/main/java/org/elasticsearch/action/support/replication/ReplicationOperation.java b/server/src/main/java/org/elasticsearch/action/support/replication/ReplicationOperation.java
+index 8cea44911bbe..e24a3dbe381c 100644
+--- a/server/src/main/java/org/elasticsearch/action/support/replication/ReplicationOperation.java
++++ b/server/src/main/java/org/elasticsearch/action/support/replication/ReplicationOperation.java
+@@ -46,6 +46,7 @@
+ import java.util.Locale;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.AtomicInteger;
++import java.util.function.LongSupplier;
+ 
+ public class ReplicationOperation<
+             Request extends ReplicationRequest<Request>,
+@@ -110,8 +111,6 @@ public void execute() throws Exception {
+ 
+     private void handlePrimaryResult(final PrimaryResultT primaryResult) {
+         this.primaryResult = primaryResult;
+-        primary.updateLocalCheckpointForShard(primary.routingEntry().allocationId().getId(), primary.localCheckpoint());
+-        primary.updateGlobalCheckpointForShard(primary.routingEntry().allocationId().getId(), primary.globalCheckpoint());
+         final ReplicaRequest replicaRequest = primaryResult.replicaRequest();
+         if (replicaRequest != null) {
+             if (logger.isTraceEnabled()) {
+@@ -134,8 +133,26 @@ private void handlePrimaryResult(final PrimaryResultT primaryResult) {
+             markUnavailableShardsAsStale(replicaRequest, replicationGroup);
+             performOnReplicas(replicaRequest, globalCheckpoint, maxSeqNoOfUpdatesOrDeletes, replicationGroup);
+         }
+-        successfulShards.incrementAndGet();  // mark primary as successful
+-        decPendingAndFinishIfNeeded();
++        primaryResult.runPostReplicationActions(new ActionListener<>() {
++
++            @Override
++            public void onResponse(Void aVoid) {
++                successfulShards.incrementAndGet();
++                try {
++                    updateCheckPoints(primary.routingEntry(), primary::localCheckpoint, primary::globalCheckpoint);
++                } finally {
++                    decPendingAndFinishIfNeeded();
++                }
++            }
++
++            @Override
++            public void onFailure(Exception e) {
++                logger.trace("[{}] op [{}] post replication actions failed for [{}]", primary.routingEntry().shardId(), opType, request);
++                // TODO: fail shard? This will otherwise have the local / global checkpoint info lagging, or possibly have replicas
++                // go out of sync with the primary
++                finishAsFailed(e);
++            }
++        });
+     }
+ 
+     private void markUnavailableShardsAsStale(ReplicaRequest replicaRequest, ReplicationGroup replicationGroup) {
+@@ -176,16 +193,10 @@ private void performOnReplica(final ShardRouting shard, final ReplicaRequest rep
+                 public void onResponse(ReplicaResponse response) {
+                     successfulShards.incrementAndGet();
+                     try {
+-                        primary.updateLocalCheckpointForShard(shard.allocationId().getId(), response.localCheckpoint());
+-                        primary.updateGlobalCheckpointForShard(shard.allocationId().getId(), response.globalCheckpoint());
+-                    } catch (final AlreadyClosedException e) {
+-                        // the index was deleted or this shard was never activated after a relocation; fall through and finish normally
+-                    } catch (final Exception e) {
+-                        // fail the primary but fall through and let the rest of operation processing complete
+-                        final String message = String.format(Locale.ROOT, "primary failed updating local checkpoint for replica %s", shard);
+-                        primary.failShard(message, e);
++                        updateCheckPoints(shard, response::localCheckpoint, response::globalCheckpoint);
++                    } finally {
++                        decPendingAndFinishIfNeeded();
+                     }
+-                    decPendingAndFinishIfNeeded();
+                 }
+ 
+                 @Override
+@@ -211,6 +222,19 @@ public String toString() {
+             });
+     }
+ 
++    private void updateCheckPoints(ShardRouting shard, LongSupplier localCheckpointSupplier, LongSupplier globalCheckpointSupplier) {
++        try {
++            primary.updateLocalCheckpointForShard(shard.allocationId().getId(), localCheckpointSupplier.getAsLong());
++            primary.updateGlobalCheckpointForShard(shard.allocationId().getId(), globalCheckpointSupplier.getAsLong());
++        } catch (final AlreadyClosedException e) {
++            // the index was deleted or this shard was never activated after a relocation; fall through and finish normally
++        } catch (final Exception e) {
++            // fail the primary but fall through and let the rest of operation processing complete
++            final String message = String.format(Locale.ROOT, "primary failed updating local checkpoint for replica %s", shard);
++            primary.failShard(message, e);
++        }
++    }
++
+     private void onNoLongerPrimary(Exception failure) {
+         final Throwable cause = ExceptionsHelper.unwrapCause(failure);
+         final boolean nodeIsClosing = cause instanceof NodeClosedException;
+@@ -464,5 +488,11 @@ public RetryOnPrimaryException(StreamInput in) throws IOException {
+         @Nullable RequestT replicaRequest();
+ 
+         void setShardInfo(ReplicationResponse.ShardInfo shardInfo);
++
++        /**
++         * Run actions to be triggered post replication
++         * @param listener calllback that is invoked after post replication actions have completed
++         * */
++        void runPostReplicationActions(ActionListener<Void> listener);
+     }
+ }
+diff --git a/server/src/main/java/org/elasticsearch/action/support/replication/TransportReplicationAction.java b/server/src/main/java/org/elasticsearch/action/support/replication/TransportReplicationAction.java
+index c72f10b35c37..5888ec3f46bf 100644
+--- a/server/src/main/java/org/elasticsearch/action/support/replication/TransportReplicationAction.java
++++ b/server/src/main/java/org/elasticsearch/action/support/replication/TransportReplicationAction.java
+@@ -73,8 +73,6 @@
+ import org.elasticsearch.transport.TransportException;
+ import org.elasticsearch.transport.TransportRequest;
+ import org.elasticsearch.transport.TransportRequestOptions;
+-import org.elasticsearch.transport.TransportResponse;
+-import org.elasticsearch.transport.TransportResponse.Empty;
+ import org.elasticsearch.transport.TransportResponseHandler;
+ import org.elasticsearch.transport.TransportService;
+ 
+@@ -346,17 +344,12 @@ public void handleException(TransportException exp) {
+                 } else {
+                     setPhase(replicationTask, "primary");
+ 
+-                    final ActionListener<Response> referenceClosingListener = ActionListener.wrap(response -> {
+-                        primaryShardReference.close(); // release shard operation lock before responding to caller
+-                        setPhase(replicationTask, "finished");
+-                        onCompletionListener.onResponse(response);
+-                    }, e -> handleException(primaryShardReference, e));
++                    final ActionListener<Response> responseListener = ActionListener.wrap(response -> {
++                        adaptResponse(response, primaryShardReference.indexShard);
+ 
+-                    final ActionListener<Response> globalCheckpointSyncingListener = ActionListener.wrap(response -> {
+                         if (syncGlobalCheckpointAfterOperation) {
+-                            final IndexShard shard = primaryShardReference.indexShard;
+                             try {
+-                                shard.maybeSyncGlobalCheckpoint("post-operation");
++                                primaryShardReference.indexShard.maybeSyncGlobalCheckpoint("post-operation");
+                             } catch (final Exception e) {
+                                 // only log non-closed exceptions
+                                 if (ExceptionsHelper.unwrap(
+@@ -364,15 +357,19 @@ public void handleException(TransportException exp) {
+                                     // intentionally swallow, a missed global checkpoint sync should not fail this operation
+                                     logger.info(
+                                         new ParameterizedMessage(
+-                                            "{} failed to execute post-operation global checkpoint sync", shard.shardId()), e);
++                                            "{} failed to execute post-operation global checkpoint sync",
++                                            primaryShardReference.indexShard.shardId()), e);
+                                 }
+                             }
+                         }
+-                        referenceClosingListener.onResponse(response);
+-                    }, referenceClosingListener::onFailure);
++
++                        primaryShardReference.close(); // release shard operation lock before responding to caller
++                        setPhase(replicationTask, "finished");
++                        onCompletionListener.onResponse(response);
++                    }, e -> handleException(primaryShardReference, e));
+ 
+                     new ReplicationOperation<>(primaryRequest.getRequest(), primaryShardReference,
+-                        ActionListener.wrap(result -> result.respond(globalCheckpointSyncingListener), referenceClosingListener::onFailure),
++                        ActionListener.map(responseListener, result -> result.finalResponseIfSuccessful),
+                         newReplicasProxy(), logger, actionName, primaryRequest.getPrimaryTerm()).execute();
+                 }
+             } catch (Exception e) {
+@@ -393,10 +390,19 @@ public void onFailure(Exception e) {
+ 
+     }
+ 
++    // allows subclasses to adapt the response
++    protected void adaptResponse(Response response, IndexShard indexShard) {
++
++    }
++
++    protected ActionListener<Response> wrapResponseActionListener(ActionListener<Response> listener, IndexShard shard) {
++        return listener;
++    }
++
+     public static class PrimaryResult<ReplicaRequest extends ReplicationRequest<ReplicaRequest>,
+             Response extends ReplicationResponse>
+             implements ReplicationOperation.PrimaryResult<ReplicaRequest> {
+-        final ReplicaRequest replicaRequest;
++        protected final ReplicaRequest replicaRequest;
+         public final Response finalResponseIfSuccessful;
+         public final Exception finalFailure;
+ 
+@@ -429,11 +435,12 @@ public void setShardInfo(ReplicationResponse.ShardInfo shardInfo) {
+             }
+         }
+ 
+-        public void respond(ActionListener<Response> listener) {
+-            if (finalResponseIfSuccessful != null) {
+-                listener.onResponse(finalResponseIfSuccessful);
+-            } else {
++        @Override
++        public void runPostReplicationActions(ActionListener<Void> listener) {
++            if (finalFailure != null) {
+                 listener.onFailure(finalFailure);
++            } else {
++                listener.onResponse(null);
+             }
+         }
+     }
+@@ -449,11 +456,11 @@ public ReplicaResult() {
+             this(null);
+         }
+ 
+-        public void respond(ActionListener<TransportResponse.Empty> listener) {
+-            if (finalFailure == null) {
+-                listener.onResponse(TransportResponse.Empty.INSTANCE);
+-            } else {
++        public void runPostReplicaActions(ActionListener<Void> listener) {
++            if (finalFailure != null) {
+                 listener.onFailure(finalFailure);
++            } else {
++                listener.onResponse(null);
+             }
+         }
+     }
+@@ -503,10 +510,23 @@ public void onResponse(Releasable releasable) {
+             try {
+                 assert replica.getActiveOperationsCount() != 0 : "must perform shard operation under a permit";
+                 final ReplicaResult replicaResult = shardOperationOnReplica(replicaRequest.getRequest(), replica);
+-                releasable.close(); // release shard operation lock before responding to caller
+-                final TransportReplicationAction.ReplicaResponse response =
+-                        new ReplicaResponse(replica.getLocalCheckpoint(), replica.getLastSyncedGlobalCheckpoint());
+-                replicaResult.respond(new ResponseListener(response));
++                replicaResult.runPostReplicaActions(
++                    ActionListener.wrap(r -> {
++                        final TransportReplicationAction.ReplicaResponse response =
++                            new ReplicaResponse(replica.getLocalCheckpoint(), replica.getLastSyncedGlobalCheckpoint());
++                        releasable.close(); // release shard operation lock before responding to caller
++                        if (logger.isTraceEnabled()) {
++                            logger.trace("action [{}] completed on shard [{}] for request [{}]", transportReplicaAction,
++                                replicaRequest.getRequest().shardId(),
++                                replicaRequest.getRequest());
++                        }
++                        setPhase(task, "finished");
++                        onCompletionListener.onResponse(response);
++                    }, e -> {
++                        Releasables.closeWhileHandlingException(releasable); // release shard operation lock before responding to caller
++                        this.responseWithFailure(e);
++                    })
++                );
+             } catch (final Exception e) {
+                 Releasables.closeWhileHandlingException(releasable); // release shard operation lock before responding to caller
+                 AsyncReplicaAction.this.onFailure(e);
+@@ -564,33 +584,6 @@ protected void doRun() throws Exception {
+             acquireReplicaOperationPermit(replica, replicaRequest.getRequest(), this, replicaRequest.getPrimaryTerm(),
+                 replicaRequest.getGlobalCheckpoint(), replicaRequest.getMaxSeqNoOfUpdatesOrDeletes());
+         }
+-
+-        /**
+-         * Listens for the response on the replica and sends the response back to the primary.
+-         */
+-        private class ResponseListener implements ActionListener<TransportResponse.Empty> {
+-            private final ReplicaResponse replicaResponse;
+-
+-            ResponseListener(ReplicaResponse replicaResponse) {
+-                this.replicaResponse = replicaResponse;
+-            }
+-
+-            @Override
+-            public void onResponse(Empty response) {
+-                if (logger.isTraceEnabled()) {
+-                    logger.trace("action [{}] completed on shard [{}] for request [{}]", transportReplicaAction,
+-                        replicaRequest.getRequest().shardId(),
+-                        replicaRequest.getRequest());
+-                }
+-                setPhase(task, "finished");
+-                onCompletionListener.onResponse(replicaResponse);
+-            }
+-
+-            @Override
+-            public void onFailure(Exception e) {
+-                responseWithFailure(e);
+-            }
+-        }
+     }
+ 
+     private IndexShard getIndexShard(final ShardId shardId) {
+diff --git a/server/src/main/java/org/elasticsearch/action/support/replication/TransportWriteAction.java b/server/src/main/java/org/elasticsearch/action/support/replication/TransportWriteAction.java
+index 104d3517815c..07f8e96b4e79 100644
+--- a/server/src/main/java/org/elasticsearch/action/support/replication/TransportWriteAction.java
++++ b/server/src/main/java/org/elasticsearch/action/support/replication/TransportWriteAction.java
+@@ -41,7 +41,6 @@
+ import org.elasticsearch.index.translog.Translog.Location;
+ import org.elasticsearch.indices.IndicesService;
+ import org.elasticsearch.threadpool.ThreadPool;
+-import org.elasticsearch.transport.TransportResponse;
+ import org.elasticsearch.transport.TransportService;
+ 
+ import java.util.concurrent.atomic.AtomicBoolean;
+@@ -124,12 +123,10 @@ protected abstract void shardOperationOnPrimary(
+      * NOTE: public for testing
+      */
+     public static class WritePrimaryResult<ReplicaRequest extends ReplicatedWriteRequest<ReplicaRequest>,
+-            Response extends ReplicationResponse & WriteResponse> extends PrimaryResult<ReplicaRequest, Response>
+-            implements RespondingWriteResult {
+-        boolean finishedAsyncActions;
++            Response extends ReplicationResponse & WriteResponse> extends PrimaryResult<ReplicaRequest, Response> {
+         public final Location location;
+         public final IndexShard primary;
+-        ActionListener<Response> listener = null;
++        private final Logger logger;
+ 
+         public WritePrimaryResult(ReplicaRequest request, @Nullable Response finalResponse,
+                                   @Nullable Location location, @Nullable Exception operationFailure,
+@@ -137,104 +134,73 @@ public WritePrimaryResult(ReplicaRequest request, @Nullable Response finalRespon
+             super(request, finalResponse, operationFailure);
+             this.location = location;
+             this.primary = primary;
++            this.logger = logger;
+             assert location == null || operationFailure == null
+                     : "expected either failure to be null or translog location to be null, " +
+                     "but found: [" + location + "] translog location and [" + operationFailure + "] failure";
+-            if (operationFailure != null) {
+-                this.finishedAsyncActions = true;
++        }
++
++        @Override
++        public void runPostReplicationActions(ActionListener<Void> listener) {
++            if (finalFailure != null) {
++                listener.onFailure(finalFailure);
+             } else {
+                 /*
+-                 * We call this before replication because this might wait for a refresh and that can take a while.
++                 * We call this after replication because this might wait for a refresh and that can take a while.
+                  * This way we wait for the refresh in parallel on the primary and on the replica.
+                  */
+-                new AsyncAfterWriteAction(primary, request, location, this, logger).run();
+-            }
+-        }
+-
+-        @Override
+-        public synchronized void respond(ActionListener<Response> listener) {
+-            this.listener = listener;
+-            respondIfPossible(null);
+-        }
++                new AsyncAfterWriteAction(primary, replicaRequest, location, new RespondingWriteResult() {
++                    @Override
++                    public void onSuccess(boolean forcedRefresh) {
++                        finalResponseIfSuccessful.setForcedRefresh(forcedRefresh);
++                        listener.onResponse(null);
++                    }
+ 
+-        /**
+-         * Respond if the refresh has occurred and the listener is ready. Always called while synchronized on {@code this}.
+-         */
+-        protected void respondIfPossible(Exception ex) {
+-            assert Thread.holdsLock(this);
+-            if (finishedAsyncActions && listener != null) {
+-                if (ex == null) {
+-                    super.respond(listener);
+-                } else {
+-                    listener.onFailure(ex);
+-                }
++                    @Override
++                    public void onFailure(Exception ex) {
++                        listener.onFailure(ex);
++                    }
++                }, logger).run();
+             }
+         }
+-
+-        public synchronized void onFailure(Exception exception) {
+-            finishedAsyncActions = true;
+-            respondIfPossible(exception);
+-        }
+-
+-        @Override
+-        public synchronized void onSuccess(boolean forcedRefresh) {
+-            finalResponseIfSuccessful.setForcedRefresh(forcedRefresh);
+-            finishedAsyncActions = true;
+-            respondIfPossible(null);
+-        }
+     }
+ 
+     /**
+      * Result of taking the action on the replica.
+      */
+-    public static class WriteReplicaResult<ReplicaRequest extends ReplicatedWriteRequest<ReplicaRequest>>
+-            extends ReplicaResult implements RespondingWriteResult {
++    public static class WriteReplicaResult<ReplicaRequest extends ReplicatedWriteRequest<ReplicaRequest>> extends ReplicaResult {
+         public final Location location;
+-        boolean finishedAsyncActions;
+-        private ActionListener<TransportResponse.Empty> listener;
++        private final ReplicaRequest request;
++        private final IndexShard replica;
++        private final Logger logger;
+ 
+         public WriteReplicaResult(ReplicaRequest request, @Nullable Location location,
+                                   @Nullable Exception operationFailure, IndexShard replica, Logger logger) {
+             super(operationFailure);
+             this.location = location;
+-            if (operationFailure != null) {
+-                this.finishedAsyncActions = true;
+-            } else {
+-                new AsyncAfterWriteAction(replica, request, location, this, logger).run();
+-            }
++            this.request = request;
++            this.replica = replica;
++            this.logger = logger;
+         }
+ 
+         @Override
+-        public synchronized void respond(ActionListener<TransportResponse.Empty> listener) {
+-            this.listener = listener;
+-            respondIfPossible(null);
+-        }
++        public void runPostReplicaActions(ActionListener<Void> listener) {
++            if (finalFailure != null) {
++                listener.onFailure(finalFailure);
++            } else {
++                new AsyncAfterWriteAction(replica, request, location, new RespondingWriteResult() {
++                    @Override
++                    public void onSuccess(boolean forcedRefresh) {
++                        listener.onResponse(null);
++                    }
+ 
+-        /**
+-         * Respond if the refresh has occurred and the listener is ready. Always called while synchronized on {@code this}.
+-         */
+-        protected void respondIfPossible(Exception ex) {
+-            assert Thread.holdsLock(this);
+-            if (finishedAsyncActions && listener != null) {
+-                if (ex == null) {
+-                    super.respond(listener);
+-                } else {
+-                    listener.onFailure(ex);
+-                }
++                    @Override
++                    public void onFailure(Exception ex) {
++                        listener.onFailure(ex);
++                    }
++                }, logger).run();
+             }
+         }
+-
+-        @Override
+-        public synchronized void onFailure(Exception ex) {
+-            finishedAsyncActions = true;
+-            respondIfPossible(ex);
+-        }
+-
+-        @Override
+-        public synchronized void onSuccess(boolean forcedRefresh) {
+-            finishedAsyncActions = true;
+-            respondIfPossible(null);
+-        }
+     }
+ 
+     @Override
+diff --git a/server/src/test/java/org/elasticsearch/action/admin/indices/close/TransportVerifyShardBeforeCloseActionTests.java b/server/src/test/java/org/elasticsearch/action/admin/indices/close/TransportVerifyShardBeforeCloseActionTests.java
+index ba48eabadcca..3700722a5d63 100644
+--- a/server/src/test/java/org/elasticsearch/action/admin/indices/close/TransportVerifyShardBeforeCloseActionTests.java
++++ b/server/src/test/java/org/elasticsearch/action/admin/indices/close/TransportVerifyShardBeforeCloseActionTests.java
+@@ -348,6 +348,11 @@ public void setShardInfo(ReplicationResponse.ShardInfo shardInfo) {
+             this.shardInfo.set(shardInfo);
+         }
+ 
++        @Override
++        public void runPostReplicationActions(ActionListener<Void> listener) {
++            listener.onResponse(null);
++        }
++
+         public ReplicationResponse.ShardInfo getShardInfo() {
+             return shardInfo.get();
+         }
+diff --git a/server/src/test/java/org/elasticsearch/action/support/replication/ReplicationOperationTests.java b/server/src/test/java/org/elasticsearch/action/support/replication/ReplicationOperationTests.java
+index 3038153a3d53..32051f51fce2 100644
+--- a/server/src/test/java/org/elasticsearch/action/support/replication/ReplicationOperationTests.java
++++ b/server/src/test/java/org/elasticsearch/action/support/replication/ReplicationOperationTests.java
+@@ -124,6 +124,7 @@ public void testReplication() throws Exception {
+         assertThat(request.processedOnReplicas, equalTo(expectedReplicas));
+         assertThat(replicasProxy.failedReplicas, equalTo(simulatedFailures.keySet()));
+         assertThat(replicasProxy.markedAsStaleCopies, equalTo(staleAllocationIds));
++        assertThat("post replication operations not run on primary", request.runPostReplicationActionsOnPrimary.get(), equalTo(true));
+         assertTrue("listener is not marked as done", listener.isDone());
+         ShardInfo shardInfo = listener.actionGet().getShardInfo();
+         assertThat(shardInfo.getFailed(), equalTo(reportedFailures.size()));
+@@ -437,6 +438,7 @@ public void updateLocalCheckpointForShard(String allocationId, long checkpoint)
+ 
+     public static class Request extends ReplicationRequest<Request> {
+         public AtomicBoolean processedOnPrimary = new AtomicBoolean();
++        public AtomicBoolean runPostReplicationActionsOnPrimary = new AtomicBoolean();
+         public Set<ShardRouting> processedOnReplicas = ConcurrentCollections.newConcurrentSet();
+ 
+         Request(ShardId shardId) {
+@@ -505,6 +507,14 @@ public void setShardInfo(ShardInfo shardInfo) {
+                 this.shardInfo = shardInfo;
+             }
+ 
++            @Override
++            public void runPostReplicationActions(ActionListener<Void> listener) {
++                if (request.runPostReplicationActionsOnPrimary.compareAndSet(false, true) == false) {
++                    fail("processed [" + request + "] twice");
++                }
++                listener.onResponse(null);
++            }
++
+             public ShardInfo getShardInfo() {
+                 return shardInfo;
+             }
+@@ -597,6 +607,7 @@ public void performOn(
+                 final long maxSeqNoOfUpdatesOrDeletes,
+                 final ActionListener<ReplicationOperation.ReplicaResponse> listener) {
+             assertTrue("replica request processed twice on [" + replica + "]", request.processedOnReplicas.add(replica));
++            assertFalse("primary post replication actions should run after replication", request.runPostReplicationActionsOnPrimary.get());
+             if (opFailures.containsKey(replica)) {
+                 listener.onFailure(opFailures.get(replica));
+             } else {
+diff --git a/server/src/test/java/org/elasticsearch/action/support/replication/TransportWriteActionTests.java b/server/src/test/java/org/elasticsearch/action/support/replication/TransportWriteActionTests.java
+index c22613b9c291..441d532652a3 100644
+--- a/server/src/test/java/org/elasticsearch/action/support/replication/TransportWriteActionTests.java
++++ b/server/src/test/java/org/elasticsearch/action/support/replication/TransportWriteActionTests.java
+@@ -67,9 +67,6 @@
+ import java.util.Collections;
+ import java.util.HashSet;
+ import java.util.Locale;
+-import java.util.concurrent.BrokenBarrierException;
+-import java.util.concurrent.CountDownLatch;
+-import java.util.concurrent.CyclicBarrier;
+ import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicBoolean;
+@@ -143,7 +140,7 @@ public void testPrimaryNoRefreshCall() throws Exception {
+         testAction.shardOperationOnPrimary(request, indexShard,
+             ActionTestUtils.assertNoFailureListener(result -> {
+                 CapturingActionListener<TestResponse> listener = new CapturingActionListener<>();
+-                result.respond(listener);
++                result.runPostReplicationActions(ActionListener.map(listener, ignore -> result.finalResponseIfSuccessful));
+                 assertNotNull(listener.response);
+                 assertNull(listener.failure);
+                 verify(indexShard, never()).refresh(any());
+@@ -158,7 +155,7 @@ public void testReplicaNoRefreshCall() throws Exception {
+         TransportWriteAction.WriteReplicaResult<TestRequest> result =
+                 testAction.shardOperationOnReplica(request, indexShard);
+         CapturingActionListener<TransportResponse.Empty> listener = new CapturingActionListener<>();
+-        result.respond(listener);
++        result.runPostReplicaActions(ActionListener.map(listener, ignore -> TransportResponse.Empty.INSTANCE));
+         assertNotNull(listener.response);
+         assertNull(listener.failure);
+         verify(indexShard, never()).refresh(any());
+@@ -172,7 +169,7 @@ public void testPrimaryImmediateRefresh() throws Exception {
+         testAction.shardOperationOnPrimary(request, indexShard,
+             ActionTestUtils.assertNoFailureListener(result -> {
+                 CapturingActionListener<TestResponse> listener = new CapturingActionListener<>();
+-                result.respond(listener);
++                result.runPostReplicationActions(ActionListener.map(listener, ignore -> result.finalResponseIfSuccessful));
+                 assertNotNull(listener.response);
+                 assertNull(listener.failure);
+                 assertTrue(listener.response.forcedRefresh);
+@@ -188,7 +185,7 @@ public void testReplicaImmediateRefresh() throws Exception {
+         TransportWriteAction.WriteReplicaResult<TestRequest> result =
+                 testAction.shardOperationOnReplica(request, indexShard);
+         CapturingActionListener<TransportResponse.Empty> listener = new CapturingActionListener<>();
+-        result.respond(listener);
++        result.runPostReplicaActions(ActionListener.map(listener, ignore -> TransportResponse.Empty.INSTANCE));
+         assertNotNull(listener.response);
+         assertNull(listener.failure);
+         verify(indexShard).refresh("refresh_flag_index");
+@@ -203,7 +200,7 @@ public void testPrimaryWaitForRefresh() throws Exception {
+         testAction.shardOperationOnPrimary(request, indexShard,
+             ActionTestUtils.assertNoFailureListener(result -> {
+                 CapturingActionListener<TestResponse> listener = new CapturingActionListener<>();
+-                result.respond(listener);
++                result.runPostReplicationActions(ActionListener.map(listener, ignore -> result.finalResponseIfSuccessful));
+                 assertNull(listener.response); // Haven't really responded yet
+ 
+                 @SuppressWarnings({"unchecked", "rawtypes"})
+@@ -226,7 +223,7 @@ public void testReplicaWaitForRefresh() throws Exception {
+         TestAction testAction = new TestAction();
+         TransportWriteAction.WriteReplicaResult<TestRequest> result = testAction.shardOperationOnReplica(request, indexShard);
+         CapturingActionListener<TransportResponse.Empty> listener = new CapturingActionListener<>();
+-        result.respond(listener);
++        result.runPostReplicaActions(ActionListener.map(listener, ignore -> TransportResponse.Empty.INSTANCE));
+         assertNull(listener.response); // Haven't responded yet
+         @SuppressWarnings({ "unchecked", "rawtypes" })
+         ArgumentCaptor<Consumer<Boolean>> refreshListener = ArgumentCaptor.forClass((Class) Consumer.class);
+@@ -244,9 +241,9 @@ public void testDocumentFailureInShardOperationOnPrimary() throws Exception {
+         TestRequest request = new TestRequest();
+         TestAction testAction = new TestAction(true, true);
+         testAction.shardOperationOnPrimary(request, indexShard,
+-            ActionTestUtils.assertNoFailureListener(writePrimaryResult -> {
++            ActionTestUtils.assertNoFailureListener(result -> {
+                 CapturingActionListener<TestResponse> listener = new CapturingActionListener<>();
+-                writePrimaryResult.respond(listener);
++                result.runPostReplicationActions(ActionListener.map(listener, ignore -> result.finalResponseIfSuccessful));
+                 assertNull(listener.response);
+                 assertNotNull(listener.failure);
+             }));
+@@ -255,10 +252,10 @@ public void testDocumentFailureInShardOperationOnPrimary() throws Exception {
+     public void testDocumentFailureInShardOperationOnReplica() throws Exception {
+         TestRequest request = new TestRequest();
+         TestAction testAction = new TestAction(randomBoolean(), true);
+-        TransportWriteAction.WriteReplicaResult<TestRequest> writeReplicaResult =
++        TransportWriteAction.WriteReplicaResult<TestRequest> result =
+                 testAction.shardOperationOnReplica(request, indexShard);
+         CapturingActionListener<TransportResponse.Empty> listener = new CapturingActionListener<>();
+-        writeReplicaResult.respond(listener);
++        result.runPostReplicaActions(ActionListener.map(listener, ignore -> TransportResponse.Empty.INSTANCE));
+         assertNull(listener.response);
+         assertNotNull(listener.failure);
+     }
+@@ -350,41 +347,6 @@ public void testReplicaProxy() throws InterruptedException, ExecutionException {
+         }
+     }
+ 
+-    public void testConcurrentWriteReplicaResultCompletion() throws InterruptedException {
+-        IndexShard replica = mock(IndexShard.class);
+-        when(replica.getTranslogDurability()).thenReturn(Translog.Durability.ASYNC);
+-        TestRequest request = new TestRequest();
+-        request.setRefreshPolicy(RefreshPolicy.WAIT_UNTIL);
+-        TransportWriteAction.WriteReplicaResult<TestRequest> replicaResult = new TransportWriteAction.WriteReplicaResult<>(
+-            request, new Translog.Location(0, 0, 0), null, replica, logger);
+-        CyclicBarrier barrier = new CyclicBarrier(2);
+-        Runnable waitForBarrier = () -> {
+-            try {
+-                barrier.await();
+-            } catch (InterruptedException | BrokenBarrierException e) {
+-                throw new AssertionError(e);
+-            }
+-        };
+-        CountDownLatch completionLatch = new CountDownLatch(1);
+-        threadPool.generic().execute(() -> {
+-            waitForBarrier.run();
+-            replicaResult.respond(ActionListener.wrap(completionLatch::countDown));
+-        });
+-        if (randomBoolean()) {
+-            threadPool.generic().execute(() -> {
+-                waitForBarrier.run();
+-                replicaResult.onFailure(null);
+-            });
+-        } else {
+-            threadPool.generic().execute(() -> {
+-                waitForBarrier.run();
+-                replicaResult.onSuccess(false);
+-            });
+-        }
+-
+-        assertTrue(completionLatch.await(30, TimeUnit.SECONDS));
+-    }
+-
+     private class TestAction extends TransportWriteAction<TestRequest, TestRequest, TestResponse> {
+ 
+         private final boolean withDocumentFailureOnPrimary;
+diff --git a/server/src/test/java/org/elasticsearch/index/seqno/GlobalCheckpointSyncIT.java b/server/src/test/java/org/elasticsearch/index/seqno/GlobalCheckpointSyncIT.java
+index a714870953ae..ad2520248a67 100644
+--- a/server/src/test/java/org/elasticsearch/index/seqno/GlobalCheckpointSyncIT.java
++++ b/server/src/test/java/org/elasticsearch/index/seqno/GlobalCheckpointSyncIT.java
+@@ -259,4 +259,31 @@ public void testPersistGlobalCheckpoint() throws Exception {
+             }
+         });
+     }
++
++    public void testPersistLocalCheckpoint() {
++        internalCluster().ensureAtLeastNumDataNodes(2);
++        Settings.Builder indexSettings = Settings.builder()
++            .put(IndexService.GLOBAL_CHECKPOINT_SYNC_INTERVAL_SETTING.getKey(), "10m")
++            .put(IndexSettings.INDEX_TRANSLOG_DURABILITY_SETTING.getKey(), Translog.Durability.REQUEST)
++            .put("index.number_of_shards", 1)
++            .put("index.number_of_replicas", randomIntBetween(0, 1));
++        prepareCreate("test", indexSettings).get();
++        ensureGreen("test");
++        int numDocs = randomIntBetween(1, 20);
++        logger.info("numDocs {}", numDocs);
++        long maxSeqNo = 0;
++        for (int i = 0; i < numDocs; i++) {
++            maxSeqNo = client().prepareIndex("test").setId(Integer.toString(i)).setSource("{}", XContentType.JSON).get().getSeqNo();
++            logger.info("got {}", maxSeqNo);
++        }
++        for (IndicesService indicesService : internalCluster().getDataNodeInstances(IndicesService.class)) {
++            for (IndexService indexService : indicesService) {
++                for (IndexShard shard : indexService) {
++                    final SeqNoStats seqNoStats = shard.seqNoStats();
++                    assertThat(maxSeqNo, equalTo(seqNoStats.getMaxSeqNo()));
++                    assertThat(seqNoStats.getLocalCheckpoint(), equalTo(seqNoStats.getMaxSeqNo()));;
++                }
++            }
++        }
++    }
+ }
+diff --git a/server/src/test/java/org/elasticsearch/index/seqno/RetentionLeaseBackgroundSyncActionTests.java b/server/src/test/java/org/elasticsearch/index/seqno/RetentionLeaseBackgroundSyncActionTests.java
+index 282170a58e3e..faccbc7ff482 100644
+--- a/server/src/test/java/org/elasticsearch/index/seqno/RetentionLeaseBackgroundSyncActionTests.java
++++ b/server/src/test/java/org/elasticsearch/index/seqno/RetentionLeaseBackgroundSyncActionTests.java
+@@ -154,7 +154,7 @@ public void testRetentionLeaseBackgroundSyncActionOnReplica() throws WriteStateE
+         verify(indexShard).persistRetentionLeases();
+         // the result should indicate success
+         final AtomicBoolean success = new AtomicBoolean();
+-        result.respond(ActionListener.wrap(r -> success.set(true), e -> fail(e.toString())));
++        result.runPostReplicaActions(ActionListener.wrap(r -> success.set(true), e -> fail(e.toString())));
+         assertTrue(success.get());
+     }
+ 
+diff --git a/server/src/test/java/org/elasticsearch/index/seqno/RetentionLeaseSyncActionTests.java b/server/src/test/java/org/elasticsearch/index/seqno/RetentionLeaseSyncActionTests.java
+index a63722d93666..1999873464dd 100644
+--- a/server/src/test/java/org/elasticsearch/index/seqno/RetentionLeaseSyncActionTests.java
++++ b/server/src/test/java/org/elasticsearch/index/seqno/RetentionLeaseSyncActionTests.java
+@@ -149,7 +149,7 @@ public void testRetentionLeaseSyncActionOnReplica() throws WriteStateException {
+         verify(indexShard).persistRetentionLeases();
+         // the result should indicate success
+         final AtomicBoolean success = new AtomicBoolean();
+-        result.respond(ActionListener.wrap(r -> success.set(true), e -> fail(e.toString())));
++        result.runPostReplicaActions(ActionListener.wrap(r -> success.set(true), e -> fail(e.toString())));
+         assertTrue(success.get());
+     }
+ 
+diff --git a/test/framework/src/main/java/org/elasticsearch/index/replication/ESIndexLevelReplicationTestCase.java b/test/framework/src/main/java/org/elasticsearch/index/replication/ESIndexLevelReplicationTestCase.java
+index 62f624335c86..c067c0717dcc 100644
+--- a/test/framework/src/main/java/org/elasticsearch/index/replication/ESIndexLevelReplicationTestCase.java
++++ b/test/framework/src/main/java/org/elasticsearch/index/replication/ESIndexLevelReplicationTestCase.java
+@@ -601,14 +601,23 @@ protected ReplicationAction(Request request, ActionListener<Response> listener,
+         public void execute() {
+             try {
+                 new ReplicationOperation<>(request, new PrimaryRef(),
+-                    ActionListener.wrap(result -> result.respond(listener), listener::onFailure), new ReplicasRef(), logger, opType,
+-                    primaryTerm).execute();
++                    ActionListener.map(listener, result -> {
++                        adaptResponse(result.finalResponse, getPrimaryShard());
++                        return result.finalResponse;
++                    }),
++                    new ReplicasRef(), logger, opType, primaryTerm)
++                    .execute();
+             } catch (Exception e) {
+                 listener.onFailure(e);
+             }
+         }
+ 
+-        IndexShard getPrimaryShard() {
++        // to be overridden by subclasses
++        protected void adaptResponse(Response response, IndexShard indexShard) {
++
++        }
++
++        protected IndexShard getPrimaryShard() {
+             return replicationTargets.primary;
+         }
+ 
+@@ -731,8 +740,9 @@ public void setShardInfo(ReplicationResponse.ShardInfo shardInfo) {
+                 finalResponse.setShardInfo(shardInfo);
+             }
+ 
+-            public void respond(ActionListener<Response> listener) {
+-                listener.onResponse(finalResponse);
++            @Override
++            public void runPostReplicationActions(ActionListener<Void> listener) {
++                listener.onResponse(null);
+             }
+         }
+ 
+diff --git a/x-pack/plugin/ccr/src/main/java/org/elasticsearch/xpack/ccr/action/bulk/TransportBulkShardOperationsAction.java b/x-pack/plugin/ccr/src/main/java/org/elasticsearch/xpack/ccr/action/bulk/TransportBulkShardOperationsAction.java
+index 8c4374fac362..48f41ef527de 100644
+--- a/x-pack/plugin/ccr/src/main/java/org/elasticsearch/xpack/ccr/action/bulk/TransportBulkShardOperationsAction.java
++++ b/x-pack/plugin/ccr/src/main/java/org/elasticsearch/xpack/ccr/action/bulk/TransportBulkShardOperationsAction.java
+@@ -102,7 +102,7 @@ protected void shardOperationOnPrimary(BulkShardOperationsRequest request, Index
+     }
+ 
+     // public for testing purposes only
+-    public static CcrWritePrimaryResult shardOperationOnPrimary(
++    public static WritePrimaryResult<BulkShardOperationsRequest, BulkShardOperationsResponse> shardOperationOnPrimary(
+             final ShardId shardId,
+             final String historyUUID,
+             final List<Translog.Operation> sourceOperations,
+@@ -154,7 +154,7 @@ public static CcrWritePrimaryResult shardOperationOnPrimary(
+         }
+         final BulkShardOperationsRequest replicaRequest = new BulkShardOperationsRequest(
+             shardId, historyUUID, appliedOperations, maxSeqNoOfUpdatesOrDeletes);
+-        return new CcrWritePrimaryResult(replicaRequest, location, primary, logger);
++        return new WritePrimaryResult<>(replicaRequest, new BulkShardOperationsResponse(), location, null, primary, logger);
+     }
+ 
+     @Override
+@@ -190,26 +190,16 @@ protected BulkShardOperationsResponse newResponseInstance(StreamInput in) throws
+         return new BulkShardOperationsResponse(in);
+     }
+ 
+-    /**
+-     * Custom write result to include global checkpoint after ops have been replicated.
+-     */
+-    static final class CcrWritePrimaryResult extends WritePrimaryResult<BulkShardOperationsRequest, BulkShardOperationsResponse> {
+-        CcrWritePrimaryResult(BulkShardOperationsRequest request, Translog.Location location, IndexShard primary, Logger logger) {
+-            super(request, new BulkShardOperationsResponse(), location, null, primary, logger);
+-        }
+-
+-        @Override
+-        public synchronized void respond(ActionListener<BulkShardOperationsResponse> listener) {
+-            final ActionListener<BulkShardOperationsResponse> wrappedListener = ActionListener.wrap(response -> {
+-                final SeqNoStats seqNoStats = primary.seqNoStats();
+-                // return a fresh global checkpoint after the operations have been replicated for the shard follow task
+-                response.setGlobalCheckpoint(seqNoStats.getGlobalCheckpoint());
+-                response.setMaxSeqNo(seqNoStats.getMaxSeqNo());
+-                listener.onResponse(response);
+-            }, listener::onFailure);
+-            super.respond(wrappedListener);
+-        }
++    @Override
++    protected void adaptResponse(BulkShardOperationsResponse response, IndexShard indexShard) {
++        adaptBulkShardOperationsResponse(response, indexShard);
++    }
+ 
++    public static void adaptBulkShardOperationsResponse(BulkShardOperationsResponse response, IndexShard indexShard) {
++        final SeqNoStats seqNoStats = indexShard.seqNoStats();
++        // return a fresh global checkpoint after the operations have been replicated for the shard follow task
++        response.setGlobalCheckpoint(seqNoStats.getGlobalCheckpoint());
++        response.setMaxSeqNo(seqNoStats.getMaxSeqNo());
+     }
+ 
+ }
+diff --git a/x-pack/plugin/ccr/src/test/java/org/elasticsearch/xpack/ccr/action/ShardFollowTaskReplicationTests.java b/x-pack/plugin/ccr/src/test/java/org/elasticsearch/xpack/ccr/action/ShardFollowTaskReplicationTests.java
+index 3fdf16a67946..aebf4129c1af 100644
+--- a/x-pack/plugin/ccr/src/test/java/org/elasticsearch/xpack/ccr/action/ShardFollowTaskReplicationTests.java
++++ b/x-pack/plugin/ccr/src/test/java/org/elasticsearch/xpack/ccr/action/ShardFollowTaskReplicationTests.java
+@@ -18,6 +18,7 @@
+ import org.elasticsearch.action.support.PlainActionFuture;
+ import org.elasticsearch.action.support.replication.ReplicationResponse;
+ import org.elasticsearch.action.support.replication.TransportWriteAction;
++import org.elasticsearch.action.support.replication.TransportWriteActionTestHelper;
+ import org.elasticsearch.cluster.metadata.IndexMetaData;
+ import org.elasticsearch.cluster.node.DiscoveryNode;
+ import org.elasticsearch.cluster.routing.RecoverySource;
+@@ -67,6 +68,7 @@
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
++import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.Future;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.function.BiConsumer;
+@@ -668,26 +670,32 @@ private void assertConsistentHistoryBetweenLeaderAndFollower(ReplicationGroup le
+ 
+         @Override
+         protected void performOnPrimary(IndexShard primary, BulkShardOperationsRequest request, ActionListener<PrimaryResult> listener) {
+-            ActionListener.completeWith(listener, () -> {
+-                final PlainActionFuture<Releasable> permitFuture = new PlainActionFuture<>();
+-                primary.acquirePrimaryOperationPermit(permitFuture, ThreadPool.Names.SAME, request);
+-                final TransportWriteAction.WritePrimaryResult<BulkShardOperationsRequest, BulkShardOperationsResponse> ccrResult;
+-                try (Releasable ignored = permitFuture.get()) {
+-                    ccrResult = TransportBulkShardOperationsAction.shardOperationOnPrimary(primary.shardId(), request.getHistoryUUID(),
+-                        request.getOperations(), request.getMaxSeqNoOfUpdatesOrDeletes(), primary, logger);
+-                }
+-                return new PrimaryResult(ccrResult.replicaRequest(), ccrResult.finalResponseIfSuccessful) {
+-                    @Override
+-                    public void respond(ActionListener<BulkShardOperationsResponse> listener) {
+-                        ccrResult.respond(listener);
+-                    }
+-                };
+-            });
++            final PlainActionFuture<Releasable> permitFuture = new PlainActionFuture<>();
++            primary.acquirePrimaryOperationPermit(permitFuture, ThreadPool.Names.SAME, request);
++            final TransportWriteAction.WritePrimaryResult<BulkShardOperationsRequest, BulkShardOperationsResponse> ccrResult;
++            try (Releasable ignored = permitFuture.get()) {
++                ccrResult = TransportBulkShardOperationsAction.shardOperationOnPrimary(primary.shardId(), request.getHistoryUUID(),
++                    request.getOperations(), request.getMaxSeqNoOfUpdatesOrDeletes(), primary, logger);
++                TransportWriteActionTestHelper.performPostWriteActions(primary, request, ccrResult.location, logger);
++            } catch (InterruptedException | ExecutionException | IOException e) {
++                throw new AssertionError(e);
++            }
++            listener.onResponse(new PrimaryResult(ccrResult.replicaRequest(), ccrResult.finalResponseIfSuccessful));
++        }
++
++        @Override
++        protected void adaptResponse(BulkShardOperationsResponse response, IndexShard indexShard) {
++            TransportBulkShardOperationsAction.adaptBulkShardOperationsResponse(response, indexShard);
+         }
+ 
+         @Override
+         protected void performOnReplica(BulkShardOperationsRequest request, IndexShard replica) throws Exception {
+-            TransportBulkShardOperationsAction.shardOperationOnReplica(request, replica, logger);
++            try (Releasable ignored = PlainActionFuture.get(f -> replica.acquireReplicaOperationPermit(
++                getPrimaryShard().getPendingPrimaryTerm(), getPrimaryShard().getLastKnownGlobalCheckpoint(),
++                getPrimaryShard().getMaxSeqNoOfUpdatesOrDeletes(), f, ThreadPool.Names.SAME, request))) {
++                Translog.Location location = TransportBulkShardOperationsAction.shardOperationOnReplica(request, replica, logger).location;
++                TransportWriteActionTestHelper.performPostWriteActions(replica, request, location, logger);
++            }
+         }
+     }
+ 
+diff --git a/x-pack/plugin/ccr/src/test/java/org/elasticsearch/xpack/ccr/action/bulk/BulkShardOperationsTests.java b/x-pack/plugin/ccr/src/test/java/org/elasticsearch/xpack/ccr/action/bulk/BulkShardOperationsTests.java
+index 850efa9a74b6..b14403406dd6 100644
+--- a/x-pack/plugin/ccr/src/test/java/org/elasticsearch/xpack/ccr/action/bulk/BulkShardOperationsTests.java
++++ b/x-pack/plugin/ccr/src/test/java/org/elasticsearch/xpack/ccr/action/bulk/BulkShardOperationsTests.java
+@@ -33,7 +33,6 @@
+ import static java.util.Collections.emptySet;
+ import static org.elasticsearch.xpack.ccr.action.bulk.TransportBulkShardOperationsAction.rewriteOperationWithPrimaryTerm;
+ import static org.hamcrest.Matchers.equalTo;
+-import static org.elasticsearch.xpack.ccr.action.bulk.TransportBulkShardOperationsAction.CcrWritePrimaryResult;
+ 
+ public class BulkShardOperationsTests extends IndexShardTestCase {
+ 
+@@ -124,7 +123,8 @@ public void testPrimaryResultIncludeOnlyAppliedOperations() throws Exception {
+         Randomness.shuffle(firstBulk);
+         Randomness.shuffle(secondBulk);
+         oldPrimary.advanceMaxSeqNoOfUpdatesOrDeletes(seqno);
+-        final CcrWritePrimaryResult fullResult = TransportBulkShardOperationsAction.shardOperationOnPrimary(oldPrimary.shardId(),
++        final TransportWriteAction.WritePrimaryResult<BulkShardOperationsRequest, BulkShardOperationsResponse> fullResult =
++            TransportBulkShardOperationsAction.shardOperationOnPrimary(oldPrimary.shardId(),
+             oldPrimary.getHistoryUUID(), firstBulk, seqno, oldPrimary, logger);
+         assertThat(fullResult.replicaRequest().getOperations(),
+             equalTo(firstBulk.stream().map(op -> rewriteOperationWithPrimaryTerm(op, oldPrimaryTerm)).collect(Collectors.toList())));
+@@ -138,7 +138,8 @@ public void testPrimaryResultIncludeOnlyAppliedOperations() throws Exception {
+         // The second bulk includes some operations from the first bulk which were processed already;
+         // only a subset of these operations will be included the result but with the old primary term.
+         final List<Translog.Operation> existingOps = randomSubsetOf(firstBulk);
+-        final CcrWritePrimaryResult partialResult = TransportBulkShardOperationsAction.shardOperationOnPrimary(newPrimary.shardId(),
++        final TransportWriteAction.WritePrimaryResult<BulkShardOperationsRequest, BulkShardOperationsResponse> partialResult =
++            TransportBulkShardOperationsAction.shardOperationOnPrimary(newPrimary.shardId(),
+             newPrimary.getHistoryUUID(), Stream.concat(secondBulk.stream(), existingOps.stream()).collect(Collectors.toList()),
+             seqno, newPrimary, logger);
+         final long newPrimaryTerm = newPrimary.getOperationPrimaryTerm();

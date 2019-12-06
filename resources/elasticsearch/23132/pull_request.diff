@@ -1,0 +1,144 @@
+diff --git a/core/src/main/java/org/elasticsearch/cluster/ClusterStateObserver.java b/core/src/main/java/org/elasticsearch/cluster/ClusterStateObserver.java
+index e9ed22d26b75..e0c35a12c22a 100644
+--- a/core/src/main/java/org/elasticsearch/cluster/ClusterStateObserver.java
++++ b/core/src/main/java/org/elasticsearch/cluster/ClusterStateObserver.java
+@@ -149,9 +149,10 @@ public void waitForNextChange(Listener listener, Predicate<ClusterState> statePr
+             timedOut = false;
+         }
+ 
+-        // sample a new state
++        // sample a new state. This state maybe *older* than the supplied state if we are called from an applier,
++        // which wants to wait for something else to happen
+         ClusterState newState = clusterService.state();
+-        if (lastObservedState.get().sameState(newState) == false && statePredicate.test(newState)) {
++        if (lastObservedState.get().isOlderOrDifferentMaster(newState) && statePredicate.test(newState)) {
+             // good enough, let's go.
+             logger.trace("observer: sampled state accepted by predicate ({})", newState);
+             lastObservedState.set(new StoredState(newState));
+@@ -198,7 +199,7 @@ public void postAdded() {
+                 return;
+             }
+             ClusterState newState = clusterService.state();
+-            if (lastObservedState.get().sameState(newState) == false && context.statePredicate.test(newState)) {
++            if (lastObservedState.get().isOlderOrDifferentMaster(newState) && context.statePredicate.test(newState)) {
+                 // double check we're still listening
+                 if (observingContext.compareAndSet(context, null)) {
+                     logger.trace("observer: post adding listener: accepting current cluster state ({})", newState);
+@@ -251,8 +252,11 @@ public void onTimeout(TimeValue timeout) {
+             this.version = clusterState.version();
+         }
+ 
+-        public boolean sameState(ClusterState clusterState) {
+-            return version == clusterState.version() && Objects.equals(masterNodeId, clusterState.nodes().getMasterNodeId());
++        /**
++         * returns true if stored state is older then given state or they are from a different master, meaning they can't be compared
++         * */
++        public boolean isOlderOrDifferentMaster(ClusterState clusterState) {
++            return version < clusterState.version() || Objects.equals(masterNodeId, clusterState.nodes().getMasterNodeId()) == false;
+         }
+     }
+ 
+diff --git a/core/src/main/java/org/elasticsearch/cluster/service/ClusterService.java b/core/src/main/java/org/elasticsearch/cluster/service/ClusterService.java
+index ebcf60f7f92a..5affa0f822be 100644
+--- a/core/src/main/java/org/elasticsearch/cluster/service/ClusterService.java
++++ b/core/src/main/java/org/elasticsearch/cluster/service/ClusterService.java
+@@ -29,6 +29,7 @@
+ import org.elasticsearch.cluster.ClusterState.Builder;
+ import org.elasticsearch.cluster.ClusterStateApplier;
+ import org.elasticsearch.cluster.ClusterStateListener;
++import org.elasticsearch.cluster.ClusterStateObserver;
+ import org.elasticsearch.cluster.ClusterStateTaskConfig;
+ import org.elasticsearch.cluster.ClusterStateTaskExecutor;
+ import org.elasticsearch.cluster.ClusterStateTaskExecutor.ClusterTasksResult;
+@@ -561,10 +562,15 @@ public static boolean assertNotClusterStateUpdateThread(String reason) {
+     /** asserts that the current stack trace does <b>NOT</b> involve a cluster state applier */
+     private static boolean assertNotCalledFromClusterStateApplier(String reason) {
+         if (Thread.currentThread().getName().contains(UPDATE_THREAD_NAME)) {
+-            for (StackTraceElement element: Thread.currentThread().getStackTrace()) {
+-                if (element.getClassName().equals(ClusterService.class.getName())
+-                    && element.getMethodName().equals("callClusterStateAppliers")) {
+-                   throw new AssertionError("should not be called by a cluster state applier. reason [" + reason + "]");
++            for (StackTraceElement element : Thread.currentThread().getStackTrace()) {
++                final String className = element.getClassName();
++                final String methodName = element.getMethodName();
++                if (className.equals(ClusterStateObserver.class.getName())) {
++                    // people may start an observer from an applier
++                    return true;
++                } else if (className.equals(ClusterService.class.getName())
++                    && methodName.equals("callClusterStateAppliers")) {
++                    throw new AssertionError("should not be called by a cluster state applier. reason [" + reason + "]");
+                 }
+             }
+         }
+diff --git a/core/src/test/java/org/elasticsearch/cluster/service/ClusterServiceTests.java b/core/src/test/java/org/elasticsearch/cluster/service/ClusterServiceTests.java
+index 809ebdfe17ef..7f4e25f76a8c 100644
+--- a/core/src/test/java/org/elasticsearch/cluster/service/ClusterServiceTests.java
++++ b/core/src/test/java/org/elasticsearch/cluster/service/ClusterServiceTests.java
+@@ -26,6 +26,7 @@
+ import org.elasticsearch.Version;
+ import org.elasticsearch.cluster.ClusterChangedEvent;
+ import org.elasticsearch.cluster.ClusterState;
++import org.elasticsearch.cluster.ClusterStateObserver;
+ import org.elasticsearch.cluster.ClusterStateTaskConfig;
+ import org.elasticsearch.cluster.ClusterStateTaskExecutor;
+ import org.elasticsearch.cluster.ClusterStateTaskListener;
+@@ -1197,6 +1198,59 @@ public void clusterStateProcessed(String source, ClusterState oldState, ClusterS
+         assertTrue(applierCalled.get());
+     }
+ 
++    public void testClusterStateApplierCanCreateAnObserver() throws InterruptedException {
++        AtomicReference<Throwable> error = new AtomicReference<>();
++        AtomicBoolean applierCalled = new AtomicBoolean();
++        clusterService.addStateApplier(event -> {
++            try {
++                applierCalled.set(true);
++                ClusterStateObserver observer = new ClusterStateObserver(event.state(),
++                    clusterService, null, logger, threadPool.getThreadContext());
++                observer.waitForNextChange(new ClusterStateObserver.Listener() {
++                    @Override
++                    public void onNewClusterState(ClusterState state) {
++
++                    }
++
++                    @Override
++                    public void onClusterServiceClose() {
++
++                    }
++
++                    @Override
++                    public void onTimeout(TimeValue timeout) {
++
++                    }
++                });
++            } catch (AssertionError e) {
++                    error.set(e);
++            }
++        });
++
++        CountDownLatch latch = new CountDownLatch(1);
++        clusterService.submitStateUpdateTask("test", new ClusterStateUpdateTask() {
++            @Override
++            public ClusterState execute(ClusterState currentState) throws Exception {
++                return ClusterState.builder(currentState).build();
++            }
++
++            @Override
++            public void onFailure(String source, Exception e) {
++                error.compareAndSet(null, e);
++            }
++
++            @Override
++            public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {
++                latch.countDown();
++            }
++        });
++
++        latch.await();
++        assertNull(error.get());
++        assertTrue(applierCalled.get());
++    }
++
++
+     private static class SimpleTask {
+         private final int id;
+ 

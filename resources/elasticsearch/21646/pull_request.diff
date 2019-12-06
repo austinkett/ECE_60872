@@ -1,0 +1,124 @@
+diff --git a/core/src/main/java/org/elasticsearch/common/settings/AbstractScopedSettings.java b/core/src/main/java/org/elasticsearch/common/settings/AbstractScopedSettings.java
+index e72f274fd621..b993cef92905 100644
+--- a/core/src/main/java/org/elasticsearch/common/settings/AbstractScopedSettings.java
++++ b/core/src/main/java/org/elasticsearch/common/settings/AbstractScopedSettings.java
+@@ -40,6 +40,7 @@
+ import java.util.concurrent.CopyOnWriteArrayList;
+ import java.util.function.BiConsumer;
+ import java.util.function.Consumer;
++import java.util.function.Predicate;
+ import java.util.regex.Pattern;
+ import java.util.stream.Collectors;
+ 
+@@ -445,10 +446,18 @@ private boolean updateSettings(Settings toApply, Settings.Builder target, Settin
+         boolean changed = false;
+         final Set<String> toRemove = new HashSet<>();
+         Settings.Builder settingsBuilder = Settings.builder();
++        final Predicate<String> canUpdate = (key) -> (onlyDynamic == false && get(key) != null) || hasDynamicSetting(key);
++        final Predicate<String> canRemove = (key) ->( // we can delete if
++            onlyDynamic && hasDynamicSetting(key)  // it's a dynamicSetting and we only do dynamic settings
++            || get(key) == null && key.startsWith(ARCHIVED_SETTINGS_PREFIX) // the setting is not registered AND it's been archived
++            || (onlyDynamic == false && get(key) != null)); // if it's not dynamic AND we have a key
+         for (Map.Entry<String, String> entry : toApply.getAsMap().entrySet()) {
+-            if (entry.getValue() == null) {
++            if (entry.getValue() == null && (canRemove.test(entry.getKey()) || entry.getKey().endsWith("*"))) {
++                // this either accepts null values that suffice the canUpdate test OR wildcard expressions (key ends with *)
++                // we don't validate if there is any dynamic setting with that prefix yet we could do in the future
+                 toRemove.add(entry.getKey());
+-            } else if ((onlyDynamic == false && get(entry.getKey()) != null) || hasDynamicSetting(entry.getKey())) {
++                // we don't set changed here it's set after we apply deletes below if something actually changed
++            } else if (entry.getValue() != null && canUpdate.test(entry.getKey())) {
+                 validate(entry.getKey(), toApply);
+                 settingsBuilder.put(entry.getKey(), entry.getValue());
+                 updates.put(entry.getKey(), entry.getValue());
+@@ -456,20 +465,22 @@ private boolean updateSettings(Settings toApply, Settings.Builder target, Settin
+             } else {
+                 throw new IllegalArgumentException(type + " setting [" + entry.getKey() + "], not dynamically updateable");
+             }
+-
+         }
+-        changed |= applyDeletes(toRemove, target);
++        changed |= applyDeletes(toRemove, target, canRemove);
+         target.put(settingsBuilder.build());
+         return changed;
+     }
+ 
+-    private static boolean applyDeletes(Set<String> deletes, Settings.Builder builder) {
++    private static boolean applyDeletes(Set<String> deletes, Settings.Builder builder, Predicate<String> canRemove) {
+         boolean changed = false;
+         for (String entry : deletes) {
+             Set<String> keysToRemove = new HashSet<>();
+             Set<String> keySet = builder.internalMap().keySet();
+             for (String key : keySet) {
+-                if (Regex.simpleMatch(entry, key)) {
++                if (Regex.simpleMatch(entry, key) && canRemove.test(key)) {
++                    // we have to re-check with canRemove here since we might have a wildcard expression foo.* that matches
++                    // dynamic as well as static settings if that is the case we might remove static settings since we resolve the
++                    // wildcards late
+                     keysToRemove.add(key);
+                 }
+             }
+diff --git a/core/src/test/java/org/elasticsearch/common/settings/ScopedSettingsTests.java b/core/src/test/java/org/elasticsearch/common/settings/ScopedSettingsTests.java
+index 635c00c18606..99126dcccd4d 100644
+--- a/core/src/test/java/org/elasticsearch/common/settings/ScopedSettingsTests.java
++++ b/core/src/test/java/org/elasticsearch/common/settings/ScopedSettingsTests.java
+@@ -45,6 +45,59 @@
+ 
+ public class ScopedSettingsTests extends ESTestCase {
+ 
++    public void testResetSetting() {
++        Setting<Integer> dynamicSetting = Setting.intSetting("some.dyn.setting", 1, Property.Dynamic, Property.NodeScope);
++        Setting<Integer> staticSetting = Setting.intSetting("some.static.setting", 1, Property.NodeScope);
++        Settings currentSettings = Settings.builder().put("some.dyn.setting", 5).put("some.static.setting", 6).put("archived.foo.bar", 9)
++            .build();
++        ClusterSettings service = new ClusterSettings(currentSettings
++            , new HashSet<>(Arrays.asList(dynamicSetting, staticSetting)));
++
++        expectThrows(IllegalArgumentException.class, () ->
++        service.updateDynamicSettings(Settings.builder().put("some.dyn.setting", 8).putNull("some.static.setting").build(),
++            Settings.builder().put(currentSettings), Settings.builder(), "node"));
++
++        Settings.Builder target = Settings.builder().put(currentSettings);
++        Settings.Builder update = Settings.builder();
++        assertTrue(service.updateDynamicSettings(Settings.builder().put("some.dyn.setting", 8).build(),
++            target, update, "node"));
++        assertEquals(8, dynamicSetting.get(target.build()).intValue());
++        assertEquals(6, staticSetting.get(target.build()).intValue());
++        assertEquals(9, target.build().getAsInt("archived.foo.bar", null).intValue());
++
++        target = Settings.builder().put(currentSettings);
++        update = Settings.builder();
++        assertTrue(service.updateDynamicSettings(Settings.builder().putNull("some.dyn.setting").build(),
++            target, update, "node"));
++        assertEquals(1, dynamicSetting.get(target.build()).intValue());
++        assertEquals(6, staticSetting.get(target.build()).intValue());
++        assertEquals(9, target.build().getAsInt("archived.foo.bar", null).intValue());
++
++        target = Settings.builder().put(currentSettings);
++        update = Settings.builder();
++        assertTrue(service.updateDynamicSettings(Settings.builder().putNull("archived.foo.bar").build(),
++            target, update, "node"));
++        assertEquals(5, dynamicSetting.get(target.build()).intValue());
++        assertEquals(6, staticSetting.get(target.build()).intValue());
++        assertNull(target.build().getAsInt("archived.foo.bar", null));
++
++        target = Settings.builder().put(currentSettings);
++        update = Settings.builder();
++        assertTrue(service.updateDynamicSettings(Settings.builder().putNull("some.*").build(),
++            target, update, "node"));
++        assertEquals(1, dynamicSetting.get(target.build()).intValue());
++        assertEquals(6, staticSetting.get(target.build()).intValue());
++        assertEquals(9, target.build().getAsInt("archived.foo.bar", null).intValue());
++
++        target = Settings.builder().put(currentSettings);
++        update = Settings.builder();
++        assertTrue(service.updateDynamicSettings(Settings.builder().putNull("*").build(),
++            target, update, "node"));
++        assertEquals(1, dynamicSetting.get(target.build()).intValue());
++        assertEquals(6, staticSetting.get(target.build()).intValue());
++        assertNull(target.build().getAsInt("archived.foo.bar", null));
++    }
++
+     public void testAddConsumer() {
+         Setting<Integer> testSetting = Setting.intSetting("foo.bar", 1, Property.Dynamic, Property.NodeScope);
+         Setting<Integer> testSetting2 = Setting.intSetting("foo.bar.baz", 1, Property.Dynamic, Property.NodeScope);

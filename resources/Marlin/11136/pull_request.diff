@@ -1,0 +1,605 @@
+diff --git a/Marlin/planner.cpp b/Marlin/planner.cpp
+index 4fce464099c..d6337220ff2 100644
+--- a/Marlin/planner.cpp
++++ b/Marlin/planner.cpp
+@@ -93,11 +93,12 @@ Planner planner;
+  * A ring buffer of moves described in steps
+  */
+ block_t Planner::block_buffer[BLOCK_BUFFER_SIZE];
+-volatile uint8_t Planner::block_buffer_head,  // Index of the next block to be pushed
+-                 Planner::block_buffer_tail;  // Index of the busy block, if any
+-uint16_t Planner::cleaning_buffer_counter;    // A counter to disable queuing of blocks
+-uint8_t Planner::delay_before_delivering,     // This counter delays delivery of blocks when queue becomes empty to allow the opportunity of merging blocks
+-        Planner::block_buffer_planned;        // Index of the optimally planned block
++volatile uint8_t Planner::block_buffer_head,    // Index of the next block to be pushed
++                 Planner::block_buffer_nonbusy, // Index of the first non-busy block
++                 Planner::block_buffer_planned, // Index of the optimally planned block
++                 Planner::block_buffer_tail;    // Index of the busy block, if any
++uint16_t Planner::cleaning_buffer_counter;      // A counter to disable queuing of blocks
++uint8_t Planner::delay_before_delivering;       // This counter delays delivery of blocks when queue becomes empty to allow the opportunity of merging blocks
+ 
+ uint32_t Planner::max_acceleration_mm_per_s2[XYZE_N],    // (mm/s^2) M201 XYZE
+          Planner::max_acceleration_steps_per_s2[XYZE_N], // (steps/s^2) Derived from mm_per_s2
+@@ -229,7 +230,6 @@ void Planner::init() {
+     bed_level_matrix.set_to_identity();
+   #endif
+   clear_block_buffer();
+-  block_buffer_planned = 0;
+   delay_before_delivering = 0;
+ }
+ 
+@@ -678,6 +678,7 @@ void Planner::init() {
+     // Return the result
+     return r11 | (uint16_t(r12) << 8) | (uint32_t(r13) << 16);
+   }
++
+ #endif // S_CURVE_ACCELERATION
+ 
+ #define MINIMAL_STEP_RATE 120
+@@ -685,6 +686,12 @@ void Planner::init() {
+ /**
+  * Calculate trapezoid parameters, multiplying the entry- and exit-speeds
+  * by the provided factors.
++ **
++ * ############ VERY IMPORTANT ############
++ * NOTE that the PRECONDITION to call this function is that the block is
++ * NOT BUSY and it is marked as RECALCULATE. That WARRANTIES the Stepper ISR
++ * is not and will not use the block while we modify it, so it is safe to
++ * alter its values.
+  */
+ void Planner::calculate_trapezoid_for_block(block_t* const block, const float &entry_factor, const float &exit_factor) {
+ 
+@@ -726,9 +733,6 @@ void Planner::calculate_trapezoid_for_block(block_t* const block, const float &e
+       cruise_rate = block->nominal_rate;
+   #endif
+ 
+-  // block->accelerate_until = accelerate_steps;
+-  // block->decelerate_after = accelerate_steps+plateau_steps;
+-
+   #if ENABLED(S_CURVE_ACCELERATION)
+     // Jerk controlled speed requires to express speed versus time, NOT steps
+     uint32_t acceleration_time = ((float)(cruise_rate - initial_rate) / accel) * (STEPPER_TIMER_RATE),
+@@ -737,32 +741,20 @@ void Planner::calculate_trapezoid_for_block(block_t* const block, const float &e
+     // And to offload calculations from the ISR, we also calculate the inverse of those times here
+     uint32_t acceleration_time_inverse = get_period_inverse(acceleration_time);
+     uint32_t deceleration_time_inverse = get_period_inverse(deceleration_time);
+-
+   #endif
+ 
+-  // Fill variables used by the stepper in a critical section
+-  const bool was_enabled = STEPPER_ISR_ENABLED();
+-  if (was_enabled) DISABLE_STEPPER_DRIVER_INTERRUPT();
+-
+-  // Don't update variables if block is busy; it is being interpreted by the planner.
+-  // If this happens, there's a problem... The block speed is inconsistent. Some values
+-  // have already been updated, but the Stepper ISR is already using the block. Fortunately,
+-  // the values being used by the Stepper ISR weren't touched, so just stop here...
+-  // TODO: There may be a way to update a running block, depending on the stepper ISR position.
+-  if (!TEST(block->flag, BLOCK_BIT_BUSY)) {
+-    block->accelerate_until = accelerate_steps;
+-    block->decelerate_after = accelerate_steps + plateau_steps;
+-    block->initial_rate = initial_rate;
+-    #if ENABLED(S_CURVE_ACCELERATION)
+-      block->acceleration_time = acceleration_time;
+-      block->deceleration_time = deceleration_time;
+-      block->acceleration_time_inverse = acceleration_time_inverse;
+-      block->deceleration_time_inverse = deceleration_time_inverse;
+-      block->cruise_rate = cruise_rate;
+-    #endif
+-    block->final_rate = final_rate;
+-  }
+-  if (was_enabled) ENABLE_STEPPER_DRIVER_INTERRUPT();
++  // Store new block parameters
++  block->accelerate_until = accelerate_steps;
++  block->decelerate_after = accelerate_steps + plateau_steps;
++  block->initial_rate = initial_rate;
++  #if ENABLED(S_CURVE_ACCELERATION)
++    block->acceleration_time = acceleration_time;
++    block->deceleration_time = deceleration_time;
++    block->acceleration_time_inverse = acceleration_time_inverse;
++    block->deceleration_time_inverse = deceleration_time_inverse;
++    block->cruise_rate = cruise_rate;
++  #endif
++  block->final_rate = final_rate;
+ }
+ 
+ /*                            PLANNER SPEED DEFINITION
+@@ -813,7 +805,7 @@ void Planner::calculate_trapezoid_for_block(block_t* const block, const float &e
+       streaming operating conditions. Use for planning optimizations by avoiding recomputing parts of the
+       planner buffer that don't change with the addition of a new block, as describe above. In addition,
+       this block can never be less than block_buffer_tail and will always be pushed forward and maintain
+-      this requirement when encountered by the plan_discard_current_block() routine during a cycle.
++      this requirement when encountered by the Planner::discard_current_block() routine during a cycle.
+ 
+   NOTE: Since the planner only computes on what's in the planner buffer, some motions with lots of short
+   line segments, like G2/3 arcs or complex curves, may seem to move slow. This is because there simply isn't
+@@ -857,8 +849,19 @@ void Planner::reverse_pass_kernel(block_t* const current, const block_t * const
+         // ISR does not consume the block before being recalculated
+         SBI(current->flag, BLOCK_BIT_RECALCULATE);
+ 
+-        // Set the new entry speed
+-        current->entry_speed_sqr = new_entry_speed_sqr;
++        // But there is an inherent race condition here, as the block may have
++        // become BUSY just before being marked RECALCULATE, so check for that!
++        if (stepper.is_block_busy(current)) {
++          // Block became busy. Clear the RECALCULATE flag (no point in
++          // recalculating BUSY blocks). And don't set its speed, as it can't
++          // be updated at this time.
++          CBI(current->flag, BLOCK_BIT_RECALCULATE);
++        }
++        else {
++          // Block is not BUSY so this is ahead of the Stepper ISR:
++          // Just Set the new entry speed.
++          current->entry_speed_sqr = new_entry_speed_sqr;
++        }
+       }
+     }
+   }
+@@ -884,12 +887,11 @@ void Planner::reverse_pass() {
+   // Reverse Pass: Coarsely maximize all possible deceleration curves back-planning from the last
+   // block in buffer. Cease planning when the last optimal planned or tail pointer is reached.
+   // NOTE: Forward pass will later refine and correct the reverse pass to create an optimal plan.
+-  block_t *current;
+   const block_t *next = NULL;
+   while (block_index != planned_block_index) {
+ 
+     // Perform the reverse pass
+-    current = &block_buffer[block_index];
++    block_t *current = &block_buffer[block_index];
+ 
+     // Only consider non sync blocks
+     if (!TEST(current->flag, BLOCK_BIT_SYNC_POSITION)) {
+@@ -899,6 +901,18 @@ void Planner::reverse_pass() {
+ 
+     // Advance to the next
+     block_index = prev_block_index(block_index);
++
++    // The ISR could advance the block_buffer_planned while we were doing the reverse pass.
++    // We must try to avoid using an already consumed block as the last one - So follow
++    // changes to the pointer and make sure to limit the loop to the currently busy block
++    while (planned_block_index != block_buffer_planned) {
++
++      // If we reached the busy block or an already processed block, break the loop now
++      if (block_index == planned_block_index) return;
++
++      // Advance the pointer, following the busy block
++      planned_block_index = next_block_index(planned_block_index);
++    }
+   }
+ }
+ 
+@@ -922,11 +936,24 @@ void Planner::forward_pass_kernel(const block_t* const previous, block_t* const
+         // so the stepper ISR does not consume the block before being recalculated
+         SBI(current->flag, BLOCK_BIT_RECALCULATE);
+ 
+-        // Always <= max_entry_speed_sqr. Backward pass sets this.
+-        current->entry_speed_sqr = new_entry_speed_sqr; // Always <= max_entry_speed_sqr. Backward pass sets this.
++        // But there is an inherent race condition here, as the block maybe
++        // became BUSY, just before it was marked as RECALCULATE, so check
++        // if that is the case!
++        if (stepper.is_block_busy(current)) {
++          // Block became busy. Clear the RECALCULATE flag (no point in
++          //  recalculating BUSY blocks and don't set its speed, as it can't
++          //  be updated at this time.
++          CBI(current->flag, BLOCK_BIT_RECALCULATE);
++        }
++        else {
++          // Block is not BUSY, we won the race against the Stepper ISR:
++
++          // Always <= max_entry_speed_sqr. Backward pass sets this.
++          current->entry_speed_sqr = new_entry_speed_sqr; // Always <= max_entry_speed_sqr. Backward pass sets this.
+ 
+-        // Set optimal plan pointer.
+-        block_buffer_planned = block_index;
++          // Set optimal plan pointer.
++          block_buffer_planned = block_index;
++        }
+       }
+     }
+ 
+@@ -963,7 +990,13 @@ void Planner::forward_pass() {
+ 
+     // Skip SYNC blocks
+     if (!TEST(current->flag, BLOCK_BIT_SYNC_POSITION)) {
+-      forward_pass_kernel(previous, current, block_index);
++      // If there's no previous block or the previous block is not
++      // BUSY (thus, modifiable) run the forward_pass_kernel. Otherwise,
++      // the previous block became BUSY, so assume the current block's
++      // entry speed can't be altered (since that would also require
++      // updating the exit speed of the previous block).
++      if (!previous || !stepper.is_block_busy(previous))
++        forward_pass_kernel(previous, current, block_index);
+       previous = current;
+     }
+     // Advance to the previous
+@@ -978,16 +1011,15 @@ void Planner::forward_pass() {
+  */
+ void Planner::recalculate_trapezoids() {
+   // The tail may be changed by the ISR so get a local copy.
+-  uint8_t block_index = block_buffer_tail;
+-
+-  // As there could be a sync block in the head of the queue, and the next loop must not
+-  // recalculate the head block (as it needs to be specially handled), scan backwards until
+-  // we find the first non SYNC block
+-  uint8_t head_block_index = block_buffer_head;
++  uint8_t block_index = block_buffer_tail,
++          head_block_index = block_buffer_head;
++  // Since there could be a sync block in the head of the queue, and the
++  // next loop must not recalculate the head block (as it needs to be
++  // specially handled), scan backwards to the first non-SYNC block.
+   while (head_block_index != block_index) {
+ 
+     // Go back (head always point to the first free block)
+-    uint8_t prev_index = prev_block_index(head_block_index);
++    const uint8_t prev_index = prev_block_index(head_block_index);
+ 
+     // Get the pointer to the block
+     block_t *prev = &block_buffer[prev_index];
+@@ -997,7 +1029,7 @@ void Planner::recalculate_trapezoids() {
+ 
+     // Examine the previous block. This and all following are SYNC blocks
+     head_block_index = prev_index;
+-  };
++  }
+ 
+   // Go from the tail (currently executed block) to the first block, without including it)
+   block_t *current = NULL, *next = NULL;
+@@ -1019,17 +1051,24 @@ void Planner::recalculate_trapezoids() {
+           // RECALCULATE yet, but the next one is. That's the reason for the following line.
+           SBI(current->flag, BLOCK_BIT_RECALCULATE);
+ 
+-          // NOTE: Entry and exit factors always > 0 by all previous logic operations.
+-          const float current_nominal_speed = SQRT(current->nominal_speed_sqr),
+-                      nomr = 1.0 / current_nominal_speed;
+-          calculate_trapezoid_for_block(current, current_entry_speed * nomr, next_entry_speed * nomr);
+-          #if ENABLED(LIN_ADVANCE)
+-            if (current->use_advance_lead) {
+-              const float comp = current->e_D_ratio * extruder_advance_K * axis_steps_per_mm[E_AXIS];
+-              current->max_adv_steps = current_nominal_speed * comp;
+-              current->final_adv_steps = next_entry_speed * comp;
+-            }
+-          #endif
++          // But there is an inherent race condition here, as the block maybe
++          // became BUSY, just before it was marked as RECALCULATE, so check
++          // if that is the case!
++          if (!stepper.is_block_busy(current)) {
++            // Block is not BUSY, we won the race against the Stepper ISR:
++
++            // NOTE: Entry and exit factors always > 0 by all previous logic operations.
++            const float current_nominal_speed = SQRT(current->nominal_speed_sqr),
++                        nomr = 1.0 / current_nominal_speed;
++            calculate_trapezoid_for_block(current, current_entry_speed * nomr, next_entry_speed * nomr);
++            #if ENABLED(LIN_ADVANCE)
++              if (current->use_advance_lead) {
++                const float comp = current->e_D_ratio * extruder_advance_K * axis_steps_per_mm[E_AXIS];
++                current->max_adv_steps = current_nominal_speed * comp;
++                current->final_adv_steps = next_entry_speed * comp;
++              }
++            #endif
++          }
+ 
+           // Reset current only to ensure next trapezoid is computed - The
+           // stepper is free to use the block from now on.
+@@ -1052,16 +1091,23 @@ void Planner::recalculate_trapezoids() {
+     // marked as RECALCULATE yet. That's the reason for the following line.
+     SBI(next->flag, BLOCK_BIT_RECALCULATE);
+ 
+-    const float next_nominal_speed = SQRT(next->nominal_speed_sqr),
+-                nomr = 1.0 / next_nominal_speed;
+-    calculate_trapezoid_for_block(next, next_entry_speed * nomr, (MINIMUM_PLANNER_SPEED) * nomr);
+-    #if ENABLED(LIN_ADVANCE)
+-      if (next->use_advance_lead) {
+-        const float comp = next->e_D_ratio * extruder_advance_K * axis_steps_per_mm[E_AXIS];
+-        next->max_adv_steps = next_nominal_speed * comp;
+-        next->final_adv_steps = (MINIMUM_PLANNER_SPEED) * comp;
+-      }
+-    #endif
++    // But there is an inherent race condition here, as the block maybe
++    // became BUSY, just before it was marked as RECALCULATE, so check
++    // if that is the case!
++    if (!stepper.is_block_busy(current)) {
++      // Block is not BUSY, we won the race against the Stepper ISR:
++
++      const float next_nominal_speed = SQRT(next->nominal_speed_sqr),
++                  nomr = 1.0 / next_nominal_speed;
++      calculate_trapezoid_for_block(next, next_entry_speed * nomr, (MINIMUM_PLANNER_SPEED) * nomr);
++      #if ENABLED(LIN_ADVANCE)
++        if (next->use_advance_lead) {
++          const float comp = next->e_D_ratio * extruder_advance_K * axis_steps_per_mm[E_AXIS];
++          next->max_adv_steps = next_nominal_speed * comp;
++          next->final_adv_steps = (MINIMUM_PLANNER_SPEED) * comp;
++        }
++      #endif
++    }
+ 
+     // Reset next only to ensure its trapezoid is computed - The stepper is free to use
+     // the block from now on.
+@@ -1405,7 +1451,7 @@ void Planner::quick_stop() {
+   if (was_enabled) DISABLE_STEPPER_DRIVER_INTERRUPT();
+ 
+   // Drop all queue entries
+-  block_buffer_planned = block_buffer_head = block_buffer_tail;
++  block_buffer_nonbusy = block_buffer_planned = block_buffer_head = block_buffer_tail;
+ 
+   // Restart the block delay for the first movement - As the queue was
+   // forced to empty, there's no risk the ISR will touch this.
+@@ -1888,7 +1934,8 @@ bool Planner::_populate_block(block_t * const block, bool split_move,
+   // Example: At 120mm/s a 60mm move takes 0.5s. So this will give 2.0.
+   float inverse_secs = fr_mm_s * inverse_millimeters;
+ 
+-  const uint8_t moves_queued = movesplanned();
++  // Get the number of non busy movements in queue (non busy means that they can be altered)
++  const uint8_t moves_queued = nonbusy_movesplanned();
+ 
+   // Slow down when the buffer starts to empty, rather than wait at the corner for a buffer refill
+   #if ENABLED(SLOWDOWN) || ENABLED(ULTRA_LCD) || defined(XY_FREQUENCY_LIMIT)
+diff --git a/Marlin/planner.h b/Marlin/planner.h
+index cedf8e41c1e..c935f7e3d16 100644
+--- a/Marlin/planner.h
++++ b/Marlin/planner.h
+@@ -49,9 +49,6 @@ enum BlockFlagBit : char {
+   // from a safe speed (in consideration of jerking from zero speed).
+   BLOCK_BIT_NOMINAL_LENGTH,
+ 
+-  // The block is busy, being interpreted by the stepper ISR
+-  BLOCK_BIT_BUSY,
+-
+   // The block is segment 2+ of a longer move
+   BLOCK_BIT_CONTINUED,
+ 
+@@ -62,7 +59,6 @@ enum BlockFlagBit : char {
+ enum BlockFlag : char {
+   BLOCK_FLAG_RECALCULATE          = _BV(BLOCK_BIT_RECALCULATE),
+   BLOCK_FLAG_NOMINAL_LENGTH       = _BV(BLOCK_BIT_NOMINAL_LENGTH),
+-  BLOCK_FLAG_BUSY                 = _BV(BLOCK_BIT_BUSY),
+   BLOCK_FLAG_CONTINUED            = _BV(BLOCK_BIT_CONTINUED),
+   BLOCK_FLAG_SYNC_POSITION        = _BV(BLOCK_BIT_SYNC_POSITION)
+ };
+@@ -78,7 +74,7 @@ enum BlockFlag : char {
+  */
+ typedef struct {
+ 
+-  uint8_t flag;                             // Block flags (See BlockFlag enum above)
++  volatile uint8_t flag;                    // Block flags (See BlockFlag enum above) - Modified by ISR and main thread!
+ 
+   // Fields used by the motion planner to manage acceleration
+   float nominal_speed_sqr,                  // The nominal speed for this block in (mm/sec)^2
+@@ -170,10 +166,12 @@ class Planner {
+      */
+     static block_t block_buffer[BLOCK_BUFFER_SIZE];
+     static volatile uint8_t block_buffer_head,      // Index of the next block to be pushed
++                            block_buffer_nonbusy,   // Index of the first non busy block
++                            block_buffer_planned,   // Index of the optimally planned block
+                             block_buffer_tail;      // Index of the busy block, if any
+     static uint16_t cleaning_buffer_counter;        // A counter to disable queuing of blocks
+-    static uint8_t delay_before_delivering,         // This counter delays delivery of blocks when queue becomes empty to allow the opportunity of merging blocks
+-                   block_buffer_planned;            // Index of the optimally planned block
++    static uint8_t delay_before_delivering;         // This counter delays delivery of blocks when queue becomes empty to allow the opportunity of merging blocks
++
+ 
+     #if ENABLED(DISTINCT_E_FACTORS)
+       static uint8_t last_extruder;                 // Respond to extruder change
+@@ -438,11 +436,14 @@ class Planner {
+       #define ARG_Z const float &rz
+     #endif
+ 
+-    // Number of moves currently in the planner
++    // Number of moves currently in the planner including the busy block, if any
+     FORCE_INLINE static uint8_t movesplanned() { return BLOCK_MOD(block_buffer_head - block_buffer_tail); }
+ 
++    // Number of nonbusy moves currently in the planner
++    FORCE_INLINE static uint8_t nonbusy_movesplanned() { return BLOCK_MOD(block_buffer_head - block_buffer_nonbusy); }
++
+     // Remove all blocks from the buffer
+-    FORCE_INLINE static void clear_block_buffer() { block_buffer_head = block_buffer_tail = 0; }
++    FORCE_INLINE static void clear_block_buffer() { block_buffer_nonbusy = block_buffer_planned = block_buffer_head = block_buffer_tail = 0; }
+ 
+     // Check if movement queue is full
+     FORCE_INLINE static bool is_full() { return block_buffer_tail == next_block_index(block_buffer_head); }
+@@ -644,7 +645,7 @@ class Planner {
+     static block_t* get_current_block() {
+ 
+       // Get the number of moves in the planner queue so far
+-      uint8_t nr_moves = movesplanned();
++      const uint8_t nr_moves = movesplanned();
+ 
+       // If there are any moves queued ...
+       if (nr_moves) {
+@@ -668,8 +669,14 @@ class Planner {
+           block_buffer_runtime_us -= block->segment_time_us; // We can't be sure how long an active block will take, so don't count it.
+         #endif
+ 
+-        // Mark the block as busy, so the planner does not attempt to replan it
+-        SBI(block->flag, BLOCK_BIT_BUSY);
++        // As this block is busy, advance the nonbusy block pointer
++        block_buffer_nonbusy = next_block_index(block_buffer_tail);
++
++        // Push block_buffer_planned pointer, if encountered.
++        if (block_buffer_tail == block_buffer_planned)
++          block_buffer_planned = block_buffer_nonbusy;
++
++        // Return the block
+         return block;
+       }
+ 
+@@ -687,27 +694,18 @@ class Planner {
+      * NB: There MUST be a current block to call this function!!
+      */
+     FORCE_INLINE static void discard_current_block() {
+-      if (has_blocks_queued()) { // Discard non-empty buffer.
+-        uint8_t block_index = next_block_index(block_buffer_tail);
+-
+-        // Push block_buffer_planned pointer, if encountered.
+-        if (!has_blocks_queued()) block_buffer_planned = block_index;
+-
+-        block_buffer_tail = block_index;
+-      }
++      if (has_blocks_queued())
++        block_buffer_tail = next_block_index(block_buffer_tail);
+     }
+ 
+     #if ENABLED(ULTRA_LCD)
+ 
+       static uint16_t block_buffer_runtime() {
+-        // Protect the access to the variable. Only required for AVR, as
+-        //  any 32bit CPU offers atomic access to 32bit variables
+         bool was_enabled = STEPPER_ISR_ENABLED();
+         if (was_enabled) DISABLE_STEPPER_DRIVER_INTERRUPT();
+ 
+         millis_t bbru = block_buffer_runtime_us;
+ 
+-        // Reenable Stepper ISR
+         if (was_enabled) ENABLE_STEPPER_DRIVER_INTERRUPT();
+ 
+         // To translate µs to ms a division by 1000 would be required.
+@@ -720,14 +718,11 @@ class Planner {
+       }
+ 
+       static void clear_block_buffer_runtime() {
+-        // Protect the access to the variable. Only required for AVR, as
+-        //  any 32bit CPU offers atomic access to 32bit variables
+         bool was_enabled = STEPPER_ISR_ENABLED();
+         if (was_enabled) DISABLE_STEPPER_DRIVER_INTERRUPT();
+ 
+         block_buffer_runtime_us = 0;
+ 
+-        // Reenable Stepper ISR
+         if (was_enabled) ENABLE_STEPPER_DRIVER_INTERRUPT();
+       }
+ 
+diff --git a/Marlin/stepper.cpp b/Marlin/stepper.cpp
+index 6805591931c..eb474f9fd57 100644
+--- a/Marlin/stepper.cpp
++++ b/Marlin/stepper.cpp
+@@ -96,8 +96,6 @@ Stepper stepper; // Singleton
+ 
+ // public:
+ 
+-block_t* Stepper::current_block = NULL;  // A pointer to the block currently being traced
+-
+ #if ENABLED(X_DUAL_ENDSTOPS) || ENABLED(Y_DUAL_ENDSTOPS) || ENABLED(Z_DUAL_ENDSTOPS)
+   bool Stepper::homing_dual_axis = false;
+ #endif
+@@ -108,6 +106,8 @@ block_t* Stepper::current_block = NULL;  // A pointer to the block currently bei
+ 
+ // private:
+ 
++block_t* Stepper::current_block = NULL; // A pointer to the block currently being traced
++
+ uint8_t Stepper::last_direction_bits = 0,
+         Stepper::axis_did_move;
+ 
+@@ -1128,6 +1128,8 @@ HAL_STEP_TIMER_ISR {
+ #define STEP_MULTIPLY(A,B) MultiU24X32toH16(A, B)
+ 
+ void Stepper::isr() {
++  DISABLE_ISRS();
++
+   // Program timer compare for the maximum period, so it does NOT
+   // flag an interrupt while this ISR is running - So changes from small
+   // periods to big periods are respected and the timer does not reset to 0
+@@ -1615,6 +1617,7 @@ uint32_t Stepper::stepper_block_phase_isr() {
+       acceleration_time = deceleration_time = 0;
+ 
+       uint8_t oversampling = 0;                         // Assume we won't use it
++
+       #if ENABLED(ADAPTIVE_STEP_SMOOTHING)
+         // At this point, we must decide if we can use Stepper movement axis smoothing.
+         uint32_t max_rate = current_block->nominal_rate;  // Get the maximum rate (maximum event speed)
+@@ -1824,6 +1827,29 @@ uint32_t Stepper::stepper_block_phase_isr() {
+   }
+ #endif // LIN_ADVANCE
+ 
++// Check if the given block is busy or not - Must not be called from ISR contexts
++// The current_block could change in the middle of the read by an Stepper ISR, so
++// we must explicitly prevent that!
++bool Stepper::is_block_busy(const block_t* const block) {
++  #define sw_barrier() asm volatile("": : :"memory");
++
++  // Keep reading until 2 consecutive reads return the same value,
++  // meaning there was no update in-between caused by an interrupt.
++  // This works because stepper ISRs happen at a slower rate than
++  // successive reads of a variable, so 2 consecutive reads with
++  // the same value means no interrupt updated it.
++  block_t* vold, *vnew = current_block;
++  sw_barrier();
++  do {
++    vold = vnew;
++    vnew = current_block;
++    sw_barrier();
++  } while (vold != vnew);
++
++  // Return if the block is busy or not
++  return block == vnew;
++}
++
+ void Stepper::init() {
+ 
+   // Init Digipot Motor Current
+@@ -2021,7 +2047,9 @@ void Stepper::_set_position(const int32_t &a, const int32_t &b, const int32_t &c
+ int32_t Stepper::position(const AxisEnum axis) {
+   const bool was_enabled = STEPPER_ISR_ENABLED();
+   if (was_enabled) DISABLE_STEPPER_DRIVER_INTERRUPT();
++
+   const int32_t v = count_position[axis];
++
+   if (was_enabled) ENABLE_STEPPER_DRIVER_INTERRUPT();
+   return v;
+ }
+@@ -2059,8 +2087,11 @@ void Stepper::endstop_triggered(const AxisEnum axis) {
+ int32_t Stepper::triggered_position(const AxisEnum axis) {
+   const bool was_enabled = STEPPER_ISR_ENABLED();
+   if (was_enabled) DISABLE_STEPPER_DRIVER_INTERRUPT();
++
+   const int32_t v = endstops_trigsteps[axis];
++
+   if (was_enabled) ENABLE_STEPPER_DRIVER_INTERRUPT();
++
+   return v;
+ }
+ 
+diff --git a/Marlin/stepper.h b/Marlin/stepper.h
+index 4526e5d8b62..f8f754fdb5a 100644
+--- a/Marlin/stepper.h
++++ b/Marlin/stepper.h
+@@ -226,8 +226,6 @@ class Stepper {
+ 
+   public:
+ 
+-    static block_t* current_block;  // A pointer to the block currently being traced
+-
+     #if ENABLED(X_DUAL_ENDSTOPS) || ENABLED(Y_DUAL_ENDSTOPS) || ENABLED(Z_DUAL_ENDSTOPS)
+       static bool homing_dual_axis;
+     #endif
+@@ -241,6 +239,8 @@ class Stepper {
+ 
+   private:
+ 
++    static block_t* current_block;          // A pointer to the block currently being traced
++
+     static uint8_t last_direction_bits,     // The next stepping-bits to be output
+                    axis_did_move;           // Last Movement in the given direction is not null, as computed when the last movement was fetched from planner
+ 
+@@ -350,6 +350,9 @@ class Stepper {
+       static uint32_t advance_isr();
+     #endif
+ 
++    // Check if the given block is busy or not - Must not be called from ISR contexts
++    static bool is_block_busy(const block_t* const block);
++
+     // Get the position of a stepper, in steps
+     static int32_t position(const AxisEnum axis);
+ 
+@@ -432,9 +435,12 @@ class Stepper {
+ 
+     inline static void set_position(const AxisEnum a, const int32_t &v) {
+       planner.synchronize();
++
+       const bool was_enabled = STEPPER_ISR_ENABLED();
+       if (was_enabled) DISABLE_STEPPER_DRIVER_INTERRUPT();
++
+       count_position[a] = v;
++
+       if (was_enabled) ENABLE_STEPPER_DRIVER_INTERRUPT();
+     }
+ 

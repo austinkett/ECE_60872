@@ -1,0 +1,117 @@
+diff --git a/server/src/main/java/org/elasticsearch/index/engine/InternalEngine.java b/server/src/main/java/org/elasticsearch/index/engine/InternalEngine.java
+index c9d0190867dd..c112a6cd295f 100644
+--- a/server/src/main/java/org/elasticsearch/index/engine/InternalEngine.java
++++ b/server/src/main/java/org/elasticsearch/index/engine/InternalEngine.java
+@@ -102,6 +102,7 @@
+ import java.util.Arrays;
+ import java.util.HashMap;
+ import java.util.List;
++import java.util.Locale;
+ import java.util.Map;
+ import java.util.Objects;
+ import java.util.Optional;
+@@ -1406,9 +1407,19 @@ private DeleteResult deleteInLucene(Delete delete, DeletionStrategy plan) throws
+             }
+             return new DeleteResult(
+                 plan.versionOfDeletion, delete.primaryTerm(), delete.seqNo(), plan.currentlyDeleted == false);
+-        } catch (Exception ex) {
++        } catch (final Exception ex) {
++            /*
++             * Document level failures when deleting are unexpected, we likely hit something fatal such as the Lucene index being corrupt,
++             * or the Lucene document limit. We have already issued a sequence number here so this is fatal, fail the engine.
++             */
+             if (ex instanceof AlreadyClosedException == false && indexWriter.getTragicException() == null) {
+-                throw new AssertionError("delete operation should never fail at document level", ex);
++                final String reason = String.format(
++                    Locale.ROOT,
++                    "delete id[%s] origin [%s] seq#[%d] failed at the document level",
++                    delete.id(),
++                    delete.origin(),
++                    delete.seqNo());
++                failEngine(reason, ex);
+             }
+             throw ex;
+         }
+diff --git a/server/src/test/java/org/elasticsearch/index/engine/InternalEngineTests.java b/server/src/test/java/org/elasticsearch/index/engine/InternalEngineTests.java
+index c1efdc45f699..4c897c13c6b1 100644
+--- a/server/src/test/java/org/elasticsearch/index/engine/InternalEngineTests.java
++++ b/server/src/test/java/org/elasticsearch/index/engine/InternalEngineTests.java
+@@ -81,6 +81,7 @@
+ import org.elasticsearch.cluster.routing.ShardRouting;
+ import org.elasticsearch.cluster.routing.ShardRoutingState;
+ import org.elasticsearch.cluster.routing.TestShardRouting;
++import org.elasticsearch.common.CheckedBiConsumer;
+ import org.elasticsearch.common.CheckedRunnable;
+ import org.elasticsearch.common.Randomness;
+ import org.elasticsearch.common.Strings;
+@@ -5990,11 +5991,16 @@ public void testNoOpFailure() throws IOException {
+             IndexMetaData.builder(defaultSettings.getIndexMetaData()).settings(settings).build());
+         try (Store store = createStore();
+              Engine engine = createEngine((dir, iwc) -> new IndexWriter(dir, iwc) {
+-            @Override
+-            public long addDocument(Iterable<? extends IndexableField> doc) throws IOException {
+-                throw new IllegalArgumentException("fatal");
+-            }
+-        }, null, null, config(indexSettings, store, createTempDir(), NoMergePolicy.INSTANCE, null))) {
++
++                     @Override
++                     public long addDocument(Iterable<? extends IndexableField> doc) throws IOException {
++                         throw new IllegalArgumentException("fatal");
++                     }
++
++                 },
++                 null,
++                 null,
++                 config(indexSettings, store, createTempDir(), NoMergePolicy.INSTANCE, null))) {
+             final Engine.NoOp op = new Engine.NoOp(0, 0, PRIMARY, System.currentTimeMillis(), "test");
+             final IllegalArgumentException e = expectThrows(IllegalArgumentException. class, () -> engine.noOp(op));
+             assertThat(e.getMessage(), equalTo("fatal"));
+@@ -6005,4 +6011,48 @@ public long addDocument(Iterable<? extends IndexableField> doc) throws IOExcepti
+         }
+     }
+ 
++    public void testDeleteFailureSoftDeletesEnabledDocAlreadyDeleted() throws IOException {
++        runTestDeleteFailure(true, InternalEngine::delete);
++    }
++
++    public void testDeleteFailureSoftDeletesEnabled() throws IOException {
++        runTestDeleteFailure(true, (engine, op) -> {});
++    }
++
++    public void testDeleteFailureSoftDeletesDisabled() throws IOException {
++        runTestDeleteFailure(false, (engine, op) -> {});
++    }
++
++    private void runTestDeleteFailure(
++        final boolean softDeletesEnabled,
++        final CheckedBiConsumer<InternalEngine, Engine.Delete, IOException> consumer) throws IOException {
++        engine.close();
++        final Settings settings = Settings.builder()
++            .put(defaultSettings.getSettings())
++            .put(IndexSettings.INDEX_SOFT_DELETES_SETTING.getKey(), softDeletesEnabled).build();
++        final IndexSettings indexSettings = IndexSettingsModule.newIndexSettings(
++            IndexMetaData.builder(defaultSettings.getIndexMetaData()).settings(settings).build());
++        final AtomicReference<ThrowingIndexWriter> iw = new AtomicReference<>();
++        try (Store store = createStore();
++             InternalEngine engine = createEngine(
++                 (dir, iwc) -> {
++                     iw.set(new ThrowingIndexWriter(dir, iwc));
++                     return iw.get();
++                 },
++                 null,
++                 null,
++                 config(indexSettings, store, createTempDir(), NoMergePolicy.INSTANCE, null))) {
++            engine.index(new Engine.Index(newUid("0"), primaryTerm.get(), InternalEngineTests.createParsedDoc("0", null)));
++            final Engine.Delete op = new Engine.Delete("_doc", "0", newUid("0"), primaryTerm.get());
++            consumer.accept(engine, op);
++            iw.get().setThrowFailure(() -> new IllegalArgumentException("fatal"));
++            final IllegalArgumentException e = expectThrows(IllegalArgumentException. class, () -> engine.delete(op));
++            assertThat(e.getMessage(), equalTo("fatal"));
++            assertTrue(engine.isClosed.get());
++            assertThat(engine.failedEngine.get(), not(nullValue()));
++            assertThat(engine.failedEngine.get(), instanceOf(IllegalArgumentException.class));
++            assertThat(engine.failedEngine.get().getMessage(), equalTo("fatal"));
++        }
++    }
++
+ }

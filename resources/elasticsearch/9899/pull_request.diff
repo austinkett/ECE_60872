@@ -1,0 +1,175 @@
+diff --git a/src/main/java/org/elasticsearch/common/lucene/Lucene.java b/src/main/java/org/elasticsearch/common/lucene/Lucene.java
+index 3d9ccaceb526..eb01d3950e05 100644
+--- a/src/main/java/org/elasticsearch/common/lucene/Lucene.java
++++ b/src/main/java/org/elasticsearch/common/lucene/Lucene.java
+@@ -23,6 +23,7 @@
+ import org.apache.lucene.analysis.core.KeywordAnalyzer;
+ import org.apache.lucene.analysis.standard.StandardAnalyzer;
+ import org.apache.lucene.codecs.CodecUtil;
++import org.apache.lucene.codecs.lucene3x.Lucene3xSegmentInfoFormat;
+ import org.apache.lucene.index.*;
+ import org.apache.lucene.search.*;
+ import org.apache.lucene.store.*;
+@@ -40,6 +41,7 @@
+ import org.elasticsearch.index.analysis.AnalyzerScope;
+ import org.elasticsearch.index.analysis.NamedAnalyzer;
+ import org.elasticsearch.index.fielddata.IndexFieldData;
++import org.elasticsearch.index.store.Store;
+ 
+ import java.io.IOException;
+ import java.text.ParseException;
+@@ -724,4 +726,37 @@ public void delete() {
+             throw new UnsupportedOperationException("This IndexCommit does not support deletions");
+         }
+     }
++
++    /**
++     * Returns <code>true</code> iff the store contains an index that contains segments that were
++     * not upgraded to the lucene 4.x format.
++     */
++    static boolean indexNeeds3xUpgrading(Directory directory) throws IOException {
++        final String si =  SegmentInfos.getLastCommitSegmentsFileName(directory);
++        if (si != null) {
++            try (IndexInput input = directory.openInput(si, IOContext.READONCE)) {
++                return input.readInt() != CodecUtil.CODEC_MAGIC; // check if it's a 4.x commit point
++            }
++        }
++        return false;
++    }
++
++    /**
++     * Upgrades the segments metadata of the index to match a lucene 4.x index format. In particular it ensures that each
++     * segment has a .si file even if it was written with lucene 3.x
++     */
++    public static boolean upgradeLucene3xSegmentsMetadata(Directory directory) throws IOException {
++        if (indexNeeds3xUpgrading(directory)) {
++            try (final IndexWriter iw = new IndexWriter(directory, new IndexWriterConfig(Version.LATEST, Lucene.STANDARD_ANALYZER)
++                    .setMergePolicy(NoMergePolicy.INSTANCE)
++                    .setOpenMode(IndexWriterConfig.OpenMode.APPEND))) {
++                Map<String, String> commitData = iw.getCommitData(); // this is a trick to make IW to actually do a commit - we have to preserve the last committed data as well
++                // for ES to get the translog ID back
++                iw.setCommitData(commitData);
++                iw.commit();
++            }
++            return true;
++        }
++        return false;
++    }
+ }
+diff --git a/src/main/java/org/elasticsearch/index/engine/InternalEngine.java b/src/main/java/org/elasticsearch/index/engine/InternalEngine.java
+index 85d96e4a2d48..f0b24598198c 100644
+--- a/src/main/java/org/elasticsearch/index/engine/InternalEngine.java
++++ b/src/main/java/org/elasticsearch/index/engine/InternalEngine.java
+@@ -26,8 +26,7 @@
+ import org.apache.lucene.search.Query;
+ import org.apache.lucene.search.SearcherFactory;
+ import org.apache.lucene.search.SearcherManager;
+-import org.apache.lucene.store.AlreadyClosedException;
+-import org.apache.lucene.store.LockObtainFailedException;
++import org.apache.lucene.store.*;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.IOUtils;
+ import org.elasticsearch.ElasticsearchException;
+@@ -50,6 +49,7 @@
+ import org.elasticsearch.index.merge.policy.MergePolicyProvider;
+ import org.elasticsearch.index.merge.scheduler.MergeSchedulerProvider;
+ import org.elasticsearch.index.search.nested.IncludeNestedDocsQuery;
++import org.elasticsearch.index.store.Store;
+ import org.elasticsearch.index.translog.Translog;
+ import org.elasticsearch.indices.IndicesWarmer;
+ import org.elasticsearch.threadpool.ThreadPool;
+@@ -114,6 +114,11 @@ public InternalEngine(EngineConfig engineConfig) throws EngineException {
+         SearcherManager manager = null;
+         boolean success = false;
+         try {
++            try {
++                upgrade3xSegments(store);
++            } catch (IOException ex) {
++                throw new EngineCreationFailureException(shardId, "failed to upgrade 3x segments", ex);
++            }
+             this.onGoingRecoveries = new FlushingRecoveryCounter(this, store, logger);
+             this.lastDeleteVersionPruneTimeMSec = engineConfig.getThreadPool().estimatedTimeInMillis();
+             this.indexingService = engineConfig.getIndexingService();
+@@ -1025,6 +1030,19 @@ public void warm(AtomicReader reader) throws IOException {
+         }
+     }
+ 
++    protected void upgrade3xSegments(Store store) throws IOException {
++        store.incRef();
++        try {
++            if (Lucene.upgradeLucene3xSegmentsMetadata(store.directory())) {
++                logger.debug("upgraded pending 3.x segments on startup");
++            } else {
++                logger.debug("no 3.x segments needed upgrading");
++            }
++        } finally {
++            store.decRef();
++        }
++    }
++
+     /** Extended SearcherFactory that warms the segments if needed when acquiring a new searcher */
+     class SearchFactory extends EngineSearcherFactory {
+ 
+diff --git a/src/test/java/org/elasticsearch/common/lucene/LuceneTest.java b/src/test/java/org/elasticsearch/common/lucene/LuceneTest.java
+index cf46880b5d74..f902fac0ad1f 100644
+--- a/src/test/java/org/elasticsearch/common/lucene/LuceneTest.java
++++ b/src/test/java/org/elasticsearch/common/lucene/LuceneTest.java
+@@ -24,12 +24,18 @@
+ import org.apache.lucene.index.*;
+ import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.search.TermQuery;
++import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.MockDirectoryWrapper;
++import org.apache.lucene.util.TestUtil;
+ import org.apache.lucene.util.Version;
++import org.elasticsearch.index.engine.InternalEngine;
++import org.elasticsearch.index.translog.Translog;
+ import org.elasticsearch.test.ElasticsearchLuceneTestCase;
+ import org.junit.Test;
+ 
++import java.io.File;
+ import java.io.IOException;
++import java.net.URISyntaxException;
+ import java.util.HashSet;
+ import java.util.Set;
+ 
+@@ -204,4 +210,39 @@ public void testFiles() throws IOException {
+         dir.close();
+ 
+     }
++
++    public void testNeedsUpgrading() throws URISyntaxException, IOException {
++        OLD_FORMAT_IMPERSONATION_IS_ACTIVE = false;
++        File indexDir = createTempDir();
++        File backwardsIndex = new File(getClass().getResource("/org/elasticsearch/bwcompat/index-0.20.6.zip").toURI());
++        TestUtil.unzip(backwardsIndex, indexDir);
++        File luceneIndex = new File(indexDir, "data/bwc_index_0.20.6/nodes/0/indices/test/0/index");
++        try (Directory dir = newFSDirectory(luceneIndex)) {
++            SegmentInfos before = Lucene.readSegmentInfos(dir);
++            assertTrue(before.getUserData().containsKey(Translog.TRANSLOG_ID_KEY));
++            String key = before.getUserData().get(Translog.TRANSLOG_ID_KEY);
++            assertNotNull(key);
++
++            for (int i = 0; i < 2; i++) {
++                assertTrue(Lucene.indexNeeds3xUpgrading(dir));
++            }
++
++            for (int i = 0; i < 2; i++) {
++                boolean upgraded = Lucene.upgradeLucene3xSegmentsMetadata(dir);
++                if (i == 0) {
++                    assertTrue(upgraded);
++                } else {
++                    assertFalse(upgraded);
++                }
++            }
++
++            for (int i = 0; i < 2; i++) {
++                assertFalse(Lucene.indexNeeds3xUpgrading(dir));
++            }
++
++            SegmentInfos after = Lucene.readSegmentInfos(dir);
++            assertEquals(after.getUserData(), before.getUserData());
++            assertEquals(key, after.getUserData().get(Translog.TRANSLOG_ID_KEY));
++        }
++    }
+ }
