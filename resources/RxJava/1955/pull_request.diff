@@ -1,0 +1,787 @@
+diff --git a/src/main/java/rx/internal/operators/OperatorOnBackpressureBlock.java b/src/main/java/rx/internal/operators/OperatorOnBackpressureBlock.java
+index bb328788e9..71a5fc4993 100644
+--- a/src/main/java/rx/internal/operators/OperatorOnBackpressureBlock.java
++++ b/src/main/java/rx/internal/operators/OperatorOnBackpressureBlock.java
+@@ -20,8 +20,8 @@
+ import java.util.concurrent.BlockingQueue;
+ 
+ import rx.Observable.Operator;
+-import rx.Producer;
+ import rx.Subscriber;
++import rx.internal.util.BackpressureDrainManager;
+ 
+ /**
+  * Operator that blocks the producer thread in case a backpressure is needed.
+@@ -38,42 +38,25 @@ public OperatorOnBackpressureBlock(int max) {
+         return s;
+     }
+     
+-    static final class BlockingSubscriber<T> extends Subscriber<T> {
++    static final class BlockingSubscriber<T> extends Subscriber<T> implements BackpressureDrainManager.BackpressureQueueCallback {
+         final NotificationLite<T> nl = NotificationLite.instance();
+         final BlockingQueue<Object> queue;
+         final Subscriber<? super T> child;
+-        /** Guarded by this. */
+-        long requestedCount;
+-        /** Guarded by this. */
+-        boolean emitting;
+-        volatile boolean terminated;
+-        /** Set before terminated, read after terminated. */
+-        Throwable exception;
++        final BackpressureDrainManager manager;
+         public BlockingSubscriber(int max, Subscriber<? super T> child) {
+             this.queue = new ArrayBlockingQueue<Object>(max);
+             this.child = child;
++            this.manager = new BackpressureDrainManager(this);
+         }
+         void init() {
+             child.add(this);
+-            child.setProducer(new Producer() {
+-                @Override
+-                public void request(long n) {
+-                    synchronized (BlockingSubscriber.this) {
+-                        if (n == Long.MAX_VALUE || requestedCount == Long.MAX_VALUE) {
+-                            requestedCount = Long.MAX_VALUE;
+-                        } else {
+-                            requestedCount += n;
+-                        }
+-                    }
+-                    drain();
+-                }
+-            });
++            child.setProducer(manager);
+         }
+         @Override
+         public void onNext(T t) {
+             try {
+                 queue.put(nl.next(t));
+-                drain();
++                manager.drain();
+             } catch (InterruptedException ex) {
+                 if (!isUnsubscribed()) {
+                     onError(ex);
+@@ -82,76 +65,31 @@ public void onNext(T t) {
+         }
+         @Override
+         public void onError(Throwable e) {
+-            if (!terminated) {
+-                exception = e;
+-                terminated = true;
+-                drain();
+-            }
++            manager.terminateAndDrain(e);
+         }
+         @Override
+         public void onCompleted() {
+-            terminated = true;
+-            drain();
++            manager.terminateAndDrain();
+         }
+-        void drain() {
+-            long n;
+-            synchronized (this) {
+-                if (emitting) {
+-                    return;
+-                }
+-                emitting = true;
+-                n = requestedCount;
+-            }
+-            boolean skipFinal = false;
+-            try {
+-                while (true) {
+-                    int emitted = 0;
+-                    while (n > 0) {
+-                        Object o = queue.poll();
+-                        if (o == null) {
+-                            if (terminated) {
+-                                if (exception != null) {
+-                                    child.onError(exception);
+-                                } else {
+-                                    child.onCompleted();
+-                                }
+-                                return;
+-                            }
+-                            break;
+-                        } else {
+-                            child.onNext(nl.getValue(o));
+-                            n--;
+-                            emitted++;
+-                        }
+-                    }
+-                    synchronized (this) {
+-                        // if no backpressure below
+-                        if (requestedCount == Long.MAX_VALUE) {
+-                            // no new data arrived since the last poll
+-                            if (queue.peek() == null) {
+-                                skipFinal = true;
+-                                emitting = false;
+-                                return;
+-                            }
+-                            n = Long.MAX_VALUE;
+-                        } else {
+-                            if (emitted == 0) {
+-                                skipFinal = true;
+-                                emitting = false;
+-                                return;
+-                            }
+-                            requestedCount -= emitted;
+-                            n = requestedCount;
+-                        }
+-                    }
+-                }
+-            } finally {
+-                if (!skipFinal) {
+-                    synchronized (this) {
+-                        emitting = false;
+-                    }
+-                }
++        @Override
++        public boolean accept(Object value) {
++            return nl.accept(child, value);
++        }
++        @Override
++        public void complete(Throwable exception) {
++            if (exception != null) {
++                child.onError(exception);
++            } else {
++                child.onCompleted();
+             }
+         }
++        @Override
++        public Object peek() {
++            return queue.peek();
++        }
++        @Override
++        public Object poll() {
++            return queue.poll();
++        }
+     }
+ }
+diff --git a/src/main/java/rx/internal/operators/OperatorOnBackpressureBuffer.java b/src/main/java/rx/internal/operators/OperatorOnBackpressureBuffer.java
+index 2ddb582f9e..e35c489d5c 100644
+--- a/src/main/java/rx/internal/operators/OperatorOnBackpressureBuffer.java
++++ b/src/main/java/rx/internal/operators/OperatorOnBackpressureBuffer.java
+@@ -15,7 +15,6 @@
+  */
+ package rx.internal.operators;
+ 
+-import java.util.Queue;
+ import java.util.concurrent.ConcurrentLinkedQueue;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.AtomicLong;
+@@ -25,11 +24,10 @@
+ import rx.Subscriber;
+ import rx.exceptions.MissingBackpressureException;
+ import rx.functions.Action0;
++import rx.internal.util.BackpressureDrainManager;
+ 
+ public class OperatorOnBackpressureBuffer<T> implements Operator<T, T> {
+ 
+-    private final NotificationLite<T> on = NotificationLite.instance();
+-
+     private final Long capacity;
+     private final Action0 onOverflow;
+ 
+@@ -52,122 +50,114 @@ public OperatorOnBackpressureBuffer(long capacity, Action0 onOverflow) {
+ 
+     @Override
+     public Subscriber<? super T> call(final Subscriber<? super T> child) {
+-        // TODO get a different queue implementation
+-        final ConcurrentLinkedQueue<Object> queue = new ConcurrentLinkedQueue<Object>();
+-        final AtomicLong capacity = (this.capacity == null) ? null : new AtomicLong(this.capacity);
+-        final AtomicLong wip = new AtomicLong();
+-        final AtomicLong requested = new AtomicLong();
+-
+-        child.setProducer(new Producer() {
+-
+-            @Override
+-            public void request(long n) {
+-                if (requested.getAndAdd(n) == 0) {
+-                    pollQueue(wip, requested, capacity, queue, child);
+-                }
+-            }
+ 
+-        });
+         // don't pass through subscriber as we are async and doing queue draining
+         // a parent being unsubscribed should not affect the children
+-        Subscriber<T> parent = new Subscriber<T>() {
++        BufferSubscriber<T> parent = new BufferSubscriber<T>(child, capacity, onOverflow);
+ 
+-            private AtomicBoolean saturated = new AtomicBoolean(false);
++        // if child unsubscribes it should unsubscribe the parent, but not the other way around
++        child.add(parent);
++        child.setProducer(parent.manager());
+ 
+-            @Override
+-            public void onStart() {
+-                request(Long.MAX_VALUE);
+-            }
++        return parent;
++    }
++    private static final class BufferSubscriber<T> extends Subscriber<T> implements BackpressureDrainManager.BackpressureQueueCallback {
++        // TODO get a different queue implementation
++        private final ConcurrentLinkedQueue<Object> queue = new ConcurrentLinkedQueue<Object>();
++        private final Long baseCapacity;
++        private final AtomicLong capacity;
++        private final Subscriber<? super T> child;
++        private final AtomicBoolean saturated = new AtomicBoolean(false);
++        private final BackpressureDrainManager manager;
++        private final NotificationLite<T> on = NotificationLite.instance();
++        private final Action0 onOverflow;
++        
++        public BufferSubscriber(final Subscriber<? super T> child, Long capacity, Action0 onOverflow) {
++            this.child = child;
++            this.baseCapacity = capacity;
++            this.capacity = capacity != null ? new AtomicLong(capacity) : null;
++            this.onOverflow = onOverflow;
++            this.manager = new BackpressureDrainManager(this);
++        }
++        @Override
++        public void onStart() {
++            request(Long.MAX_VALUE);
++        }
+ 
+-            @Override
+-            public void onCompleted() {
+-                if (!saturated.get()) {
+-                    queue.offer(on.completed());
+-                    pollQueue(wip, requested, capacity, queue, child);
+-                }
++        @Override
++        public void onCompleted() {
++            if (!saturated.get()) {
++                manager.terminateAndDrain();
+             }
++        }
+ 
+-            @Override
+-            public void onError(Throwable e) {
+-                if (!saturated.get()) {
+-                    queue.offer(on.error(e));
+-                    pollQueue(wip, requested, capacity, queue, child);
+-                }
++        @Override
++        public void onError(Throwable e) {
++            if (!saturated.get()) {
++                manager.terminateAndDrain(e);
+             }
++        }
+ 
+-            @Override
+-            public void onNext(T t) {
+-                if (!assertCapacity()) {
+-                    return;
+-                }
+-                queue.offer(on.next(t));
+-                pollQueue(wip, requested, capacity, queue, child);
++        @Override
++        public void onNext(T t) {
++            if (!assertCapacity()) {
++                return;
+             }
++            queue.offer(on.next(t));
++            manager.drain();
++        }
+ 
+-            private boolean assertCapacity() {
+-                if (capacity == null) {
+-                    return true;
+-                }
+-
+-                long currCapacity;
+-                do {
+-                    currCapacity = capacity.get();
+-                    if (currCapacity <= 0) {
+-                        if (saturated.compareAndSet(false, true)) {
+-                            unsubscribe();
+-                            child.onError(new MissingBackpressureException(
+-                                "Overflowed buffer of "
+-                                + OperatorOnBackpressureBuffer.this.capacity));
+-                            if (onOverflow != null) {
+-                                onOverflow.call();
+-                            }
+-                        }
+-                        return false;
+-                    }
+-                // ensure no other thread stole our slot, or retry
+-                } while (!capacity.compareAndSet(currCapacity, currCapacity - 1));
+-                return true;
++        @Override
++        public boolean accept(Object value) {
++            return on.accept(child, value);
++        }
++        @Override
++        public void complete(Throwable exception) {
++            if (exception != null) {
++                child.onError(exception);
++            } else {
++                child.onCompleted();
+             }
+-        };
+-        
+-        // if child unsubscribes it should unsubscribe the parent, but not the other way around
+-        child.add(parent);
++        }
++        @Override
++        public Object peek() {
++            return queue.peek();
++        }
++        @Override
++        public Object poll() {
++            Object value = queue.poll();
++            if (capacity != null && value != null) {
++                capacity.incrementAndGet();
++            }
++            return value;
++        }
+         
+-        return parent;
+-    }
++        private boolean assertCapacity() {
++            if (capacity == null) {
++                return true;
++            }
+ 
+-    private void pollQueue(AtomicLong wip, AtomicLong requested, AtomicLong capacity, Queue<Object> queue, Subscriber<? super T> child) {
+-        // TODO can we do this without putting everything in the queue first so we can fast-path the case when we don't need to queue?
+-        if (requested.get() > 0) {
+-            // only one draining at a time
+-            try {
+-                /*
+-                 * This needs to protect against concurrent execution because `request` and `on*` events can come concurrently.
+-                 */
+-                if (wip.getAndIncrement() == 0) {
+-                    while (true) {
+-                        if (requested.getAndDecrement() != 0) {
+-                            Object o = queue.poll();
+-                            if (o == null) {
+-                                // nothing in queue
+-                                requested.incrementAndGet();
+-                                return;
+-                            }
+-                            if (capacity != null) { // it's bounded
+-                                capacity.incrementAndGet();
+-                            }
+-                            on.accept(child, o);
+-                        } else {
+-                            // we hit the end ... so increment back to 0 again
+-                            requested.incrementAndGet();
+-                            return;
++            long currCapacity;
++            do {
++                currCapacity = capacity.get();
++                if (currCapacity <= 0) {
++                    if (saturated.compareAndSet(false, true)) {
++                        unsubscribe();
++                        child.onError(new MissingBackpressureException(
++                                "Overflowed buffer of "
++                                        + baseCapacity));
++                        if (onOverflow != null) {
++                            onOverflow.call();
+                         }
+                     }
++                    return false;
+                 }
+-
+-            } finally {
+-                wip.decrementAndGet();
+-            }
++                // ensure no other thread stole our slot, or retry
++            } while (!capacity.compareAndSet(currCapacity, currCapacity - 1));
++            return true;
++        }
++        protected Producer manager() {
++            return manager;
+         }
+     }
+ }
+diff --git a/src/main/java/rx/internal/util/BackpressureDrainManager.java b/src/main/java/rx/internal/util/BackpressureDrainManager.java
+new file mode 100644
+index 0000000000..f4a95573e7
+--- /dev/null
++++ b/src/main/java/rx/internal/util/BackpressureDrainManager.java
+@@ -0,0 +1,240 @@
++/**
++ * Copyright 2014 Netflix, Inc.
++ * 
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ * 
++ * http://www.apache.org/licenses/LICENSE-2.0
++ * 
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package rx.internal.util;
++
++import java.util.concurrent.atomic.AtomicLongFieldUpdater;
++
++import rx.Producer;
++import rx.annotations.Experimental;
++
++/**
++ * Manages the producer-backpressure-consumer interplay by
++ * matching up available elements with requested elements and/or
++ * terminal events. 
++ */
++@Experimental
++public final class BackpressureDrainManager implements Producer {
++    /**
++     * Interface representing the minimal callbacks required
++     * to operate the drain part of a backpressure system.
++     */
++    public interface BackpressureQueueCallback {
++        /**
++         * Override this method to peek for the next element,
++         * null meaning no next element available now.
++         * <p>It will be called plain and while holding this object's monitor.
++         * @return the next element or null if no next element available
++         */
++        Object peek();
++        /**
++         * Override this method to poll (consume) the next element,
++         * null meaning no next element available now.
++         * @return the next element or null if no next element available
++         */
++        Object poll();
++        /**
++         * Override this method to deliver an element to downstream.
++         * The logic ensures that this happens only in the right conditions.
++         * @param value the value to deliver, not null
++         * @return true indicates that one should terminate the emission loop unconditionally
++         * and not deliver any further elements or terminal events.
++         */
++        boolean accept(Object value);
++        /**
++         * Override this method to deliver a normal or exceptional
++         * terminal event.
++         * @param exception if not null, contains the terminal exception
++         */
++        void complete(Throwable exception);
++    }
++
++    /** The request counter, updated via REQUESTED_COUNTER. */
++    protected volatile long requestedCount;
++    /** Atomically updates the the requestedCount field. */ 
++    protected static final AtomicLongFieldUpdater<BackpressureDrainManager> REQUESTED_COUNT
++    = AtomicLongFieldUpdater.newUpdater(BackpressureDrainManager.class, "requestedCount");
++    /** Indicates if one is in emitting phase, guarded by this. */
++    protected boolean emitting;
++    /** Indicates a terminal state. */
++    protected volatile boolean terminated;
++    /** Indicates an error state, barrier is provided via terminated. */
++    protected Throwable exception;
++    /** The callbacks to manage the drain. */
++    protected final BackpressureQueueCallback actual;
++    /**
++     * Constructs a backpressure drain manager with 0 requesedCount,
++     * no terminal event and not emitting.
++     * @param actual he queue callback to check for new element availability
++     */
++    public BackpressureDrainManager(BackpressureQueueCallback actual) {
++        this.actual = actual;
++    }
++    /**
++     * Checks if a terminal state has been reached.
++     * @return true if a terminal state has been reached
++     */
++    public final boolean isTerminated() {
++        return terminated;
++    }
++    /**
++     * Move into a terminal state. 
++     * Call drain() anytime after.
++     */
++    public final void terminate() {
++        terminated = true;
++    }
++    /**
++     * Move into a terminal state with an exception.
++     * Call drain() anytime after.
++     * <p>Serialized access is expected with respect to
++     * element emission.
++     * @param error the exception to deliver
++     */
++    public final void terminate(Throwable error) {
++        if (!terminated) {
++            exception = error;
++            terminated = true;
++        }
++    }
++    /**
++     * Move into a terminal state and drain. 
++     */
++    public final void terminateAndDrain() {
++        terminated = true;
++        drain();
++    }
++    /**
++     * Move into a terminal state with an exception and drain.
++     * <p>Serialized access is expected with respect to
++     * element emission.
++     * @param error the exception to deliver
++     */
++    public final void terminateAndDrain(Throwable error) {
++        if (!terminated) {
++            exception = error;
++            terminated = true;
++            drain();
++        }
++    }
++    @Override
++    public final void request(long n) {
++        if (n == 0) {
++            return;
++        }
++        boolean mayDrain;
++        long r;
++        long u;
++        do {
++            r = requestedCount;
++            mayDrain = r == 0;
++            if (r == Long.MAX_VALUE) {
++                break;
++            }
++            if (n == Long.MAX_VALUE) {
++                u = n;
++                mayDrain = true;
++            } else {
++                if (r > Long.MAX_VALUE - n) {
++                    u = Long.MAX_VALUE;
++                } else {
++                    u = r + n;
++                }
++            }
++        } while (!REQUESTED_COUNT.compareAndSet(this, r, u));
++        // since we implement producer, we have to call drain
++        // on a 0-n request transition
++        if (mayDrain) {
++            drain();
++        }
++    }
++    /**
++     * Try to drain the "queued" elements and terminal events
++     * by considering the available and requested event counts.
++     */
++    public final void drain() {
++        long n;
++        boolean term;
++        synchronized (this) {
++            if (emitting) {
++                return;
++            }
++            emitting = true;
++            term = terminated;
++        }
++        n = requestedCount;
++        boolean skipFinal = false;
++        try {
++            BackpressureQueueCallback a = actual;
++            while (true) {
++                int emitted = 0;
++                while (n > 0 || term) {
++                    Object o;
++                    if (term) {
++                        o = a.peek();
++                        if (o == null) {
++                            skipFinal = true;
++                            Throwable e = exception;
++                            a.complete(e);
++                            return;
++                        }
++                        if (n == 0) {
++                            break;
++                        }
++                    }
++                    o = a.poll();
++                    if (o == null) {
++                        break;
++                    } else {
++                        if (a.accept(o)) {
++                            skipFinal = true;
++                            return;
++                        }
++                        n--;
++                        emitted++;
++                    }
++                }
++                synchronized (this) {
++                    term = terminated;
++                    boolean more = a.peek() != null;
++                    // if no backpressure below
++                    if (requestedCount == Long.MAX_VALUE) {
++                        // no new data arrived since the last poll
++                        if (!more && !term) {
++                            skipFinal = true;
++                            emitting = false;
++                            return;
++                        }
++                        n = Long.MAX_VALUE;
++                    } else {
++                        n = REQUESTED_COUNT.addAndGet(this, -emitted);
++                        if ((n == 0 || !more) && (!term || more)) {
++                            skipFinal = true;
++                            emitting = false;
++                            return;
++                        }
++                    }
++                }
++            }
++        } finally {
++            if (!skipFinal) {
++                synchronized (this) {
++                    emitting = false;
++                }
++            }
++        }
++
++    }
++}
+diff --git a/src/test/java/rx/internal/operators/OnBackpressureBlockTest.java b/src/test/java/rx/internal/operators/OnBackpressureBlockTest.java
+index b247b15e6b..47d3cebd71 100644
+--- a/src/test/java/rx/internal/operators/OnBackpressureBlockTest.java
++++ b/src/test/java/rx/internal/operators/OnBackpressureBlockTest.java
+@@ -16,11 +16,13 @@
+ 
+ package rx.internal.operators;
+ 
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
++import static org.mockito.Matchers.any;
+ import static org.mockito.Mockito.*;
+ 
+ import java.util.Arrays;
+-
+-import static org.junit.Assert.*;
++import java.util.Collections;
+ 
+ import org.junit.Test;
+ 
+@@ -34,6 +36,7 @@
+ import rx.observers.TestObserver;
+ import rx.observers.TestSubscriber;
+ import rx.schedulers.Schedulers;
++import rx.subjects.PublishSubject;
+ 
+ /**
+  * Test the onBackpressureBlock() behavior.
+@@ -161,13 +164,15 @@ public void onStart() {
+         Thread.sleep(WAIT);
+ 
+         o.assertReceivedOnNext(Arrays.asList(1, 2, 3, 4, 5, 6, 7, 8, 9, 10));
+-        o.assertNoErrors();
+-        assertTrue(o.getOnCompletedEvents().isEmpty());
++        o.assertTerminalEvent();
++        assertEquals(1, o.getOnErrorEvents().size());
++        assertTrue(o.getOnErrorEvents().get(0) instanceof TestException);
+ 
+         o.requestMore(10);
+         
+         Thread.sleep(WAIT);
+         
++        o.assertReceivedOnNext(Arrays.asList(1, 2, 3, 4, 5, 6, 7, 8, 9, 10));
+         o.assertTerminalEvent();
+         assertEquals(1, o.getOnErrorEvents().size());
+         assertTrue(o.getOnErrorEvents().get(0) instanceof TestException);
+@@ -259,4 +264,84 @@ public void testTakeWorksSubscriberRequestUnlimitedBufferedException() {
+         o.assertNoErrors();
+         o.assertTerminalEvent();
+     }
++    @Test(timeout = 10000)
++    public void testOnCompletedDoesntWaitIfNoEvents() {
++        
++        TestSubscriber<Integer> o = new TestSubscriber<Integer>() {
++            @Override
++            public void onStart() {
++                request(0); // make sure it doesn't start in unlimited mode
++            }
++        };
++        Observable.<Integer>empty().onBackpressureBlock(2).subscribe(o);
++        
++        o.assertNoErrors();
++        o.assertTerminalEvent();
++        o.assertReceivedOnNext(Collections.<Integer>emptyList());
++    }
++    @Test(timeout = 10000)
++    public void testOnCompletedDoesWaitIfEvents() {
++        
++        TestSubscriber<Integer> o = new TestSubscriber<Integer>() {
++            @Override
++            public void onStart() {
++                request(0); // make sure it doesn't start in unlimited mode
++            }
++        };
++        Observable.just(1).onBackpressureBlock(2).subscribe(o);
++        
++        o.assertReceivedOnNext(Collections.<Integer>emptyList());
++        assertTrue(o.getOnErrorEvents().isEmpty());
++        assertTrue(o.getOnCompletedEvents().isEmpty());
++    }
++    @Test(timeout = 10000)
++    public void testOnCompletedDoesntWaitIfNoEvents2() {
++        final PublishSubject<Integer> ps = PublishSubject.create();
++        TestSubscriber<Integer> o = new TestSubscriber<Integer>() {
++            @Override
++            public void onStart() {
++                request(0); // make sure it doesn't start in unlimited mode
++            }
++            @Override
++            public void onNext(Integer t) {
++                super.onNext(t);
++                ps.onCompleted(); // as if an async completion arrived while in the loop
++            }
++        };
++        ps.onBackpressureBlock(2).unsafeSubscribe(o);
++        ps.onNext(1);
++        o.requestMore(1);
++        
++        o.assertNoErrors();
++        o.assertTerminalEvent();
++        o.assertReceivedOnNext(Arrays.asList(1));
++    }
++    @Test(timeout = 10000)
++    public void testOnCompletedDoesntWaitIfNoEvents3() {
++        final PublishSubject<Integer> ps = PublishSubject.create();
++        TestSubscriber<Integer> o = new TestSubscriber<Integer>() {
++            boolean once = true;
++            @Override
++            public void onStart() {
++                request(0); // make sure it doesn't start in unlimited mode
++            }
++            @Override
++            public void onNext(Integer t) {
++                super.onNext(t);
++                if (once) {
++                    once = false;
++                    ps.onNext(2);
++                    ps.onCompleted(); // as if an async completion arrived while in the loop
++                    requestMore(1);
++                }
++            }
++        };
++        ps.onBackpressureBlock(3).unsafeSubscribe(o);
++        ps.onNext(1);
++        o.requestMore(1);
++        
++        o.assertNoErrors();
++        o.assertTerminalEvent();
++        o.assertReceivedOnNext(Arrays.asList(1, 2));
++    }
+ }
+diff --git a/src/test/java/rx/internal/operators/OperatorOnBackpressureBufferTest.java b/src/test/java/rx/internal/operators/OperatorOnBackpressureBufferTest.java
+index 34cb73cfc0..ff2d8e0c6f 100644
+--- a/src/test/java/rx/internal/operators/OperatorOnBackpressureBufferTest.java
++++ b/src/test/java/rx/internal/operators/OperatorOnBackpressureBufferTest.java
+@@ -47,7 +47,7 @@ public void testNoBackpressureSupport() {
+         ts.assertNoErrors();
+     }
+ 
+-    @Test(timeout = 500)
++    @Test(timeout = 2000)
+     public void testFixBackpressureWithBuffer() throws InterruptedException {
+         final CountDownLatch l1 = new CountDownLatch(100);
+         final CountDownLatch l2 = new CountDownLatch(150);

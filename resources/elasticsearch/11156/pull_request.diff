@@ -1,0 +1,676 @@
+diff --git a/docs/reference/search/suggesters/phrase-suggest.asciidoc b/docs/reference/search/suggesters/phrase-suggest.asciidoc
+index 311a9a75304b..073325686856 100644
+--- a/docs/reference/search/suggesters/phrase-suggest.asciidoc
++++ b/docs/reference/search/suggesters/phrase-suggest.asciidoc
+@@ -163,20 +163,18 @@ can contain misspellings (See parameter descriptions below).
+ 
+ `collate`::
+     Checks each suggestion against the specified `query` or `filter` to
+-    prune suggestions for which no matching docs exist in the index. Either
+-    a `query` or a `filter` must be specified, and it is run as a
+-    <<query-dsl-template-query,`template` query>>. The current suggestion is
+-    automatically made available as the `{{suggestion}}`  variable, which
+-    should be used in your query/filter.  You can still specify  your own
+-    template `params` -- the `suggestion` value will be added to the
+-    variables you specify. You can specify a `preference` to control
+-    on which shards the query is executed (see <<search-request-preference>>).
+-    The default value is `_only_local`. Additionally, you can specify
+-    a `prune` to control if all phrase suggestions will be
+-    returned, when set to `true` the suggestions will have an additional
+-    option `collate_match`, which will be `true` if matching documents
+-    for the phrase was found, `false` otherwise. The default value for
+-    `prune` is `false`.
++    prune suggestions for which no matching docs exist in the index.
++    The collate query for a suggestion is run only on the local shard from which
++    the suggestion has been generated from. Either a `query` or a `filter` must
++    be specified, and it is run as a <<query-dsl-template-query,`template` query>>.
++    The current suggestion is automatically made available as the `{{suggestion}}`
++    variable, which should be used in your query/filter.  You can still specify
++    your own template `params` -- the `suggestion` value will be added to the
++    variables you specify. Additionally, you can specify a `prune` to control
++    if all phrase suggestions will be returned, when set to `true` the suggestions
++    will have an additional option `collate_match`, which will be `true` if
++    matching documents for the phrase was found, `false` otherwise.
++    The default value for `prune` is `false`.
+ 
+ [source,js]
+ --------------------------------------------------
+@@ -199,8 +197,7 @@ curl -XPOST 'localhost:9200/_search' -d {
+              }
+            },
+            "params": {"field_name" : "title"}, <3>
+-           "preference": "_primary", <4>
+-           "prune": true <5>
++           "prune": true <4>
+          }
+        }
+      }
+@@ -212,8 +209,7 @@ curl -XPOST 'localhost:9200/_search' -d {
+     of each suggestion.
+ <3> An additional `field_name` variable has been specified in
+     `params` and is used by the `match` query.
+-<4> The default `preference` has been changed to `_primary`.
+-<5> All suggestions will be returned with an extra `collate_match`
++<4> All suggestions will be returned with an extra `collate_match`
+     option indicating whether the generated phrase matched any
+     document.
+ 
+diff --git a/src/main/java/org/elasticsearch/action/suggest/TransportSuggestAction.java b/src/main/java/org/elasticsearch/action/suggest/TransportSuggestAction.java
+index 7d69af266b3f..9874783ae792 100644
+--- a/src/main/java/org/elasticsearch/action/suggest/TransportSuggestAction.java
++++ b/src/main/java/org/elasticsearch/action/suggest/TransportSuggestAction.java
+@@ -130,27 +130,26 @@ protected SuggestResponse newResponse(SuggestRequest request, AtomicReferenceArr
+     protected ShardSuggestResponse shardOperation(ShardSuggestRequest request) {
+         IndexService indexService = indicesService.indexServiceSafe(request.shardId().getIndex());
+         IndexShard indexShard = indexService.shardSafe(request.shardId().id());
+-        final Engine.Searcher searcher = indexShard.acquireSearcher("suggest");
+         ShardSuggestService shardSuggestService = indexShard.shardSuggestService();
+         shardSuggestService.preSuggest();
+         long startTime = System.nanoTime();
+         XContentParser parser = null;
+-        try {
++        try (Engine.Searcher searcher = indexShard.acquireSearcher("suggest")) {
+             BytesReference suggest = request.suggest();
+             if (suggest != null && suggest.length() > 0) {
+                 parser = XContentFactory.xContent(suggest).createParser(suggest);
+                 if (parser.nextToken() != XContentParser.Token.START_OBJECT) {
+                     throw new IllegalArgumentException("suggest content missing");
+                 }
+-                final SuggestionSearchContext context = suggestPhase.parseElement().parseInternal(parser, indexService.mapperService(), request.shardId().getIndex(), request.shardId().id());
+-                final Suggest result = suggestPhase.execute(context, searcher.reader());
++                final SuggestionSearchContext context = suggestPhase.parseElement().parseInternal(parser, indexService.mapperService(),
++                        indexService.queryParserService(), request.shardId().getIndex(), request.shardId().id());
++                final Suggest result = suggestPhase.execute(context, searcher.searcher());
+                 return new ShardSuggestResponse(request.shardId(), result);
+             }
+             return new ShardSuggestResponse(request.shardId(), new Suggest());
+         } catch (Throwable ex) {
+             throw new ElasticsearchException("failed to execute suggest", ex);
+         } finally {
+-            searcher.close();
+             if (parser != null) {
+                 parser.close();
+             }
+diff --git a/src/main/java/org/elasticsearch/search/suggest/SuggestContextParser.java b/src/main/java/org/elasticsearch/search/suggest/SuggestContextParser.java
+index ce1654245ba6..98e450d1265c 100644
+--- a/src/main/java/org/elasticsearch/search/suggest/SuggestContextParser.java
++++ b/src/main/java/org/elasticsearch/search/suggest/SuggestContextParser.java
+@@ -22,8 +22,9 @@
+ 
+ import org.elasticsearch.common.xcontent.XContentParser;
+ import org.elasticsearch.index.mapper.MapperService;
++import org.elasticsearch.index.query.IndexQueryParserService;
+ 
+ public interface SuggestContextParser {
+-    public SuggestionSearchContext.SuggestionContext parse(XContentParser parser, MapperService mapperService) throws IOException;
++    public SuggestionSearchContext.SuggestionContext parse(XContentParser parser, MapperService mapperService, IndexQueryParserService queryParserService) throws IOException;
+ 
+ }
+\ No newline at end of file
+diff --git a/src/main/java/org/elasticsearch/search/suggest/SuggestParseElement.java b/src/main/java/org/elasticsearch/search/suggest/SuggestParseElement.java
+index edfe04108a0b..cf85500cb4bd 100644
+--- a/src/main/java/org/elasticsearch/search/suggest/SuggestParseElement.java
++++ b/src/main/java/org/elasticsearch/search/suggest/SuggestParseElement.java
+@@ -22,6 +22,7 @@
+ import org.elasticsearch.common.inject.Inject;
+ import org.elasticsearch.common.xcontent.XContentParser;
+ import org.elasticsearch.index.mapper.MapperService;
++import org.elasticsearch.index.query.IndexQueryParserService;
+ import org.elasticsearch.search.SearchParseElement;
+ import org.elasticsearch.search.internal.SearchContext;
+ import org.elasticsearch.search.suggest.SuggestionSearchContext.SuggestionContext;
+@@ -44,11 +45,11 @@ public SuggestParseElement(Suggesters suggesters) {
+ 
+     @Override
+     public void parse(XContentParser parser, SearchContext context) throws Exception {
+-        SuggestionSearchContext suggestionSearchContext = parseInternal(parser, context.mapperService(), context.shardTarget().index(), context.shardTarget().shardId());
++        SuggestionSearchContext suggestionSearchContext = parseInternal(parser, context.mapperService(), context.queryParserService(), context.shardTarget().index(), context.shardTarget().shardId());
+         context.suggest(suggestionSearchContext);
+     }
+ 
+-    public SuggestionSearchContext parseInternal(XContentParser parser, MapperService mapperService, String index, int shardId) throws IOException {
++    public SuggestionSearchContext parseInternal(XContentParser parser, MapperService mapperService, IndexQueryParserService queryParserService, String index, int shardId) throws IOException {
+         SuggestionSearchContext suggestionSearchContext = new SuggestionSearchContext();
+         BytesRef globalText = null;
+         String fieldName = null;
+@@ -86,7 +87,7 @@ public SuggestionSearchContext parseInternal(XContentParser parser, MapperServic
+                             throw new IllegalArgumentException("Suggester[" + fieldName + "] not supported");
+                         }
+                         final SuggestContextParser contextParser = suggesters.get(fieldName).getContextParser();
+-                        suggestionContext = contextParser.parse(parser, mapperService);
++                        suggestionContext = contextParser.parse(parser, mapperService, queryParserService);
+                     }
+                 }
+                 if (suggestionContext != null) {
+diff --git a/src/main/java/org/elasticsearch/search/suggest/SuggestPhase.java b/src/main/java/org/elasticsearch/search/suggest/SuggestPhase.java
+index 209c7b68ce77..58a4502abf84 100644
+--- a/src/main/java/org/elasticsearch/search/suggest/SuggestPhase.java
++++ b/src/main/java/org/elasticsearch/search/suggest/SuggestPhase.java
+@@ -19,7 +19,7 @@
+ package org.elasticsearch.search.suggest;
+ 
+ import com.google.common.collect.ImmutableMap;
+-import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.util.CharsRefBuilder;
+ import org.elasticsearch.ElasticsearchException;
+ import org.elasticsearch.common.component.AbstractComponent;
+@@ -71,10 +71,10 @@ public void execute(SearchContext context) {
+         if (suggest == null) {
+             return;
+         }
+-        context.queryResult().suggest(execute(suggest, context.searcher().getIndexReader()));
++        context.queryResult().suggest(execute(suggest, context.searcher()));
+     }
+ 
+-    public Suggest execute(SuggestionSearchContext suggest, IndexReader reader) {
++    public Suggest execute(SuggestionSearchContext suggest, IndexSearcher searcher) {
+         try {
+             CharsRefBuilder spare = new CharsRefBuilder();
+             final List<Suggestion<? extends Entry<? extends Option>>> suggestions = new ArrayList<>(suggest.suggestions().size());
+@@ -82,7 +82,7 @@ public Suggest execute(SuggestionSearchContext suggest, IndexReader reader) {
+             for (Map.Entry<String, SuggestionSearchContext.SuggestionContext> entry : suggest.suggestions().entrySet()) {
+                 SuggestionSearchContext.SuggestionContext suggestion = entry.getValue();
+                 Suggester<SuggestionContext> suggester = suggestion.getSuggester();
+-                Suggestion<? extends Entry<? extends Option>> result = suggester.execute(entry.getKey(), suggestion, reader, spare);
++                Suggestion<? extends Entry<? extends Option>> result = suggester.execute(entry.getKey(), suggestion, searcher, spare);
+                 if (result != null) {
+                     assert entry.getKey().equals(result.name);
+                     suggestions.add(result);
+diff --git a/src/main/java/org/elasticsearch/search/suggest/Suggester.java b/src/main/java/org/elasticsearch/search/suggest/Suggester.java
+index dcb84ea54670..51f5f21b460f 100644
+--- a/src/main/java/org/elasticsearch/search/suggest/Suggester.java
++++ b/src/main/java/org/elasticsearch/search/suggest/Suggester.java
+@@ -19,7 +19,7 @@
+ 
+ package org.elasticsearch.search.suggest;
+ 
+-import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.util.CharsRefBuilder;
+ 
+ import java.io.IOException;
+@@ -27,19 +27,20 @@
+ public abstract class Suggester<T extends SuggestionSearchContext.SuggestionContext> {
+ 
+     protected abstract Suggest.Suggestion<? extends Suggest.Suggestion.Entry<? extends Suggest.Suggestion.Entry.Option>>
+-        innerExecute(String name, T suggestion, IndexReader indexReader, CharsRefBuilder spare) throws IOException;
++        innerExecute(String name, T suggestion, IndexSearcher searcher, CharsRefBuilder spare) throws IOException;
+ 
+     public abstract String[] names();
+ 
+     public abstract SuggestContextParser getContextParser();
+ 
+     public Suggest.Suggestion<? extends Suggest.Suggestion.Entry<? extends Suggest.Suggestion.Entry.Option>>
+-        execute(String name, T suggestion, IndexReader indexReader, CharsRefBuilder spare) throws IOException {
++        execute(String name, T suggestion, IndexSearcher searcher, CharsRefBuilder spare) throws IOException {
+         // #3469 We want to ignore empty shards
+-        if (indexReader.numDocs() == 0) {
++
++        if (searcher.getIndexReader().numDocs() == 0) {
+             return null;
+         }
+-        return innerExecute(name, suggestion, indexReader, spare);
++        return innerExecute(name, suggestion, searcher, spare);
+     }
+ 
+ }
+diff --git a/src/main/java/org/elasticsearch/search/suggest/completion/CompletionSuggestParser.java b/src/main/java/org/elasticsearch/search/suggest/completion/CompletionSuggestParser.java
+index 05a14291cad8..8ef271fb7648 100644
+--- a/src/main/java/org/elasticsearch/search/suggest/completion/CompletionSuggestParser.java
++++ b/src/main/java/org/elasticsearch/search/suggest/completion/CompletionSuggestParser.java
+@@ -26,6 +26,7 @@
+ import org.elasticsearch.common.xcontent.XContentParser;
+ import org.elasticsearch.index.mapper.MapperService;
+ import org.elasticsearch.index.mapper.core.CompletionFieldMapper;
++import org.elasticsearch.index.query.IndexQueryParserService;
+ import org.elasticsearch.search.suggest.SuggestContextParser;
+ import org.elasticsearch.search.suggest.SuggestionSearchContext;
+ import org.elasticsearch.search.suggest.context.ContextMapping.ContextQuery;
+@@ -48,7 +49,7 @@ public CompletionSuggestParser(CompletionSuggester completionSuggester) {
+     }
+ 
+     @Override
+-    public SuggestionSearchContext.SuggestionContext parse(XContentParser parser, MapperService mapperService) throws IOException {
++    public SuggestionSearchContext.SuggestionContext parse(XContentParser parser, MapperService mapperService, IndexQueryParserService queryParserService) throws IOException {
+         XContentParser.Token token;
+         String fieldName = null;
+         CompletionSuggestionContext suggestion = new CompletionSuggestionContext(completionSuggester);
+diff --git a/src/main/java/org/elasticsearch/search/suggest/completion/CompletionSuggester.java b/src/main/java/org/elasticsearch/search/suggest/completion/CompletionSuggester.java
+index 3e3ceba438e0..ee1cc70bc45e 100644
+--- a/src/main/java/org/elasticsearch/search/suggest/completion/CompletionSuggester.java
++++ b/src/main/java/org/elasticsearch/search/suggest/completion/CompletionSuggester.java
+@@ -23,6 +23,7 @@
+ import org.apache.lucene.index.LeafReaderContext;
+ import org.apache.lucene.index.IndexReader;
+ import org.apache.lucene.index.Terms;
++import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.search.suggest.Lookup;
+ import org.apache.lucene.util.CharsRefBuilder;
+ import org.apache.lucene.util.CollectionUtil;
+@@ -48,11 +49,11 @@
+ 
+     @Override
+     protected Suggest.Suggestion<? extends Suggest.Suggestion.Entry<? extends Suggest.Suggestion.Entry.Option>> innerExecute(String name,
+-            CompletionSuggestionContext suggestionContext, IndexReader indexReader, CharsRefBuilder spare) throws IOException {
++            CompletionSuggestionContext suggestionContext, IndexSearcher searcher, CharsRefBuilder spare) throws IOException {
+         if (suggestionContext.mapper() == null || !(suggestionContext.mapper() instanceof CompletionFieldMapper)) {
+             throw new ElasticsearchException("Field [" + suggestionContext.getField() + "] is not a completion suggest field");
+         }
+-
++        final IndexReader indexReader = searcher.getIndexReader();
+         CompletionSuggestion completionSuggestion = new CompletionSuggestion(name, suggestionContext.getSize());
+         spare.copyUTF8Bytes(suggestionContext.getText());
+ 
+diff --git a/src/main/java/org/elasticsearch/search/suggest/phrase/NoisyChannelSpellChecker.java b/src/main/java/org/elasticsearch/search/suggest/phrase/NoisyChannelSpellChecker.java
+index 4eb095451679..ec9ca6e1da23 100644
+--- a/src/main/java/org/elasticsearch/search/suggest/phrase/NoisyChannelSpellChecker.java
++++ b/src/main/java/org/elasticsearch/search/suggest/phrase/NoisyChannelSpellChecker.java
+@@ -60,7 +60,7 @@ public NoisyChannelSpellChecker(double nonErrorLikelihood, boolean requireUnigra
+     }
+ 
+     public Result getCorrections(TokenStream stream, final CandidateGenerator generator,
+-            float maxErrors, int numCorrections, IndexReader reader, WordScorer wordScorer, BytesRef separator, float confidence, int gramSize) throws IOException {
++            float maxErrors, int numCorrections, WordScorer wordScorer, float confidence, int gramSize) throws IOException {
+         
+         final List<CandidateSet> candidateSetsList = new ArrayList<>();
+         SuggestUtils.analyze(stream, new SuggestUtils.TokenConsumer() {
+@@ -134,7 +134,7 @@ public void end() {
+     public Result getCorrections(Analyzer analyzer, BytesRef query, CandidateGenerator generator,
+             float maxErrors, int numCorrections, IndexReader reader, String analysisField, WordScorer scorer, float confidence, int gramSize) throws IOException {
+        
+-        return getCorrections(tokenStream(analyzer, query, new CharsRefBuilder(), analysisField), generator, maxErrors, numCorrections, reader, scorer, new BytesRef(" "), confidence, gramSize);
++        return getCorrections(tokenStream(analyzer, query, new CharsRefBuilder(), analysisField), generator, maxErrors, numCorrections, scorer, confidence, gramSize);
+ 
+     }
+ 
+diff --git a/src/main/java/org/elasticsearch/search/suggest/phrase/PhraseSuggestParser.java b/src/main/java/org/elasticsearch/search/suggest/phrase/PhraseSuggestParser.java
+index 7905d5388487..453dbdc3eb5b 100644
+--- a/src/main/java/org/elasticsearch/search/suggest/phrase/PhraseSuggestParser.java
++++ b/src/main/java/org/elasticsearch/search/suggest/phrase/PhraseSuggestParser.java
+@@ -28,6 +28,7 @@
+ import org.elasticsearch.index.analysis.ShingleTokenFilterFactory;
+ import org.elasticsearch.index.mapper.FieldMapper;
+ import org.elasticsearch.index.mapper.MapperService;
++import org.elasticsearch.index.query.IndexQueryParserService;
+ import org.elasticsearch.script.CompiledScript;
+ import org.elasticsearch.script.Script;
+ import org.elasticsearch.script.ScriptContext;
+@@ -49,8 +50,9 @@ public PhraseSuggestParser(PhraseSuggester suggester) {
+     }
+ 
+     @Override
+-    public SuggestionSearchContext.SuggestionContext parse(XContentParser parser, MapperService mapperService) throws IOException {
++    public SuggestionSearchContext.SuggestionContext parse(XContentParser parser, MapperService mapperService, IndexQueryParserService queryParserService) throws IOException {
+         PhraseSuggestionContext suggestion = new PhraseSuggestionContext(suggester);
++        suggestion.setQueryParserService(queryParserService);
+         XContentParser.Token token;
+         String fieldName = null;
+         boolean gramSizeSet = false; 
+@@ -159,8 +161,6 @@ public PhraseSuggestParser(PhraseSuggester suggester) {
+                             } else {
+                                 suggestion.setCollateFilterScript(compiledScript);
+                             }
+-                        } else if ("preference".equals(fieldName)) {
+-                            suggestion.setPreference(parser.text());
+                         } else if ("params".equals(fieldName)) {
+                             suggestion.setCollateScriptParams(parser.map());
+                         } else if ("prune".equals(fieldName)) {
+diff --git a/src/main/java/org/elasticsearch/search/suggest/phrase/PhraseSuggester.java b/src/main/java/org/elasticsearch/search/suggest/phrase/PhraseSuggester.java
+index bf22dae44db2..37ab17fffedf 100644
+--- a/src/main/java/org/elasticsearch/search/suggest/phrase/PhraseSuggester.java
++++ b/src/main/java/org/elasticsearch/search/suggest/phrase/PhraseSuggester.java
+@@ -23,22 +23,19 @@
+ import org.apache.lucene.index.IndexReader;
+ import org.apache.lucene.index.MultiFields;
+ import org.apache.lucene.index.Terms;
++import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.search.spell.DirectSpellChecker;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.BytesRefBuilder;
+ import org.apache.lucene.util.CharsRefBuilder;
+-import org.elasticsearch.ElasticsearchException;
+-import org.elasticsearch.action.search.MultiSearchRequestBuilder;
+-import org.elasticsearch.action.search.MultiSearchResponse;
+-import org.elasticsearch.action.search.SearchRequestBuilder;
+-import org.elasticsearch.action.search.SearchResponse;
+-import org.elasticsearch.client.Client;
+ import org.elasticsearch.common.bytes.BytesReference;
+ import org.elasticsearch.common.inject.Inject;
++import org.elasticsearch.common.lucene.Lucene;
++import org.elasticsearch.common.lucene.Lucene.EarlyTerminatingCollector;
+ import org.elasticsearch.common.text.StringText;
+ import org.elasticsearch.common.text.Text;
+ import org.elasticsearch.index.query.QueryBuilders;
+-import org.elasticsearch.index.query.QueryBuilders;
++import org.elasticsearch.index.query.ParsedQuery;
+ import org.elasticsearch.script.CompiledScript;
+ import org.elasticsearch.script.ExecutableScript;
+ import org.elasticsearch.script.ScriptService;
+@@ -58,12 +55,10 @@
+ public final class PhraseSuggester extends Suggester<PhraseSuggestionContext> {
+     private final BytesRef SEPARATOR = new BytesRef(" ");
+     private static final String SUGGESTION_TEMPLATE_VAR_NAME = "suggestion";
+-    private final Client client;
+     private final ScriptService scriptService;
+ 
+     @Inject
+-    public PhraseSuggester(Client client, ScriptService scriptService) {
+-        this.client = client;
++    public PhraseSuggester(ScriptService scriptService) {
+         this.scriptService = scriptService;
+     }
+ 
+@@ -76,11 +71,11 @@ public PhraseSuggester(Client client, ScriptService scriptService) {
+      *   - phonetic filters could be interesting here too for candidate selection
+      */
+     @Override
+-    public Suggestion<? extends Entry<? extends Option>> innerExecute(String name, PhraseSuggestionContext suggestion,
+-            IndexReader indexReader, CharsRefBuilder spare) throws IOException {
++    public Suggestion<? extends Entry<? extends Option>> innerExecute(String name, PhraseSuggestionContext suggestion, IndexSearcher searcher,
++            CharsRefBuilder spare) throws IOException {
+         double realWordErrorLikelihood = suggestion.realworldErrorLikelyhood();
+         final PhraseSuggestion response = new PhraseSuggestion(name, suggestion.getSize());
+-
++        final IndexReader indexReader = searcher.getIndexReader();
+         List<PhraseSuggestionContext.DirectCandidateGenerator>  generators = suggestion.generators();
+         final int numGenerators = generators.size();
+         final List<CandidateGenerator> gens = new ArrayList<>(generators.size());
+@@ -103,31 +98,52 @@ public PhraseSuggester(Client client, ScriptService scriptService) {
+             WordScorer wordScorer = suggestion.model().newScorer(indexReader, suggestTerms, suggestField, realWordErrorLikelihood, separator);
+             Result checkerResult = checker.getCorrections(stream, new MultiCandidateGeneratorWrapper(suggestion.getShardSize(),
+                     gens.toArray(new CandidateGenerator[gens.size()])), suggestion.maxErrors(),
+-                    suggestion.getShardSize(), indexReader,wordScorer , separator, suggestion.confidence(), suggestion.gramSize());
++                    suggestion.getShardSize(), wordScorer, suggestion.confidence(), suggestion.gramSize());
+ 
+             PhraseSuggestion.Entry resultEntry = buildResultEntry(suggestion, spare, checkerResult.cutoffScore);
+             response.addTerm(resultEntry);
+ 
+-            BytesRefBuilder byteSpare = new BytesRefBuilder();
+-
+-            MultiSearchResponse multiSearchResponse = collate(suggestion, checkerResult, byteSpare, spare);
+-            final boolean collateEnabled = multiSearchResponse != null;
+-            final boolean collatePrune = suggestion.collatePrune();
+-
++            final BytesRefBuilder byteSpare = new BytesRefBuilder();
++            final EarlyTerminatingCollector collector = Lucene.createExistsCollector();
++            final CompiledScript collateScript;
++            if (suggestion.getCollateQueryScript() != null) {
++                collateScript = suggestion.getCollateQueryScript();
++            } else if (suggestion.getCollateFilterScript() != null) {
++                collateScript = suggestion.getCollateFilterScript();
++            } else {
++                collateScript = null;
++            }
++            final boolean collatePrune = (collateScript != null) && suggestion.collatePrune();
+             for (int i = 0; i < checkerResult.corrections.length; i++) {
+-                boolean collateMatch = hasMatchingDocs(multiSearchResponse, i);
++                Correction correction = checkerResult.corrections[i];
++                spare.copyUTF8Bytes(correction.join(SEPARATOR, byteSpare, null, null));
++                boolean collateMatch = true;
++                if (collateScript != null) {
++                    // Checks if the template query collateScript yields any documents
++                    // from the index for a correction, collateMatch is updated
++                    final Map<String, Object> vars = suggestion.getCollateScriptParams();
++                    vars.put(SUGGESTION_TEMPLATE_VAR_NAME, spare.toString());
++                    final ExecutableScript executable = scriptService.executable(collateScript, vars);
++                    final BytesReference querySource = (BytesReference) executable.run();
++                    final ParsedQuery parsedQuery;
++                    if (suggestion.getCollateFilterScript() != null) {
++                        parsedQuery = suggestion.getQueryParserService().parse(
++                                QueryBuilders.constantScoreQuery(QueryBuilders.wrapperQuery(querySource)));
++                    } else {
++                        parsedQuery = suggestion.getQueryParserService().parse(querySource);
++                    }
++                    collateMatch = Lucene.exists(searcher, parsedQuery.query(), collector);
++                }
+                 if (!collateMatch && !collatePrune) {
+                     continue;
+                 }
+-                Correction correction = checkerResult.corrections[i];
+-                spare.copyUTF8Bytes(correction.join(SEPARATOR, byteSpare, null, null));
+                 Text phrase = new StringText(spare.toString());
+                 Text highlighted = null;
+                 if (suggestion.getPreTag() != null) {
+                     spare.copyUTF8Bytes(correction.join(SEPARATOR, byteSpare, suggestion.getPreTag(), suggestion.getPostTag()));
+                     highlighted = new StringText(spare.toString());
+                 }
+-                if (collateEnabled && collatePrune) {
++                if (collatePrune) {
+                     resultEntry.addOption(new Suggestion.Entry.Option(phrase, highlighted, (float) (correction.score), collateMatch));
+                 } else {
+                     resultEntry.addOption(new Suggestion.Entry.Option(phrase, highlighted, (float) (correction.score)));
+@@ -144,67 +160,6 @@ public PhraseSuggester(Client client, ScriptService scriptService) {
+         return new PhraseSuggestion.Entry(new StringText(spare.toString()), 0, spare.length(), cutoffScore);
+     }
+ 
+-    private MultiSearchResponse collate(PhraseSuggestionContext suggestion, Result checkerResult, BytesRefBuilder byteSpare, CharsRefBuilder spare) throws IOException {
+-        CompiledScript collateQueryScript = suggestion.getCollateQueryScript();
+-        CompiledScript collateFilterScript = suggestion.getCollateFilterScript();
+-        MultiSearchResponse multiSearchResponse = null;
+-        if (collateQueryScript != null) {
+-            multiSearchResponse = fetchMatchingDocCountResponses(checkerResult.corrections, collateQueryScript, false, suggestion, byteSpare, spare);
+-        } else if (collateFilterScript != null) {
+-            multiSearchResponse = fetchMatchingDocCountResponses(checkerResult.corrections, collateFilterScript, true, suggestion, byteSpare, spare);
+-        }
+-        return multiSearchResponse;
+-    }
+-
+-    private MultiSearchResponse fetchMatchingDocCountResponses(Correction[] corrections, CompiledScript collateScript,
+-                                                               boolean isFilter, PhraseSuggestionContext suggestions,
+-                                                               BytesRefBuilder byteSpare, CharsRefBuilder spare) throws IOException {
+-        Map<String, Object> vars = suggestions.getCollateScriptParams();
+-        MultiSearchResponse multiSearchResponse = null;
+-        MultiSearchRequestBuilder multiSearchRequestBuilder = client.prepareMultiSearch();
+-        boolean requestAdded = false;
+-        SearchRequestBuilder req;
+-        for (Correction correction : corrections) {
+-            spare.copyUTF8Bytes(correction.join(SEPARATOR, byteSpare, null, null));
+-            vars.put(SUGGESTION_TEMPLATE_VAR_NAME, spare.toString());
+-            ExecutableScript executable = scriptService.executable(collateScript, vars);
+-            BytesReference querySource = (BytesReference) executable.run();
+-            requestAdded = true;
+-            if (isFilter) {
+-                req = client.prepareSearch()
+-                        .setPreference(suggestions.getPreference())
+-                        .setQuery(QueryBuilders.constantScoreQuery(QueryBuilders.wrapperQuery(querySource)))
+-                        .setSize(0)
+-                        .setTerminateAfter(1);
+-            } else {
+-                req = client.prepareSearch()
+-                        .setPreference(suggestions.getPreference())
+-                        .setQuery(querySource)
+-                        .setSize(0)
+-                        .setTerminateAfter(1);
+-            }
+-            multiSearchRequestBuilder.add(req);
+-        }
+-        if (requestAdded) {
+-            multiSearchResponse = multiSearchRequestBuilder.get();
+-        }
+-
+-        return multiSearchResponse;
+-    }
+-
+-    private static boolean hasMatchingDocs(MultiSearchResponse multiSearchResponse, int index) {
+-        if (multiSearchResponse == null) {
+-            return true;
+-        }
+-        MultiSearchResponse.Item item = multiSearchResponse.getResponses()[index];
+-        if (!item.isFailure()) {
+-            SearchResponse resp = item.getResponse();
+-            return resp.getHits().totalHits() > 0;
+-        } else {
+-            throw new ElasticsearchException("Collate request failed: " + item.getFailureMessage());
+-        }
+-    }
+-
+     ScriptService scriptService() {
+         return scriptService;
+     }
+diff --git a/src/main/java/org/elasticsearch/search/suggest/phrase/PhraseSuggestionContext.java b/src/main/java/org/elasticsearch/search/suggest/phrase/PhraseSuggestionContext.java
+index 7115b7a629a9..b38dd95053a0 100644
+--- a/src/main/java/org/elasticsearch/search/suggest/phrase/PhraseSuggestionContext.java
++++ b/src/main/java/org/elasticsearch/search/suggest/phrase/PhraseSuggestionContext.java
+@@ -25,7 +25,7 @@
+ 
+ import org.apache.lucene.analysis.Analyzer;
+ import org.apache.lucene.util.BytesRef;
+-import org.elasticsearch.cluster.routing.Preference;
++import org.elasticsearch.index.query.IndexQueryParserService;
+ import org.elasticsearch.script.CompiledScript;
+ import org.elasticsearch.search.suggest.DirectSpellcheckerSettings;
+ import org.elasticsearch.search.suggest.Suggester;
+@@ -33,7 +33,7 @@
+ 
+ class PhraseSuggestionContext extends SuggestionContext {
+     private final BytesRef SEPARATOR = new BytesRef(" ");
+-
++    private IndexQueryParserService queryParserService;
+     private float maxErrors = 0.5f;
+     private BytesRef separator = SEPARATOR;
+     private float realworldErrorLikelihood = 0.95f;
+@@ -45,7 +45,6 @@
+     private BytesRef postTag;
+     private CompiledScript collateQueryScript;
+     private CompiledScript collateFilterScript;
+-    private String preference = Preference.ONLY_LOCAL.type();
+     private Map<String, Object> collateScriptParams = new HashMap<>(1);
+ 
+     private WordScorer.WordScorerFactory scorer;
+@@ -112,7 +111,15 @@ public void setModel(WordScorer.WordScorerFactory scorer) {
+     public WordScorer.WordScorerFactory model() {
+         return scorer;
+     }
+-    
++
++    public void setQueryParserService(IndexQueryParserService queryParserService) {
++        this.queryParserService = queryParserService;
++    }
++
++    public IndexQueryParserService getQueryParserService() {
++        return queryParserService;
++    }
++
+     static class DirectCandidateGenerator extends DirectSpellcheckerSettings {
+         private Analyzer preFilter;
+         private Analyzer postFilter;
+@@ -205,14 +212,6 @@ void setCollateFilterScript(CompiledScript collateFilterScript) {
+         this.collateFilterScript = collateFilterScript;
+     }
+ 
+-    String getPreference() {
+-        return preference;
+-    }
+-
+-    void setPreference(String preference) {
+-        this.preference = preference;
+-    }
+-
+     Map<String, Object> getCollateScriptParams() {
+         return collateScriptParams;
+     }
+diff --git a/src/main/java/org/elasticsearch/search/suggest/term/TermSuggestParser.java b/src/main/java/org/elasticsearch/search/suggest/term/TermSuggestParser.java
+index 94ef1f6b3937..9e1a0e57190e 100644
+--- a/src/main/java/org/elasticsearch/search/suggest/term/TermSuggestParser.java
++++ b/src/main/java/org/elasticsearch/search/suggest/term/TermSuggestParser.java
+@@ -22,6 +22,7 @@
+ 
+ import org.elasticsearch.common.xcontent.XContentParser;
+ import org.elasticsearch.index.mapper.MapperService;
++import org.elasticsearch.index.query.IndexQueryParserService;
+ import org.elasticsearch.search.suggest.DirectSpellcheckerSettings;
+ import org.elasticsearch.search.suggest.SuggestContextParser;
+ import org.elasticsearch.search.suggest.SuggestUtils;
+@@ -36,7 +37,7 @@ public TermSuggestParser(TermSuggester suggester) {
+     }
+ 
+     @Override
+-    public SuggestionSearchContext.SuggestionContext parse(XContentParser parser, MapperService mapperService) throws IOException {
++    public SuggestionSearchContext.SuggestionContext parse(XContentParser parser, MapperService mapperService, IndexQueryParserService queryParserService) throws IOException {
+         XContentParser.Token token;
+         String fieldName = null;
+         TermSuggestionContext suggestion = new TermSuggestionContext(suggester);
+diff --git a/src/main/java/org/elasticsearch/search/suggest/term/TermSuggester.java b/src/main/java/org/elasticsearch/search/suggest/term/TermSuggester.java
+index 64c38b2df81c..70dfefe9522d 100644
+--- a/src/main/java/org/elasticsearch/search/suggest/term/TermSuggester.java
++++ b/src/main/java/org/elasticsearch/search/suggest/term/TermSuggester.java
+@@ -20,6 +20,7 @@
+ 
+ import org.apache.lucene.index.IndexReader;
+ import org.apache.lucene.index.Term;
++import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.search.spell.DirectSpellChecker;
+ import org.apache.lucene.search.spell.SuggestWord;
+ import org.apache.lucene.util.BytesRef;
+@@ -41,9 +42,9 @@
+ public final class TermSuggester extends Suggester<TermSuggestionContext> {
+ 
+     @Override
+-    public TermSuggestion innerExecute(String name, TermSuggestionContext suggestion, IndexReader indexReader, CharsRefBuilder spare) throws IOException {
++    public TermSuggestion innerExecute(String name, TermSuggestionContext suggestion, IndexSearcher searcher, CharsRefBuilder spare) throws IOException {
+         DirectSpellChecker directSpellChecker = SuggestUtils.getDirectSpellChecker(suggestion.getDirectSpellCheckerSettings());
+-
++        final IndexReader indexReader = searcher.getIndexReader();
+         TermSuggestion response = new TermSuggestion(
+                 name, suggestion.getSize(), suggestion.getDirectSpellCheckerSettings().sort()
+         );
+diff --git a/src/test/java/org/elasticsearch/search/suggest/CustomSuggester.java b/src/test/java/org/elasticsearch/search/suggest/CustomSuggester.java
+index 0fe75cd51130..6e57390a1657 100644
+--- a/src/test/java/org/elasticsearch/search/suggest/CustomSuggester.java
++++ b/src/test/java/org/elasticsearch/search/suggest/CustomSuggester.java
+@@ -18,11 +18,12 @@
+  */
+ package org.elasticsearch.search.suggest;
+ 
+-import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.util.CharsRefBuilder;
+ import org.elasticsearch.common.text.StringText;
+ import org.elasticsearch.common.xcontent.XContentParser;
+ import org.elasticsearch.index.mapper.MapperService;
++import org.elasticsearch.index.query.IndexQueryParserService;
+ 
+ import java.io.IOException;
+ import java.util.Locale;
+@@ -36,7 +37,7 @@
+ 
+     // This is a pretty dumb implementation which returns the original text + fieldName + custom config option + 12 or 123
+     @Override
+-    public Suggest.Suggestion<? extends Suggest.Suggestion.Entry<? extends Suggest.Suggestion.Entry.Option>> innerExecute(String name, CustomSuggestionsContext suggestion, IndexReader indexReader, CharsRefBuilder spare) throws IOException {
++    public Suggest.Suggestion<? extends Suggest.Suggestion.Entry<? extends Suggest.Suggestion.Entry.Option>> innerExecute(String name, CustomSuggestionsContext suggestion, IndexSearcher searcher, CharsRefBuilder spare) throws IOException {
+         // Get the suggestion context
+         String text = suggestion.getText().utf8ToString();
+ 
+@@ -63,7 +64,7 @@
+     public SuggestContextParser getContextParser() {
+         return new SuggestContextParser() {
+             @Override
+-            public SuggestionSearchContext.SuggestionContext parse(XContentParser parser, MapperService mapperService) throws IOException {
++            public SuggestionSearchContext.SuggestionContext parse(XContentParser parser, MapperService mapperService, IndexQueryParserService queryParserService) throws IOException {
+                 Map<String, Object> options = parser.map();
+                 CustomSuggestionsContext suggestionContext = new CustomSuggestionsContext(CustomSuggester.this, options);
+                 suggestionContext.setField((String) options.get("field"));
+diff --git a/src/test/java/org/elasticsearch/search/suggest/SuggestSearchTests.java b/src/test/java/org/elasticsearch/search/suggest/SuggestSearchTests.java
+index 86d979df31c4..19bc28f188da 100644
+--- a/src/test/java/org/elasticsearch/search/suggest/SuggestSearchTests.java
++++ b/src/test/java/org/elasticsearch/search/suggest/SuggestSearchTests.java
+@@ -1247,12 +1247,17 @@ public void testPhraseSuggesterCollate() throws InterruptedException, ExecutionE
+             // expected
+         }
+ 
+-        // collate request with prune set to true
++        // collate query request with prune set to true
+         PhraseSuggestionBuilder phraseSuggestWithParamsAndReturn = suggest.collateFilter(null).collateQuery(collateWithParams).collateParams(params).collatePrune(true);
+         searchSuggest = searchSuggest("united states house of representatives elections in washington 2006", phraseSuggestWithParamsAndReturn);
+         assertSuggestionSize(searchSuggest, 0, 10, "title");
+         assertSuggestionPhraseCollateMatchExists(searchSuggest, "title", 2);
+ 
++        // collate filter request with prune set to true
++        phraseSuggestWithParamsAndReturn = suggest.collateFilter(collateWithParams).collateQuery(null).collateParams(params).collatePrune(true);
++        searchSuggest = searchSuggest("united states house of representatives elections in washington 2006", phraseSuggestWithParamsAndReturn);
++        assertSuggestionSize(searchSuggest, 0, 10, "title");
++        assertSuggestionPhraseCollateMatchExists(searchSuggest, "title", 2);
+     }
+ 
+     protected Suggest searchSuggest(SuggestionBuilder<?>... suggestion) {

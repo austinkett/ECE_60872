@@ -1,0 +1,200 @@
+diff --git a/docs/reference/api-conventions.asciidoc b/docs/reference/api-conventions.asciidoc
+index 4287f61c0785..890ed88d06a1 100644
+--- a/docs/reference/api-conventions.asciidoc
++++ b/docs/reference/api-conventions.asciidoc
+@@ -39,7 +39,8 @@ Controls whether to fail if a wildcard indices expressions results into no
+ concrete indices. Either `true` or `false` can be specified. For example if
+ the wildcard expression `foo*` is specified and no indices are available that
+ start with `foo` then depending on this setting the request will fail. This
+-setting is also applicable when `_all`, `*` or no index has been specified.
++setting is also applicable when `_all`, `*` or no index has been specified. This
++settings also applies for aliases, in case an alias points to a closed index.
+ 
+ `expand_wildcards`::
+ 
+diff --git a/src/main/java/org/elasticsearch/action/support/IndicesOptions.java b/src/main/java/org/elasticsearch/action/support/IndicesOptions.java
+index 94a7d348585b..6a66acd54ea4 100644
+--- a/src/main/java/org/elasticsearch/action/support/IndicesOptions.java
++++ b/src/main/java/org/elasticsearch/action/support/IndicesOptions.java
+@@ -19,7 +19,6 @@
+ package org.elasticsearch.action.support;
+ 
+ import org.elasticsearch.ElasticsearchIllegalArgumentException;
+-import org.elasticsearch.Version;
+ import org.elasticsearch.common.Strings;
+ import org.elasticsearch.common.io.stream.StreamInput;
+ import org.elasticsearch.common.io.stream.StreamOutput;
+@@ -72,6 +71,8 @@ public boolean ignoreUnavailable() {
+     /**
+      * @return Whether to ignore if a wildcard expression resolves to no concrete indices.
+      *         The `_all` string or empty list of indices count as wildcard expressions too.
++     *         Also when an alias points to a closed index this option decides if no concrete indices
++     *         are allowed.
+      */
+     public boolean allowNoIndices() {
+         return (id & ALLOW_NO_INDICES) != 0;
+diff --git a/src/main/java/org/elasticsearch/cluster/metadata/MetaData.java b/src/main/java/org/elasticsearch/cluster/metadata/MetaData.java
+index 5d351558c0d3..6fd591fd0bb8 100644
+--- a/src/main/java/org/elasticsearch/cluster/metadata/MetaData.java
++++ b/src/main/java/org/elasticsearch/cluster/metadata/MetaData.java
+@@ -679,7 +679,7 @@ public String resolveIndexRouting(@Nullable String routing, String aliasOrIndex)
+ 
+         // optimize for single element index (common case)
+         if (aliasesOrIndices.length == 1) {
+-            return concreteIndices(aliasesOrIndices[0], indicesOptions.allowNoIndices(), indicesOptions);
++            return concreteIndices(aliasesOrIndices[0], indicesOptions, !indicesOptions.allowNoIndices());
+         }
+ 
+         // check if its a possible aliased index, if not, just return the passed array
+@@ -712,7 +712,7 @@ public String resolveIndexRouting(@Nullable String routing, String aliasOrIndex)
+ 
+         Set<String> actualIndices = new HashSet<>();
+         for (String aliasOrIndex : aliasesOrIndices) {
+-            String[] indices = concreteIndices(aliasOrIndex, indicesOptions.ignoreUnavailable(), indicesOptions);
++            String[] indices = concreteIndices(aliasOrIndex, indicesOptions, !indicesOptions.ignoreUnavailable());
+             Collections.addAll(actualIndices, indices);
+         }
+ 
+@@ -742,7 +742,7 @@ public String concreteSingleIndex(String indexOrAlias, IndicesOptions indicesOpt
+         return indices[0];
+     }
+ 
+-    private String[] concreteIndices(String aliasOrIndex, boolean allowNoIndices, IndicesOptions options) throws IndexMissingException, ElasticsearchIllegalArgumentException {
++    private String[] concreteIndices(String aliasOrIndex, IndicesOptions options, boolean failNoIndices) throws IndexMissingException, ElasticsearchIllegalArgumentException {
+         boolean failClosed = options.forbidClosedIndices() && !options.ignoreUnavailable();
+ 
+         // a quick check, if this is an actual index, if so, return it
+@@ -760,24 +760,53 @@ public String concreteSingleIndex(String indexOrAlias, IndicesOptions indicesOpt
+         }
+         // not an actual index, fetch from an alias
+         String[] indices = aliasAndIndexToIndexMap.getOrDefault(aliasOrIndex, Strings.EMPTY_ARRAY);
+-        if (indices.length == 0 && !allowNoIndices) {
++        if (indices.length == 0 && failNoIndices) {
+             throw new IndexMissingException(new Index(aliasOrIndex));
+         }
+         if (indices.length > 1 && !options.allowAliasesToMultipleIndices()) {
+             throw new ElasticsearchIllegalArgumentException("Alias [" + aliasOrIndex + "] has more than one indices associated with it [" + Arrays.toString(indices) + "], can't execute a single index op");
+         }
+ 
+-        indexMetaData = this.indices.get(aliasOrIndex);
+-        if (indexMetaData != null && indexMetaData.getState() == IndexMetaData.State.CLOSE) {
+-            if (failClosed) {
+-                throw new IndexClosedException(new Index(aliasOrIndex));
+-            } else {
+-                if (options.forbidClosedIndices()) {
+-                    return Strings.EMPTY_ARRAY;
++        // No need to check whether indices referred by aliases are closed, because there are no closed indices.
++        if (allClosedIndices.length == 0) {
++            return indices;
++        }
++
++        switch (indices.length) {
++            case 0:
++                return indices;
++            case 1:
++                indexMetaData = this.indices.get(indices[0]);
++                if (indexMetaData != null && indexMetaData.getState() == IndexMetaData.State.CLOSE) {
++                    if (failClosed) {
++                        throw new IndexClosedException(new Index(indexMetaData.getIndex()));
++                    } else {
++                        if (options.forbidClosedIndices()) {
++                            return Strings.EMPTY_ARRAY;
++                        }
++                    }
+                 }
+-            }
++                return indices;
++            default:
++                ObjectArrayList<String> concreteIndices = new ObjectArrayList<>();
++                for (String index : indices) {
++                    indexMetaData = this.indices.get(index);
++                    if (indexMetaData != null) {
++                        if (indexMetaData.getState() == IndexMetaData.State.CLOSE) {
++                            if (failClosed) {
++                                throw new IndexClosedException(new Index(indexMetaData.getIndex()));
++                            } else if (!options.forbidClosedIndices()) {
++                                concreteIndices.add(index);
++                            }
++                        } else if (indexMetaData.getState() == IndexMetaData.State.OPEN) {
++                            concreteIndices.add(index);
++                        } else {
++                            throw new IllegalStateException("index state [" + indexMetaData.getState() + "] not supported");
++                        }
++                    }
++                }
++                return concreteIndices.toArray(String.class);
+         }
+-        return indices;
+     }
+ 
+     /**
+diff --git a/src/test/java/org/elasticsearch/cluster/metadata/MetaDataTests.java b/src/test/java/org/elasticsearch/cluster/metadata/MetaDataTests.java
+index 753b5ff8945c..a4429f949e9e 100644
+--- a/src/test/java/org/elasticsearch/cluster/metadata/MetaDataTests.java
++++ b/src/test/java/org/elasticsearch/cluster/metadata/MetaDataTests.java
+@@ -718,6 +718,65 @@ public void testIsPatternMatchingAllIndices_nonMatchingTrailingWildcardAndExclus
+         assertThat(metaData.isPatternMatchingAllIndices(indicesOrAliases, concreteIndices), equalTo(false));
+     }
+ 
++    @Test
++    public void testIndexOptions_failClosedIndicesAndAliases() {
++        MetaData.Builder mdBuilder = MetaData.builder()
++                .put(indexBuilder("foo1-closed").state(IndexMetaData.State.CLOSE).putAlias(AliasMetaData.builder("foobar1-closed")).putAlias(AliasMetaData.builder("foobar2-closed")))
++                .put(indexBuilder("foo2-closed").state(IndexMetaData.State.CLOSE).putAlias(AliasMetaData.builder("foobar2-closed")))
++                .put(indexBuilder("foo3").putAlias(AliasMetaData.builder("foobar2-closed")));
++        MetaData md = mdBuilder.build();
++
++        IndicesOptions options = IndicesOptions.strictExpandOpenAndForbidClosed();
++        try {
++            md.concreteIndices(options, "foo1-closed");
++            fail("foo1-closed should be closed, but it is open");
++        } catch (IndexClosedException e) {
++            // expected
++        }
++
++        try {
++            md.concreteIndices(options, "foobar1-closed");
++            fail("foo1-closed should be closed, but it is open");
++        } catch (IndexClosedException e) {
++            // expected
++        }
++
++        options = IndicesOptions.fromOptions(true, options.allowNoIndices(), options.expandWildcardsOpen(), options.expandWildcardsClosed(), options);
++        String[] results = md.concreteIndices(options, "foo1-closed");
++        assertThat(results, emptyArray());
++
++        results = md.concreteIndices(options, "foobar1-closed");
++        assertThat(results, emptyArray());
++
++        options = IndicesOptions.lenientExpandOpen();
++        results = md.concreteIndices(options, "foo1-closed");
++        assertThat(results, arrayWithSize(1));
++        assertThat(results, arrayContaining("foo1-closed"));
++
++        results = md.concreteIndices(options, "foobar1-closed");
++        assertThat(results, arrayWithSize(1));
++        assertThat(results, arrayContaining("foo1-closed"));
++
++        // testing an alias pointing to three indices:
++        options = IndicesOptions.strictExpandOpenAndForbidClosed();
++        try {
++            md.concreteIndices(options, "foobar2-closed");
++            fail("foo2-closed should be closed, but it is open");
++        } catch (IndexClosedException e) {
++            // expected
++        }
++
++        options = IndicesOptions.fromOptions(true, options.allowNoIndices(), options.expandWildcardsOpen(), options.expandWildcardsClosed(), options);
++        results = md.concreteIndices(options, "foobar2-closed");
++        assertThat(results, arrayWithSize(1));
++        assertThat(results, arrayContaining("foo3"));
++
++        options = IndicesOptions.lenientExpandOpen();
++        results = md.concreteIndices(options, "foobar2-closed");
++        assertThat(results, arrayWithSize(3));
++        assertThat(results, arrayContainingInAnyOrder("foo1-closed", "foo2-closed", "foo3"));
++    }
++
+     private MetaData metaDataBuilder(String... indices) {
+         MetaData.Builder mdBuilder = MetaData.builder();
+         for (String concreteIndex : indices) {

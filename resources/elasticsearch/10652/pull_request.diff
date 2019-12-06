@@ -1,0 +1,1343 @@
+diff --git a/src/main/java/org/apache/lucene/spatial/prefix/RecursivePrefixTreeStrategy.java b/src/main/java/org/apache/lucene/spatial/prefix/RecursivePrefixTreeStrategy.java
+new file mode 100644
+index 000000000000..4bf403bc24e7
+--- /dev/null
++++ b/src/main/java/org/apache/lucene/spatial/prefix/RecursivePrefixTreeStrategy.java
+@@ -0,0 +1,197 @@
++/*
++ * Licensed to Elasticsearch under one or more contributor
++ * license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright
++ * ownership. Elasticsearch licenses this file to you under
++ * the Apache License, Version 2.0 (the "License"); you may
++ * not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++package org.apache.lucene.spatial.prefix;
++
++import com.spatial4j.core.shape.Point;
++import com.spatial4j.core.shape.Shape;
++import org.apache.lucene.search.Filter;
++import org.apache.lucene.spatial.prefix.tree.Cell;
++import org.apache.lucene.spatial.prefix.tree.CellIterator;
++import org.apache.lucene.spatial.prefix.tree.LegacyCell;
++import org.apache.lucene.spatial.prefix.tree.PackedQuadPrefixTree;
++import org.apache.lucene.spatial.prefix.tree.SpatialPrefixTree;
++import org.apache.lucene.spatial.query.SpatialArgs;
++import org.apache.lucene.spatial.query.SpatialOperation;
++import org.apache.lucene.spatial.query.UnsupportedSpatialOperation;
++
++import java.util.ArrayList;
++import java.util.Iterator;
++import java.util.List;
++
++/**
++ * A {@link PrefixTreeStrategy} which uses {@link AbstractVisitingPrefixTreeFilter}.
++ * This strategy has support for searching non-point shapes (note: not tested).
++ * Even a query shape with distErrPct=0 (fully precise to the grid) should have
++ * good performance for typical data, unless there is a lot of indexed data
++ * coincident with the shape's edge.
++ *
++ * @lucene.experimental
++ *
++ * NOTE: Will be removed upon commit of LUCENE-6422
++ */
++public class RecursivePrefixTreeStrategy extends PrefixTreeStrategy {
++  /* Future potential optimizations:
++
++    Each shape.relate(otherShape) result could be cached since much of the same relations will be invoked when
++    multiple segments are involved. Do this for "complex" shapes, not cheap ones, and don't cache when disjoint to
++    bbox because it's a cheap calc. This is one advantage TermQueryPrefixTreeStrategy has over RPT.
++
++   */
++
++  protected int prefixGridScanLevel;
++
++  //Formerly known as simplifyIndexedCells. Eventually will be removed. Only compatible with RPT
++  // and a LegacyPrefixTree.
++  protected boolean pruneLeafyBranches = true;
++
++  protected boolean multiOverlappingIndexedShapes = true;
++
++  public RecursivePrefixTreeStrategy(SpatialPrefixTree grid, String fieldName) {
++    super(grid, fieldName);
++    prefixGridScanLevel = grid.getMaxLevels() - 4;//TODO this default constant is dependent on the prefix grid size
++  }
++
++  public int getPrefixGridScanLevel() {
++    return prefixGridScanLevel;
++  }
++
++  /**
++   * Sets the grid level [1-maxLevels] at which indexed terms are scanned brute-force
++   * instead of by grid decomposition.  By default this is maxLevels - 4.  The
++   * final level, maxLevels, is always scanned.
++   *
++   * @param prefixGridScanLevel 1 to maxLevels
++   */
++  public void setPrefixGridScanLevel(int prefixGridScanLevel) {
++    //TODO if negative then subtract from maxlevels
++    this.prefixGridScanLevel = prefixGridScanLevel;
++  }
++
++  public boolean isMultiOverlappingIndexedShapes() {
++    return multiOverlappingIndexedShapes;
++  }
++
++  /** See {@link ContainsPrefixTreeFilter#multiOverlappingIndexedShapes}. */
++  public void setMultiOverlappingIndexedShapes(boolean multiOverlappingIndexedShapes) {
++    this.multiOverlappingIndexedShapes = multiOverlappingIndexedShapes;
++  }
++
++  public boolean isPruneLeafyBranches() {
++    return pruneLeafyBranches;
++  }
++
++  /** An optional hint affecting non-point shapes: it will
++   * simplify/aggregate sets of complete leaves in a cell to its parent, resulting in ~20-25%
++   * fewer indexed cells. However, it will likely be removed in the future. (default=true)
++   */
++  public void setPruneLeafyBranches(boolean pruneLeafyBranches) {
++    this.pruneLeafyBranches = pruneLeafyBranches;
++  }
++
++  @Override
++  public String toString() {
++    StringBuilder str = new StringBuilder(getClass().getSimpleName()).append('(');
++    str.append("SPG:(").append(grid.toString()).append(')');
++    if (pointsOnly)
++      str.append(",pointsOnly");
++    if (pruneLeafyBranches)
++      str.append(",pruneLeafyBranches");
++    if (prefixGridScanLevel != grid.getMaxLevels() - 4)
++      str.append(",prefixGridScanLevel:").append(""+prefixGridScanLevel);
++    if (!multiOverlappingIndexedShapes)
++      str.append(",!multiOverlappingIndexedShapes");
++    return str.append(')').toString();
++  }
++
++  @Override
++  protected Iterator<Cell> createCellIteratorToIndex(Shape shape, int detailLevel, Iterator<Cell> reuse) {
++    if (shape instanceof Point || !pruneLeafyBranches || grid instanceof PackedQuadPrefixTree)
++      return super.createCellIteratorToIndex(shape, detailLevel, reuse);
++
++    List<Cell> cells = new ArrayList<>(4096);
++    recursiveTraverseAndPrune(grid.getWorldCell(), shape, detailLevel, cells);
++    return cells.iterator();
++  }
++
++  /** Returns true if cell was added as a leaf. If it wasn't it recursively descends. */
++  private boolean recursiveTraverseAndPrune(Cell cell, Shape shape, int detailLevel, List<Cell> result) {
++    // Important: this logic assumes Cells don't share anything with other cells when
++    // calling cell.getNextLevelCells(). This is only true for LegacyCell.
++    if (!(cell instanceof LegacyCell))
++      throw new IllegalStateException("pruneLeafyBranches must be disabled for use with grid "+grid);
++
++    if (cell.getLevel() == detailLevel) {
++      cell.setLeaf();//FYI might already be a leaf
++    }
++    if (cell.isLeaf()) {
++      result.add(cell);
++      return true;
++    }
++    if (cell.getLevel() != 0)
++      result.add(cell);
++
++    int leaves = 0;
++    CellIterator subCells = cell.getNextLevelCells(shape);
++    while (subCells.hasNext()) {
++      Cell subCell = subCells.next();
++      if (recursiveTraverseAndPrune(subCell, shape, detailLevel, result))
++        leaves++;
++    }
++    //can we prune?
++    if (leaves == ((LegacyCell)cell).getSubCellsSize() && cell.getLevel() != 0) {
++      //Optimization: substitute the parent as a leaf instead of adding all
++      // children as leaves
++
++      //remove the leaves
++      do {
++        result.remove(result.size() - 1);//remove last
++      } while (--leaves > 0);
++      //add cell as the leaf
++      cell.setLeaf();
++      return true;
++    }
++    return false;
++  }
++
++  @Override
++  public Filter makeFilter(SpatialArgs args) {
++    final SpatialOperation op = args.getOperation();
++
++    Shape shape = args.getShape();
++    int detailLevel = grid.getLevelForDistance(args.resolveDistErr(ctx, distErrPct));
++
++    if (op == SpatialOperation.Intersects) {
++      return new IntersectsPrefixTreeFilter(
++          shape, getFieldName(), grid, detailLevel, prefixGridScanLevel);
++    } else if (op == SpatialOperation.IsWithin) {
++      return new WithinPrefixTreeFilter(
++          shape, getFieldName(), grid, detailLevel, prefixGridScanLevel,
++          -1);//-1 flag is slower but ensures correct results
++    } else if (op == SpatialOperation.Contains) {
++      return new ContainsPrefixTreeFilter(shape, getFieldName(), grid, detailLevel,
++          multiOverlappingIndexedShapes);
++    }
++    throw new UnsupportedSpatialOperation(op);
++  }
++}
++
++
++
++
+diff --git a/src/main/java/org/apache/lucene/spatial/prefix/tree/CellIterator.java b/src/main/java/org/apache/lucene/spatial/prefix/tree/CellIterator.java
+new file mode 100644
+index 000000000000..fa7bf2477860
+--- /dev/null
++++ b/src/main/java/org/apache/lucene/spatial/prefix/tree/CellIterator.java
+@@ -0,0 +1,81 @@
++/*
++ * Licensed to Elasticsearch under one or more contributor
++ * license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright
++ * ownership. Elasticsearch licenses this file to you under
++ * the Apache License, Version 2.0 (the "License"); you may
++ * not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++package org.apache.lucene.spatial.prefix.tree;
++
++import java.util.Iterator;
++import java.util.NoSuchElementException;
++
++/**
++ * An Iterator of SpatialPrefixTree Cells. The order is always sorted without duplicates.
++ *
++ * @lucene.experimental
++ *
++ * NOTE: Will be removed upon commit of LUCENE-6422
++ */
++public abstract class CellIterator implements Iterator<Cell> {
++
++  //note: nextCell or thisCell can be non-null but neither at the same time. That's
++  // because they might return the same instance when re-used!
++
++  protected Cell nextCell;//to be returned by next(), and null'ed after
++  protected Cell thisCell;//see next() & thisCell(). Should be cleared in hasNext().
++
++  /** Returns the cell last returned from {@link #next()}. It's cleared by hasNext(). */
++  public Cell thisCell() {
++    assert thisCell != null : "Only call thisCell() after next(), not hasNext()";
++    return thisCell;
++  }
++
++  // Arguably this belongs here and not on Cell
++  //public SpatialRelation getShapeRel()
++
++  /**
++   * Gets the next cell that is &gt;= {@code fromCell}, compared using non-leaf bytes. If it returns null then
++   * the iterator is exhausted.
++   */
++  public Cell nextFrom(Cell fromCell) {
++    while (true) {
++      if (!hasNext())
++        return null;
++      Cell c = next();//will update thisCell
++      if (c.compareToNoLeaf(fromCell) >= 0) {
++        return c;
++      }
++    }
++  }
++
++  /** This prevents sub-cells (those underneath the current cell) from being iterated to,
++   *  if applicable, otherwise a NO-OP. */
++  @Override
++  public void remove() {
++    assert thisCell != null;
++  }
++
++  @Override
++  public Cell next() {
++    if (nextCell == null) {
++      if (!hasNext())
++        throw new NoSuchElementException();
++    }
++    thisCell = nextCell;
++    nextCell = null;
++    return thisCell;
++  }
++}
+diff --git a/src/main/java/org/apache/lucene/spatial/prefix/tree/LegacyCell.java b/src/main/java/org/apache/lucene/spatial/prefix/tree/LegacyCell.java
+new file mode 100644
+index 000000000000..7900fd62bc40
+--- /dev/null
++++ b/src/main/java/org/apache/lucene/spatial/prefix/tree/LegacyCell.java
+@@ -0,0 +1,248 @@
++/*
++ * Licensed to Elasticsearch under one or more contributor
++ * license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright
++ * ownership. Elasticsearch licenses this file to you under
++ * the Apache License, Version 2.0 (the "License"); you may
++ * not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++package org.apache.lucene.spatial.prefix.tree;
++
++import com.spatial4j.core.shape.Point;
++import com.spatial4j.core.shape.Shape;
++import com.spatial4j.core.shape.SpatialRelation;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.StringHelper;
++
++import java.util.Collection;
++
++/** The base for the original two SPT's: Geohash and Quad. Don't subclass this for new SPTs.
++ * @lucene.internal
++ *
++ * NOTE: Will be removed upon commit of LUCENE-6422
++ */
++//public for RPT pruneLeafyBranches code
++public abstract class LegacyCell implements Cell {
++
++  // Important: A LegacyCell doesn't share state for getNextLevelCells(), and
++  //  LegacySpatialPrefixTree assumes this in its simplify tree logic.
++
++  private static final byte LEAF_BYTE = '+';//NOTE: must sort before letters & numbers
++
++  //Arguably we could simply use a BytesRef, using an extra Object.
++  protected byte[] bytes;//generally bigger to potentially hold a leaf
++  protected int b_off;
++  protected int b_len;//doesn't reflect leaf; same as getLevel()
++
++  protected boolean isLeaf;
++
++  /**
++   * When set via getSubCells(filter), it is the relationship between this cell
++   * and the given shape filter. Doesn't participate in shape equality.
++   */
++  protected SpatialRelation shapeRel;
++
++  protected Shape shape;//cached
++
++  /** Warning: Refers to the same bytes (no copy). If {@link #setLeaf()} is subsequently called then it
++   * may modify bytes. */
++  protected LegacyCell(byte[] bytes, int off, int len) {
++    this.bytes = bytes;
++    this.b_off = off;
++    this.b_len = len;
++    readLeafAdjust();
++  }
++
++  protected void readCell(BytesRef bytes) {
++    shapeRel = null;
++    shape = null;
++    this.bytes = bytes.bytes;
++    this.b_off = bytes.offset;
++    this.b_len = (short) bytes.length;
++    readLeafAdjust();
++  }
++
++  protected void readLeafAdjust() {
++    isLeaf = (b_len > 0 && bytes[b_off + b_len - 1] == LEAF_BYTE);
++    if (isLeaf)
++      b_len--;
++    if (getLevel() == getMaxLevels())
++      isLeaf = true;
++  }
++
++  protected abstract SpatialPrefixTree getGrid();
++
++  protected abstract int getMaxLevels();
++
++  @Override
++  public SpatialRelation getShapeRel() {
++    return shapeRel;
++  }
++
++  @Override
++  public void setShapeRel(SpatialRelation rel) {
++    this.shapeRel = rel;
++  }
++
++  @Override
++  public boolean isLeaf() {
++    return isLeaf;
++  }
++
++  @Override
++  public void setLeaf() {
++    isLeaf = true;
++  }
++
++  @Override
++  public BytesRef getTokenBytesWithLeaf(BytesRef result) {
++    result = getTokenBytesNoLeaf(result);
++    if (!isLeaf || getLevel() == getMaxLevels())
++      return result;
++    if (result.bytes.length < result.offset + result.length + 1) {
++      assert false : "Not supposed to happen; performance bug";
++      byte[] copy = new byte[result.length + 1];
++      System.arraycopy(result.bytes, result.offset, copy, 0, result.length - 1);
++      result.bytes = copy;
++      result.offset = 0;
++    }
++    result.bytes[result.offset + result.length++] = LEAF_BYTE;
++    return result;
++  }
++
++  @Override
++  public BytesRef getTokenBytesNoLeaf(BytesRef result) {
++    if (result == null)
++      return new BytesRef(bytes, b_off, b_len);
++    result.bytes = bytes;
++    result.offset = b_off;
++    result.length = b_len;
++    return result;
++  }
++
++  @Override
++  public int getLevel() {
++    return b_len;
++  }
++
++  @Override
++  public CellIterator getNextLevelCells(Shape shapeFilter) {
++    assert getLevel() < getGrid().getMaxLevels();
++    if (shapeFilter instanceof Point) {
++      LegacyCell cell = getSubCell((Point) shapeFilter);
++      cell.shapeRel = SpatialRelation.CONTAINS;
++      return new SingletonCellIterator(cell);
++    } else {
++      return new FilterCellIterator(getSubCells().iterator(), shapeFilter);
++    }
++  }
++
++  /**
++   * Performant implementations are expected to implement this efficiently by
++   * considering the current cell's boundary.
++   * <p>
++   * Precondition: Never called when getLevel() == maxLevel.
++   * Precondition: this.getShape().relate(p) != DISJOINT.
++   */
++  protected abstract LegacyCell getSubCell(Point p);
++
++  /**
++   * Gets the cells at the next grid cell level that covers this cell.
++   * Precondition: Never called when getLevel() == maxLevel.
++   *
++   * @return A set of cells (no dups), sorted, modifiable, not empty, not null.
++   */
++  protected abstract Collection<Cell> getSubCells();
++
++  /**
++   * {@link #getSubCells()}.size() -- usually a constant. Should be &gt;=2
++   */
++  public abstract int getSubCellsSize();
++
++  @Override
++  public boolean isPrefixOf(Cell c) {
++    //Note: this only works when each level uses a whole number of bytes.
++    LegacyCell cell = (LegacyCell)c;
++    boolean result = sliceEquals(cell.bytes, cell.b_off, cell.b_len, bytes, b_off, b_len);
++    assert result == StringHelper.startsWith(c.getTokenBytesNoLeaf(null), getTokenBytesNoLeaf(null));
++    return result;
++  }
++
++  /** Copied from {@link org.apache.lucene.util.StringHelper#startsWith(org.apache.lucene.util.BytesRef, org.apache.lucene.util.BytesRef)}
++   *  which calls this. This is to avoid creating a BytesRef.  */
++  private static boolean sliceEquals(byte[] sliceToTest_bytes, int sliceToTest_offset, int sliceToTest_length,
++                                     byte[] other_bytes, int other_offset, int other_length) {
++    if (sliceToTest_length < other_length) {
++      return false;
++    }
++    int i = sliceToTest_offset;
++    int j = other_offset;
++    final int k = other_offset + other_length;
++
++    while (j < k) {
++      if (sliceToTest_bytes[i++] != other_bytes[j++]) {
++        return false;
++      }
++    }
++
++    return true;
++  }
++
++  @Override
++  public int compareToNoLeaf(Cell fromCell) {
++    LegacyCell b = (LegacyCell) fromCell;
++    return compare(bytes, b_off, b_len, b.bytes, b.b_off, b.b_len);
++  }
++
++  /** Copied from {@link org.apache.lucene.util.BytesRef#compareTo(org.apache.lucene.util.BytesRef)}.
++   * This is to avoid creating a BytesRef. */
++  protected static int compare(byte[] aBytes, int aUpto, int a_length, byte[] bBytes, int bUpto, int b_length) {
++    final int aStop = aUpto + Math.min(a_length, b_length);
++    while(aUpto < aStop) {
++      int aByte = aBytes[aUpto++] & 0xff;
++      int bByte = bBytes[bUpto++] & 0xff;
++
++      int diff = aByte - bByte;
++      if (diff != 0) {
++        return diff;
++      }
++    }
++
++    // One is a prefix of the other, or, they are equal:
++    return a_length - b_length;
++  }
++
++  @Override
++  public boolean equals(Object obj) {
++    //this method isn't "normally" called; just in asserts/tests
++    if (obj instanceof Cell) {
++      Cell cell = (Cell) obj;
++      return getTokenBytesWithLeaf(null).equals(cell.getTokenBytesWithLeaf(null));
++    } else {
++      return false;
++    }
++  }
++
++  @Override
++  public int hashCode() {
++    return getTokenBytesWithLeaf(null).hashCode();
++  }
++
++  @Override
++  public String toString() {
++    //this method isn't "normally" called; just in asserts/tests
++    return getTokenBytesWithLeaf(null).utf8ToString();
++  }
++
++}
+diff --git a/src/main/java/org/apache/lucene/spatial/prefix/tree/PackedQuadPrefixTree.java b/src/main/java/org/apache/lucene/spatial/prefix/tree/PackedQuadPrefixTree.java
+new file mode 100644
+index 000000000000..65808c041e37
+--- /dev/null
++++ b/src/main/java/org/apache/lucene/spatial/prefix/tree/PackedQuadPrefixTree.java
+@@ -0,0 +1,435 @@
++/*
++ * Licensed to Elasticsearch under one or more contributor
++ * license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright
++ * ownership. Elasticsearch licenses this file to you under
++ * the Apache License, Version 2.0 (the "License"); you may
++ * not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++package org.apache.lucene.spatial.prefix.tree;
++
++import com.spatial4j.core.context.SpatialContext;
++import com.spatial4j.core.shape.Point;
++import com.spatial4j.core.shape.Rectangle;
++import com.spatial4j.core.shape.Shape;
++import com.spatial4j.core.shape.SpatialRelation;
++import com.spatial4j.core.shape.impl.RectangleImpl;
++import org.apache.lucene.util.BytesRef;
++
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.List;
++import java.util.NoSuchElementException;
++
++/**
++ * Subclassing QuadPrefixTree this {@link SpatialPrefixTree} uses the compact QuadCell encoding described in
++ * {@link PackedQuadCell}
++ *
++ * @lucene.experimental
++ *
++ * NOTE: Will be removed upon commit of LUCENE-6422
++ */
++public class PackedQuadPrefixTree extends QuadPrefixTree {
++  public static final byte[] QUAD = new byte[] {0x00, 0x01, 0x02, 0x03};
++  public static final int MAX_LEVELS_POSSIBLE = 29;
++
++  private boolean leafyPrune = true;
++
++  public static class Factory extends QuadPrefixTree.Factory {
++    @Override
++    protected SpatialPrefixTree newSPT() {
++      if (maxLevels > MAX_LEVELS_POSSIBLE) {
++        throw new IllegalArgumentException("maxLevels " + maxLevels + " exceeds maximum value " + MAX_LEVELS_POSSIBLE);
++      }
++      return new PackedQuadPrefixTree(ctx, maxLevels);
++    }
++  }
++
++  public PackedQuadPrefixTree(SpatialContext ctx, int maxLevels) {
++    super(ctx, maxLevels);
++  }
++
++  @Override
++  public Cell getWorldCell() {
++    return new PackedQuadCell(0x0L);
++  }
++  @Override
++  public Cell getCell(Point p, int level) {
++    List<Cell> cells = new ArrayList<>(1);
++    build(xmid, ymid, 0, cells, 0x0L, ctx.makePoint(p.getX(),p.getY()), level);
++    return cells.get(0);//note cells could be longer if p on edge
++  }
++
++  protected void build(double x, double y, int level, List<Cell> matches, long term, Shape shape, int maxLevel) {
++    double w = levelW[level] / 2;
++    double h = levelH[level] / 2;
++
++    // Z-Order
++    // http://en.wikipedia.org/wiki/Z-order_%28curve%29
++    checkBattenberg(QUAD[0], x - w, y + h, level, matches, term, shape, maxLevel);
++    checkBattenberg(QUAD[1], x + w, y + h, level, matches, term, shape, maxLevel);
++    checkBattenberg(QUAD[2], x - w, y - h, level, matches, term, shape, maxLevel);
++    checkBattenberg(QUAD[3], x + w, y - h, level, matches, term, shape, maxLevel);
++  }
++
++  protected void checkBattenberg(byte quad, double cx, double cy, int level, List<Cell> matches,
++                               long term, Shape shape, int maxLevel) {
++    // short-circuit if we find a match for the point (no need to continue recursion)
++    if (shape instanceof Point && !matches.isEmpty())
++      return;
++    double w = levelW[level] / 2;
++    double h = levelH[level] / 2;
++
++    SpatialRelation v = shape.relate(ctx.makeRectangle(cx - w, cx + w, cy - h, cy + h));
++
++    if (SpatialRelation.DISJOINT == v) {
++      return;
++    }
++
++    // set bits for next level
++    term |= (((long)(quad))<<(64-(++level<<1)));
++    // increment level
++    term = ((term>>>1)+1)<<1;
++
++    if (SpatialRelation.CONTAINS == v || (level >= maxLevel)) {
++      matches.add(new PackedQuadCell(term, v.transpose()));
++    } else {// SpatialRelation.WITHIN, SpatialRelation.INTERSECTS
++      build(cx, cy, level, matches, term, shape, maxLevel);
++    }
++  }
++
++  @Override
++  public Cell readCell(BytesRef term, Cell scratch) {
++    PackedQuadCell cell = (PackedQuadCell) scratch;
++    if (cell == null)
++      cell = (PackedQuadCell) getWorldCell();
++    cell.readCell(term);
++    return cell;
++  }
++
++  @Override
++  public CellIterator getTreeCellIterator(Shape shape, int detailLevel) {
++    return new PrefixTreeIterator(shape);
++  }
++
++  public void setPruneLeafyBranches( boolean pruneLeafyBranches ) {
++    this.leafyPrune = pruneLeafyBranches;
++  }
++
++  /**
++   * PackedQuadCell Binary Representation is as follows
++   * CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCDDDDDL
++   *
++   * Where C = Cell bits (2 per quad)
++   *       D = Depth bits (5 with max of 29 levels)
++   *       L = isLeaf bit
++   */
++  public class PackedQuadCell extends QuadCell {
++    private long term;
++
++    PackedQuadCell(long term) {
++      super(null, 0, 0);
++      this.term = term;
++      this.b_off = 0;
++      this.bytes = longToByteArray(this.term);
++      this.b_len = 8;
++      readLeafAdjust();
++    }
++
++    PackedQuadCell(long term, SpatialRelation shapeRel) {
++      this(term);
++      this.shapeRel = shapeRel;
++    }
++
++    @Override
++    protected void readCell(BytesRef bytes) {
++      shapeRel = null;
++      shape = null;
++      this.bytes = bytes.bytes;
++      this.b_off = bytes.offset;
++      this.b_len = (short) bytes.length;
++      this.term = longFromByteArray(this.bytes, bytes.offset);
++      readLeafAdjust();
++    }
++
++    private final int getShiftForLevel(final int level) {
++      return 64 - (level<<1);
++    }
++
++    public boolean isEnd(final int level, final int shift) {
++      return (term != 0x0L && ((((0x1L<<(level<<1))-1)-(term>>>shift)) == 0x0L));
++    }
++
++    /**
++     * Get the next cell in the tree without using recursion. descend parameter requests traversal to the child nodes,
++     * setting this to false will step to the next sibling.
++     * Note: This complies with lexicographical ordering, once you've moved to the next sibling there is no backtracking.
++     */
++    public PackedQuadCell nextCell(boolean descend) {
++      final int level = getLevel();
++      final int shift = getShiftForLevel(level);
++      // base case: can't go further
++      if ( (!descend && isEnd(level, shift)) || isEnd(maxLevels, getShiftForLevel(maxLevels))) {
++        return null;
++      }
++      long newTerm;
++      final boolean isLeaf = (term&0x1L)==0x1L;
++      // if descend requested && we're not at the maxLevel
++      if ((descend && !isLeaf && (level != maxLevels)) || level == 0) {
++        // simple case: increment level bits (next level)
++        newTerm = ((term>>>1)+0x1L)<<1;
++      } else {  // we're not descending or we can't descend
++        newTerm = term + (0x1L<<shift);
++        // we're at the last sibling...force descend
++        if (((term>>>shift)&0x3L) == 0x3L) {
++          // adjust level for number popping up
++          newTerm = ((newTerm>>>1) - (Long.numberOfTrailingZeros(newTerm>>>shift)>>>1))<<1;
++        }
++      }
++      return new PackedQuadCell(newTerm);
++    }
++
++    @Override
++    protected void readLeafAdjust() {
++      isLeaf = ((0x1L)&term) == 0x1L;
++      if (getLevel() == getMaxLevels()) {
++        isLeaf = true;
++      }
++    }
++
++    @Override
++    public BytesRef getTokenBytesWithLeaf(BytesRef result) {
++      if (isLeaf) {
++        term |= 0x1L;
++      }
++      return getTokenBytesNoLeaf(result);
++    }
++
++    @Override
++    public BytesRef getTokenBytesNoLeaf(BytesRef result) {
++      if (result == null)
++        return new BytesRef(bytes, b_off, b_len);
++      result.bytes = longToByteArray(this.term);
++      result.offset = 0;
++      result.length = result.bytes.length;
++      return result;
++    }
++
++    @Override
++    public int compareToNoLeaf(Cell fromCell) {
++      PackedQuadCell b = (PackedQuadCell) fromCell;
++      final long thisTerm = (((0x1L)&term) == 0x1L) ? term-1 : term;
++      final long fromTerm = (((0x1L)&b.term) == 0x1L) ? b.term-1 : b.term;
++      final int result = compare(longToByteArray(thisTerm), 0, 8, longToByteArray(fromTerm), 0, 8);
++      return result;
++    }
++
++    @Override
++    public int getLevel() {
++      int l = (int)((term >>> 1)&0x1FL);
++      return l;
++    }
++
++    @Override
++    protected Collection<Cell> getSubCells() {
++      List<Cell> cells = new ArrayList<>(4);
++      PackedQuadCell pqc = (PackedQuadCell)(new PackedQuadCell(((term&0x1)==0x1) ? this.term-1 : this.term))
++          .nextCell(true);
++      cells.add(pqc);
++      cells.add((pqc = (PackedQuadCell) (pqc.nextCell(false))));
++      cells.add((pqc = (PackedQuadCell) (pqc.nextCell(false))));
++      cells.add(pqc.nextCell(false));
++      return cells;
++    }
++
++    @Override
++    protected QuadCell getSubCell(Point p) {
++      return (PackedQuadCell) PackedQuadPrefixTree.this.getCell(p, getLevel() + 1);//not performant!
++    }
++
++    @Override
++    public boolean isPrefixOf(Cell c) {
++      PackedQuadCell cell = (PackedQuadCell)c;
++      return (this.term==0x0L) ? true : isInternalPrefix(cell);
++    }
++
++    protected boolean isInternalPrefix(PackedQuadCell c) {
++      final int shift = 64 - (getLevel()<<1);
++      return ((term>>>shift)-(c.term>>>shift)) == 0x0L;
++    }
++
++    protected long concat(byte postfix) {
++      // extra leaf bit
++      return this.term | (((long)(postfix))<<((getMaxLevels()-getLevel()<<1)+6));
++    }
++
++    /**
++     * Constructs a bounding box shape out of the encoded cell
++     */
++    @Override
++    protected Rectangle makeShape() {
++      double xmin = PackedQuadPrefixTree.this.xmin;
++      double ymin = PackedQuadPrefixTree.this.ymin;
++      int level = getLevel();
++
++      byte b;
++      for (short l=0, i=1; l<level; ++l, ++i) {
++        b = (byte) ((term>>>(64-(i<<1))) & 0x3L);
++
++        switch (b) {
++          case 0x00:
++            ymin += levelH[l];
++            break;
++          case 0x01:
++            xmin += levelW[l];
++            ymin += levelH[l];
++            break;
++          case 0x02:
++            break;//nothing really
++          case 0x03:
++            xmin += levelW[l];
++            break;
++          default:
++            throw new RuntimeException("unexpected quadrant");
++        }
++      }
++
++      double width, height;
++      if (level > 0) {
++        width = levelW[level - 1];
++        height = levelH[level - 1];
++      } else {
++        width = gridW;
++        height = gridH;
++      }
++      return new RectangleImpl(xmin, xmin + width, ymin, ymin + height, ctx);
++    }
++
++    private long fromBytes(byte b1, byte b2, byte b3, byte b4, byte b5, byte b6, byte b7, byte b8) {
++      return ((long)b1 & 255L) << 56 | ((long)b2 & 255L) << 48 | ((long)b3 & 255L) << 40
++          | ((long)b4 & 255L) << 32 | ((long)b5 & 255L) << 24 | ((long)b6 & 255L) << 16
++          | ((long)b7 & 255L) << 8 | (long)b8 & 255L;
++    }
++
++    private byte[] longToByteArray(long value) {
++      byte[] result = new byte[8];
++      for(int i = 7; i >= 0; --i) {
++        result[i] = (byte)((int)(value & 255L));
++        value >>= 8;
++      }
++      return result;
++    }
++
++    private long longFromByteArray(byte[] bytes, int ofs) {
++      assert bytes.length >= 8;
++      return fromBytes(bytes[0+ofs], bytes[1+ofs], bytes[2+ofs], bytes[3+ofs],
++          bytes[4+ofs], bytes[5+ofs], bytes[6+ofs], bytes[7+ofs]);
++    }
++
++    /**
++     * Used for debugging, this will print the bits of the cell
++     */
++    @Override
++    public String toString() {
++      String s = "";
++      for(int i = 0; i < Long.numberOfLeadingZeros(term); i++) {
++        s+='0';
++      }
++      if (term != 0)
++        s += Long.toBinaryString(term);
++      return s;
++    }
++  } // PackedQuadCell
++
++    protected class PrefixTreeIterator extends CellIterator {
++    private Shape shape;
++    private PackedQuadCell thisCell;
++    private PackedQuadCell nextCell;
++
++    private short leaves;
++    private short level;
++    private final short maxLevels;
++    private CellIterator pruneIter;
++
++    PrefixTreeIterator(Shape shape) {
++      this.shape = shape;
++      this.thisCell = ((PackedQuadCell)(getWorldCell())).nextCell(true);
++      this.maxLevels = (short)thisCell.getMaxLevels();
++      this.nextCell = null;
++    }
++
++    @Override
++    public boolean hasNext() {
++      if (nextCell != null) {
++        return true;
++      }
++      SpatialRelation rel;
++      // loop until we're at the end of the quad tree or we hit a relation
++      while (thisCell != null) {
++        rel = thisCell.getShape().relate(shape);
++        if (rel == SpatialRelation.DISJOINT) {
++          thisCell = thisCell.nextCell(false);
++        } else { // within || intersects || contains
++          thisCell.setShapeRel(rel);
++          nextCell = thisCell;
++          if (rel == SpatialRelation.WITHIN) {
++            thisCell.setLeaf();
++            thisCell = thisCell.nextCell(false);
++          } else {  // intersects || contains
++            level = (short) (thisCell.getLevel());
++            if (level == maxLevels || pruned(rel)) {
++              thisCell.setLeaf();
++              if (shape instanceof Point) {
++                thisCell.setShapeRel(SpatialRelation.WITHIN);
++                thisCell = null;
++              } else {
++                thisCell = thisCell.nextCell(false);
++              }
++              break;
++            }
++            thisCell = thisCell.nextCell(true);
++          }
++          break;
++        }
++      }
++      return nextCell != null;
++    }
++
++    private boolean pruned(SpatialRelation rel) {
++      if (rel == SpatialRelation.INTERSECTS && leafyPrune && level == maxLevels-1) {
++        for (leaves=0, pruneIter=thisCell.getNextLevelCells(shape); pruneIter.hasNext(); pruneIter.next(), ++leaves);
++        return leaves == 4;
++      }
++      return false;
++    }
++
++    @Override
++    public Cell next() {
++      if (nextCell == null) {
++        if (!hasNext()) {
++          throw new NoSuchElementException();
++        }
++      }
++      // overriding since this implementation sets thisCell in hasNext
++      Cell temp = nextCell;
++      nextCell = null;
++      return temp;
++    }
++
++    @Override
++    public void remove() {
++      //no-op
++    }
++  }
++}
+diff --git a/src/main/java/org/apache/lucene/spatial/prefix/tree/QuadPrefixTree.java b/src/main/java/org/apache/lucene/spatial/prefix/tree/QuadPrefixTree.java
+new file mode 100644
+index 000000000000..489816ddf3c3
+--- /dev/null
++++ b/src/main/java/org/apache/lucene/spatial/prefix/tree/QuadPrefixTree.java
+@@ -0,0 +1,313 @@
++/*
++ * Licensed to Elasticsearch under one or more contributor
++ * license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright
++ * ownership. Elasticsearch licenses this file to you under
++ * the Apache License, Version 2.0 (the "License"); you may
++ * not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++package org.apache.lucene.spatial.prefix.tree;
++
++import com.spatial4j.core.context.SpatialContext;
++import com.spatial4j.core.shape.Point;
++import com.spatial4j.core.shape.Rectangle;
++import com.spatial4j.core.shape.Shape;
++import com.spatial4j.core.shape.SpatialRelation;
++import org.apache.lucene.util.BytesRef;
++
++import java.io.PrintStream;
++import java.text.NumberFormat;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collection;
++import java.util.List;
++import java.util.Locale;
++
++/**
++ * A {@link SpatialPrefixTree} which uses a
++ * <a href="http://en.wikipedia.org/wiki/Quadtree">quad tree</a> in which an
++ * indexed term will be generated for each cell, 'A', 'B', 'C', 'D'.
++ *
++ * @lucene.experimental
++ *
++ * NOTE: Will be removed upon commit of LUCENE-6422
++ */
++public class QuadPrefixTree extends LegacyPrefixTree {
++
++  /**
++   * Factory for creating {@link QuadPrefixTree} instances with useful defaults
++   */
++  public static class Factory extends SpatialPrefixTreeFactory {
++
++    @Override
++    protected int getLevelForDistance(double degrees) {
++      QuadPrefixTree grid = new QuadPrefixTree(ctx, MAX_LEVELS_POSSIBLE);
++      return grid.getLevelForDistance(degrees);
++    }
++
++    @Override
++    protected SpatialPrefixTree newSPT() {
++      return new QuadPrefixTree(ctx,
++          maxLevels != null ? maxLevels : MAX_LEVELS_POSSIBLE);
++    }
++  }
++
++  public static final int MAX_LEVELS_POSSIBLE = 50;//not really sure how big this should be
++
++  public static final int DEFAULT_MAX_LEVELS = 12;
++  protected final double xmin;
++  protected final double xmax;
++  protected final double ymin;
++  protected final double ymax;
++  protected final double xmid;
++  protected final double ymid;
++
++  protected final double gridW;
++  public final double gridH;
++
++  final double[] levelW;
++  final double[] levelH;
++  final int[]    levelS; // side
++  final int[]    levelN; // number
++
++  public QuadPrefixTree(
++          SpatialContext ctx, Rectangle bounds, int maxLevels) {
++    super(ctx, maxLevels);
++    this.xmin = bounds.getMinX();
++    this.xmax = bounds.getMaxX();
++    this.ymin = bounds.getMinY();
++    this.ymax = bounds.getMaxY();
++
++    levelW = new double[maxLevels];
++    levelH = new double[maxLevels];
++    levelS = new int[maxLevels];
++    levelN = new int[maxLevels];
++
++    gridW = xmax - xmin;
++    gridH = ymax - ymin;
++    this.xmid = xmin + gridW/2.0;
++    this.ymid = ymin + gridH/2.0;
++    levelW[0] = gridW/2.0;
++    levelH[0] = gridH/2.0;
++    levelS[0] = 2;
++    levelN[0] = 4;
++
++    for (int i = 1; i < levelW.length; i++) {
++      levelW[i] = levelW[i - 1] / 2.0;
++      levelH[i] = levelH[i - 1] / 2.0;
++      levelS[i] = levelS[i - 1] * 2;
++      levelN[i] = levelN[i - 1] * 4;
++    }
++  }
++
++  public QuadPrefixTree(SpatialContext ctx) {
++    this(ctx, DEFAULT_MAX_LEVELS);
++  }
++
++  public QuadPrefixTree(
++          SpatialContext ctx, int maxLevels) {
++    this(ctx, ctx.getWorldBounds(), maxLevels);
++  }
++
++  @Override
++  public Cell getWorldCell() {
++    return new QuadCell(BytesRef.EMPTY_BYTES, 0, 0);
++  }
++
++  public void printInfo(PrintStream out) {
++    NumberFormat nf = NumberFormat.getNumberInstance(Locale.ROOT);
++    nf.setMaximumFractionDigits(5);
++    nf.setMinimumFractionDigits(5);
++    nf.setMinimumIntegerDigits(3);
++
++    for (int i = 0; i < maxLevels; i++) {
++      out.println(i + "]\t" + nf.format(levelW[i]) + "\t" + nf.format(levelH[i]) + "\t" +
++          levelS[i] + "\t" + (levelS[i] * levelS[i]));
++    }
++  }
++
++  @Override
++  public int getLevelForDistance(double dist) {
++    if (dist == 0)//short circuit
++      return maxLevels;
++    for (int i = 0; i < maxLevels-1; i++) {
++      //note: level[i] is actually a lookup for level i+1
++      if(dist > levelW[i] && dist > levelH[i]) {
++        return i+1;
++      }
++    }
++    return maxLevels;
++  }
++
++  @Override
++  public Cell getCell(Point p, int level) {
++    List<Cell> cells = new ArrayList<>(1);
++    build(xmid, ymid, 0, cells, new BytesRef(maxLevels+1), ctx.makePoint(p.getX(),p.getY()), level);
++    return cells.get(0);//note cells could be longer if p on edge
++  }
++
++  private void build(
++      double x,
++      double y,
++      int level,
++      List<Cell> matches,
++      BytesRef str,
++      Shape shape,
++      int maxLevel) {
++    assert str.length == level;
++    double w = levelW[level] / 2;
++    double h = levelH[level] / 2;
++
++    // Z-Order
++    // http://en.wikipedia.org/wiki/Z-order_%28curve%29
++    checkBattenberg('A', x - w, y + h, level, matches, str, shape, maxLevel);
++    checkBattenberg('B', x + w, y + h, level, matches, str, shape, maxLevel);
++    checkBattenberg('C', x - w, y - h, level, matches, str, shape, maxLevel);
++    checkBattenberg('D', x + w, y - h, level, matches, str, shape, maxLevel);
++
++    // possibly consider hilbert curve
++    // http://en.wikipedia.org/wiki/Hilbert_curve
++    // http://blog.notdot.net/2009/11/Damn-Cool-Algorithms-Spatial-indexing-with-Quadtrees-and-Hilbert-Curves
++    // if we actually use the range property in the query, this could be useful
++  }
++
++  protected void checkBattenberg(
++      char c,
++      double cx,
++      double cy,
++      int level,
++      List<Cell> matches,
++      BytesRef str,
++      Shape shape,
++      int maxLevel) {
++    assert str.length == level;
++    assert str.offset == 0;
++    double w = levelW[level] / 2;
++    double h = levelH[level] / 2;
++
++    int strlen = str.length;
++    Rectangle rectangle = ctx.makeRectangle(cx - w, cx + w, cy - h, cy + h);
++    SpatialRelation v = shape.relate(rectangle);
++    if (SpatialRelation.CONTAINS == v) {
++      str.bytes[str.length++] = (byte)c;//append
++      //str.append(SpatialPrefixGrid.COVER);
++      matches.add(new QuadCell(BytesRef.deepCopyOf(str), v.transpose()));
++    } else if (SpatialRelation.DISJOINT == v) {
++      // nothing
++    } else { // SpatialRelation.WITHIN, SpatialRelation.INTERSECTS
++      str.bytes[str.length++] = (byte)c;//append
++
++      int nextLevel = level+1;
++      if (nextLevel >= maxLevel) {
++        //str.append(SpatialPrefixGrid.INTERSECTS);
++        matches.add(new QuadCell(BytesRef.deepCopyOf(str), v.transpose()));
++      } else {
++        build(cx, cy, nextLevel, matches, str, shape, maxLevel);
++      }
++    }
++    str.length = strlen;
++  }
++
++  protected class QuadCell extends LegacyCell {
++
++    QuadCell(byte[] bytes, int off, int len) {
++      super(bytes, off, len);
++    }
++
++    QuadCell(BytesRef str, SpatialRelation shapeRel) {
++      this(str.bytes, str.offset, str.length);
++      this.shapeRel = shapeRel;
++    }
++
++    @Override
++    protected QuadPrefixTree getGrid() { return QuadPrefixTree.this; }
++
++    @Override
++    protected int getMaxLevels() { return maxLevels; }
++
++    @Override
++    protected Collection<Cell> getSubCells() {
++      BytesRef source = getTokenBytesNoLeaf(null);
++
++      List<Cell> cells = new ArrayList<>(4);
++      cells.add(new QuadCell(concat(source, (byte)'A'), null));
++      cells.add(new QuadCell(concat(source, (byte)'B'), null));
++      cells.add(new QuadCell(concat(source, (byte)'C'), null));
++      cells.add(new QuadCell(concat(source, (byte)'D'), null));
++      return cells;
++    }
++
++    protected BytesRef concat(BytesRef source, byte b) {
++      //+2 for new char + potential leaf
++      final byte[] buffer = Arrays.copyOfRange(source.bytes, source.offset, source.offset + source.length + 2);
++      BytesRef target = new BytesRef(buffer);
++      target.length = source.length;
++      target.bytes[target.length++] = b;
++      return target;
++    }
++
++    @Override
++    public int getSubCellsSize() {
++      return 4;
++    }
++
++    @Override
++    protected QuadCell getSubCell(Point p) {
++      return (QuadCell) QuadPrefixTree.this.getCell(p, getLevel() + 1);//not performant!
++    }
++
++    @Override
++    public Shape getShape() {
++      if (shape == null)
++        shape = makeShape();
++      return shape;
++    }
++
++    protected Rectangle makeShape() {
++      BytesRef token = getTokenBytesNoLeaf(null);
++      double xmin = QuadPrefixTree.this.xmin;
++      double ymin = QuadPrefixTree.this.ymin;
++
++      for (int i = 0; i < token.length; i++) {
++        byte c = token.bytes[token.offset + i];
++        switch (c) {
++          case 'A':
++            ymin += levelH[i];
++            break;
++          case 'B':
++            xmin += levelW[i];
++            ymin += levelH[i];
++            break;
++          case 'C':
++            break;//nothing really
++          case 'D':
++            xmin += levelW[i];
++            break;
++          default:
++            throw new RuntimeException("unexpected char: " + c);
++        }
++      }
++      int len = token.length;
++      double width, height;
++      if (len > 0) {
++        width = levelW[len-1];
++        height = levelH[len-1];
++      } else {
++        width = gridW;
++        height = gridH;
++      }
++      return ctx.makeRectangle(xmin, xmin + width, ymin, ymin + height);
++    }
++  }//QuadCell
++}
+diff --git a/src/main/java/org/elasticsearch/index/mapper/geo/GeoShapeFieldMapper.java b/src/main/java/org/elasticsearch/index/mapper/geo/GeoShapeFieldMapper.java
+index 896185f39f6f..5aba9ed54add 100644
+--- a/src/main/java/org/elasticsearch/index/mapper/geo/GeoShapeFieldMapper.java
++++ b/src/main/java/org/elasticsearch/index/mapper/geo/GeoShapeFieldMapper.java
+@@ -26,9 +26,11 @@
+ import org.apache.lucene.spatial.prefix.RecursivePrefixTreeStrategy;
+ import org.apache.lucene.spatial.prefix.TermQueryPrefixTreeStrategy;
+ import org.apache.lucene.spatial.prefix.tree.GeohashPrefixTree;
++import org.apache.lucene.spatial.prefix.tree.PackedQuadPrefixTree;
+ import org.apache.lucene.spatial.prefix.tree.QuadPrefixTree;
+ import org.apache.lucene.spatial.prefix.tree.SpatialPrefixTree;
+ import org.elasticsearch.ElasticsearchIllegalArgumentException;
++import org.elasticsearch.Version;
+ import org.elasticsearch.common.Strings;
+ import org.elasticsearch.common.geo.GeoUtils;
+ import org.elasticsearch.common.geo.SpatialStrategy;
+@@ -157,7 +159,13 @@ public GeoShapeFieldMapper build(BuilderContext context) {
+             if (Names.TREE_GEOHASH.equals(tree)) {
+                 prefixTree = new GeohashPrefixTree(ShapeBuilder.SPATIAL_CONTEXT, getLevels(treeLevels, precisionInMeters, Defaults.GEOHASH_LEVELS, true));
+             } else if (Names.TREE_QUADTREE.equals(tree)) {
+-                prefixTree = new QuadPrefixTree(ShapeBuilder.SPATIAL_CONTEXT, getLevels(treeLevels, precisionInMeters, Defaults.QUADTREE_LEVELS, false));
++                if (context.indexCreatedVersion().before(Version.V_1_6_0)) {
++                    prefixTree = new QuadPrefixTree(ShapeBuilder.SPATIAL_CONTEXT, getLevels(treeLevels, precisionInMeters, Defaults
++                            .QUADTREE_LEVELS, false));
++                } else {
++                    prefixTree = new PackedQuadPrefixTree(ShapeBuilder.SPATIAL_CONTEXT, getLevels(treeLevels, precisionInMeters, Defaults
++                            .QUADTREE_LEVELS, false));
++                }
+             } else {
+                 throw new ElasticsearchIllegalArgumentException("Unknown prefix tree type [" + tree + "]");
+             }
+@@ -220,6 +228,7 @@ public GeoShapeFieldMapper(FieldMapper.Names names, SpatialPrefixTree tree, Stri
+         super(names, 1, fieldType, false, null, null, null, null, null, indexSettings, multiFields, copyTo);
+         this.recursiveStrategy = new RecursivePrefixTreeStrategy(tree, names.indexName());
+         this.recursiveStrategy.setDistErrPct(distanceErrorPct);
++        this.recursiveStrategy.setPruneLeafyBranches(false);
+         this.termStrategy = new TermQueryPrefixTreeStrategy(tree, names.indexName());
+         this.termStrategy.setDistErrPct(distanceErrorPct);
+         this.defaultStrategy = resolveStrategy(defaultStrategyName);
