@@ -1,7 +1,19 @@
+"""
+compare.py
+
+The goal of this file is to use MOSS to compare all of the diff files which have been uploaded
+
+Example Output: http://moss.stanford.edu/results/612995158
+
+Usage Example: https://github.com/soachishti/moss.py
+"""
 import mosspy
 import yaml
+import os
+from glob import glob
 
-KEYS_PATH = '/home/akettere/PycharmProjects/ECE_60872/keys.yaml'
+KEYS_PATH = '../keys.yaml'
+COMPARE_DIR = '../resources/angr-doc/'
 
 
 def main():
@@ -10,25 +22,15 @@ def main():
 
     m = mosspy.Moss(moss_key, "python")
 
-    # m.addBaseFile("submission/test1.c")
-    # m.addBaseFile("submission/test.c")
-
-    m.addFile("submission/test1.c")
-    m.addFile("submission/test.c")
-
-    # Submission Files
-    # m.addFile("submission/a01-sample.py")
-    # m.addFilesByWildcard("submission/a01-*.py")
+    paths = glob(os.path.join(COMPARE_DIR, "*"))
+    for path in paths:
+        diff_file = os.path.join(path, 'pull_request.diff')
+        if os.path.getsize(diff_file) > 0:
+            m.addFile(diff_file)
 
     url = m.send()  # Submission Report URL
 
     print("Report Url: " + url)
-
-    # Save report file
-    m.saveWebPage(url, "submission/report.html")
-
-    # Download whole report locally including code diff links
-    mosspy.download_report(url, "submission/report/", connections=8)
 
 
 if __name__ == "__main__":

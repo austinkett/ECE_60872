@@ -1,3 +1,9 @@
+"""
+scrape.py
+
+The goal of this file is to request and save pull request information from Github repos.
+"""
+
 from github import Github
 import pprint
 import os
@@ -9,6 +15,11 @@ KEYS_PATH = '/home/akettere/PycharmProjects/ECE_60872/keys.yaml'
 
 
 def document_pull_request_info(pr):
+    """
+    This saves all info related to a pull request
+    :param pr: The pull request
+    :return:
+    """
     # Get a dictionary of the pull request's attributes
     pr_dict = pr.__dict__
     print('Writing Data for Pull Request: {} {}'.format(pr_dict['_rawData']['base']['repo']['name'],
