@@ -14,16 +14,26 @@ Which are your access keys for moss and github respectively. Note that the pull 
 github token that was used to access it so if you are planning to make your repo public I
 suggest that you delete that token from the files or delete the token itself. 
 ## Current Objective
-Currently we have built a script to build a database and send it to MOSS. This was
-unsuccessful so we are looking to machine learning approaches.
+The current iteration of this is complete. We are looking into future improvements to be made to our analysis which
+will likely take place over the next month.
+
+Plans include:
+- Doing an analysis on N-Version programs
+- Doing an analysis on files written to perform the same task but in different languages
+- Trying out other machine learning models for bug classification
+- Trying out other machine learning models for classifying which bugs are reproducible
+ 
 ## File Descriptions
 resources:
 - The resource folders here contain bug patches from many different large github projects
 as well as their pull request information. 
+- defects4J_JacksonDatabind - A list of reproducible bug issues from JacksonDatabind
 
 src:
 - scrape.py - This requests and saves pull requests from Github repos
 - compare.py - This utilizes moss to compares batches of files
+- ml_text_classification - This runs a naive Bayes classifier on a set of reproducible and non-reproducible bugs
+- scrape_issue - A module built to scrape issues from JacksonDatabind
 
 labeled_repos.yaml:
 - This file should be filled out with repo names and the label you are looking for. After
